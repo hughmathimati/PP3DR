@@ -94,7 +94,7 @@ def val_on_dataset(name, iterator, dataloader):
         state.val_losses[state.epoch - 1] += metric(pred, gt).detach()
 
 
-def get_vittt_param_groups(model: nn.Module, adamw_lr: float = 1e-4, muon_lr: float = 0.02,
+def get_vittt_param_groups(model: nn.Module, adamw_lr: float = 1e-4, muon_lr: float = 0.005,
                            weight_decay: float = 0.04, layer_decay: float = 0.9,
                            num_layers: int = 24):
     """
@@ -159,8 +159,11 @@ def get_vittt_param_groups(model: nn.Module, adamw_lr: float = 1e-4, muon_lr: fl
     return list(AdamW_params.values()), list(Muon_params.values())
 
 
-def initialize(epochs):
+def initialize(epochs, pretrained_path = "/vulcanscratch/hughma/ViT/optimizer_split/optimizer_split ViTTT epoch 4.pth"):
     ViTTT_model = ViTTT(blocks = 24)
+    if pretrained_path is not None:
+        ViTTT_model.load_state_dict(torch.load(pretrained_path, weights_only=True))
+        print("Loaded pretrained weights from", pretrained_path)
 
     def init_vit_weights(module):
         if isinstance(module, nn.Linear):
@@ -228,9 +231,9 @@ if __name__ == "__main__":
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"/tmp/torchinductor_cache_rank_{os.environ.get("LOCAL_RANK", "0")}"
     torch.set_float32_matmul_precision('high')
 
-    epochs = 20
+    epochs = 16
     checkpoint_every = 4
-    checkpoint = "/vulcanscratch/hughma/ViT/optimizer_split/epoch 12"
+    checkpoint = None
     jobs = [
         partial(initialize, epochs),
         load_dinov3,
@@ -256,12 +259,12 @@ if __name__ == "__main__":
 
     AdamW_scheduler = transformers.optimization.get_cosine_schedule_with_warmup(
         AdamW,
-        total_training_steps // 20,
+        total_training_steps // 10,
         total_training_steps
     )
     Muon_scheduler = transformers.optimization.get_cosine_schedule_with_warmup(
         Muon,
-        total_training_steps // 20,
+        total_training_steps // 10,
         total_training_steps
     )
     # Register the LR schedulers
@@ -291,7 +294,7 @@ if __name__ == "__main__":
     while state.epoch <= epochs:
         val_iter = iter(val_dataloader)
         if state.epoch % checkpoint_every == 0 or state.epoch == 1:
-            accelerator.save_state(output_dir=f"/vulcanscratch/hughma/ViT/optimizer_split/epoch {state.epoch}",
+            accelerator.save_state(output_dir=f"/vulcanscratch/hughma/ViT/muon_lr/epoch {state.epoch}",
                                    total_limit=3)
             if accelerator.is_local_main_process:
                 print("Checkpoint saved.")
@@ -320,13 +323,13 @@ if __name__ == "__main__":
     accelerator.reduce(state.val_losses, "sum")
 
     if accelerator.is_local_main_process:
-        with open("/vulcanscratch/hughma/ViT/optimizer_split/train_losses.pkl", "wb") as f:
+        with open("/vulcanscratch/hughma/ViT/muon_lr/train_losses.pkl", "wb") as f:
             pickle.dump(state.train_losses.numpy(force=True), f)
         print("Saved train_losses")
-        with open("/vulcanscratch/hughma/ViT/optimizer_split/val_losses.pkl", "wb") as f:
+        with open("/vulcanscratch/hughma/ViT/muon_lr/val_losses.pkl", "wb") as f:
             pickle.dump(state.val_losses.numpy(force=True), f)
         print("Saved val_losses")
-        torch.save(ViTTT_model.state_dict(), "/vulcanscratch/hughma/ViT/optimizer_split/ViTTT.pth")
+        torch.save(ViTTT_model.state_dict(), "/vulcanscratch/hughma/ViT/muon_lr/ViTTT.pth")
         print("Saved model")
 
     # if accelerator.is_local_main_process:
