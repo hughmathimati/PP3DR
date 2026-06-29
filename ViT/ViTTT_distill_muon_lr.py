@@ -224,14 +224,13 @@ class CosineLoss(nn.Module):
 
 if __name__ == "__main__":
     # torch.autograd.set_detect_anomaly(True) # DEBUG
-
     # Failed to reload cubin file statically launchable autotuner triton_poi_fused_arange_div_expand_mul_stack_sub_unsqueeze_view_0
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"/tmp/torchinductor_cache_rank_{os.environ.get("LOCAL_RANK", "0")}"
     torch.set_float32_matmul_precision('high')
 
     epochs = 20
     checkpoint_every = 4
-    checkpoint = None
+    checkpoint = "/vulcanscratch/hughma/ViT/optimizer_split/epoch 12"
     jobs = [
         partial(initialize, epochs),
         load_dinov3,
