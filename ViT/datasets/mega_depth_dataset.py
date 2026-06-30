@@ -25,8 +25,6 @@ class mega_depth_dataset(torch.utils.data.Dataset):
         # (sequence, image #)
         self.image_paths = []
         for sequence in tqdm(self.sequences, desc="Precomputing MegaDepth image file paths"):
-            # Says permission denied for sequence ID >= 5000...
-            if int(sequence) == 5000: break
             sequence_dir = os.path.join(dir, sequence, "images")
             for image in os.listdir(sequence_dir):
                 self.image_paths.append(os.path.join(sequence_dir, image))

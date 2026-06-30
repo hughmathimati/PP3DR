@@ -1,6 +1,6 @@
 import transformers.optimization
 from models.ViTTT import ViTTT
-from models.Dinov3 import load_dinov3, obtain_features, low_rank
+from models.Dinov3 import load_dinov3, obtain_features
 from datasets.sintel_dataset import sintel_dataset
 from datasets.nrgbd_dataset import nrgbd_dataset
 from datasets.flying_things_3d_dataset import flying_things_3d_dataset
@@ -94,7 +94,7 @@ def val_on_dataset(name, iterator, dataloader):
         state.val_losses[state.epoch - 1] += metric(pred, gt).detach()
 
 
-def get_vittt_param_groups(model: nn.Module, adamw_lr: float = 1e-4, muon_lr: float = 0.02,
+def get_vittt_param_groups(model: nn.Module, adamw_lr: float = 1e-4, muon_lr: float = 0.005,
                            weight_decay: float = 0.04, layer_decay: float = 0.9,
                            num_layers: int = 24):
     """
@@ -159,8 +159,11 @@ def get_vittt_param_groups(model: nn.Module, adamw_lr: float = 1e-4, muon_lr: fl
     return list(AdamW_params.values()), list(Muon_params.values())
 
 
-def initialize(epochs):
+def initialize(epochs, pretrained_path = "/vulcanscratch/hughma/ViT/optimizer_split/optimizer_split ViTTT epoch 4.pth"):
     ViTTT_model = ViTTT(blocks = 24)
+    if pretrained_path is not None:
+        ViTTT_model.load_state_dict(torch.load(pretrained_path, weights_only=True))
+        print("Loaded pretrained weights from", pretrained_path)
 
     def init_vit_weights(module):
         if isinstance(module, nn.Linear):
@@ -224,14 +227,13 @@ class CosineLoss(nn.Module):
 
 if __name__ == "__main__":
     # torch.autograd.set_detect_anomaly(True) # DEBUG
-
     # Failed to reload cubin file statically launchable autotuner triton_poi_fused_arange_div_expand_mul_stack_sub_unsqueeze_view_0
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"/tmp/torchinductor_cache_rank_{os.environ.get("LOCAL_RANK", "0")}"
     torch.set_float32_matmul_precision('high')
 
-    epochs = 20
+    epochs = 16
     checkpoint_every = 4
-    checkpoint = "/vulcanscratch/hughma/ViT/optimizer_split/epoch 4"
+    checkpoint = None
     jobs = [
         partial(initialize, epochs),
         load_dinov3,
@@ -257,12 +259,12 @@ if __name__ == "__main__":
 
     AdamW_scheduler = transformers.optimization.get_cosine_schedule_with_warmup(
         AdamW,
-        total_training_steps // 20,
+        total_training_steps // 10,
         total_training_steps
     )
     Muon_scheduler = transformers.optimization.get_cosine_schedule_with_warmup(
         Muon,
-        total_training_steps // 20,
+        total_training_steps // 10,
         total_training_steps
     )
     # Register the LR schedulers

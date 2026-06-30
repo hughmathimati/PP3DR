@@ -50,7 +50,7 @@ class ViTTT(nn.Module):
             self,
             dim: int = 1280,
             num_heads: int = 20,
-            blocks = 48, # DINOv3 H+ has 32 layers, but I'm using more to compensate for the weaker performance of TTT.
+            blocks = 24, # DINOv3 H+ has 32 layers, but I'm using more to compensate for the weaker performance of TTT.
             ffn_ratio = 4,
             num_registers = 5,
             start_checkpointing = 6
@@ -123,8 +123,8 @@ if __name__ == "__main__":
     model.load_state_dict(loaded_state_dict)
 
     model.eval()
-    # image = load_image("https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/pipeline-cat-chonk.jpeg")
-    image = transforms.functional.to_dtype(torchvision.io.decode_image("/vulcanscratch/hughma/data/sintel/training/final/alley_1/frame_0001.png"), torch.float32, scale=True)
+    image = load_image("https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/pipeline-cat-chonk.jpeg")
+    # image = transforms.functional.to_dtype(torchvision.io.decode_image("/vulcanscratch/hughma/data/sintel/training/final/alley_1/frame_0001.png"), torch.float32, scale=True)
     # image = image.unsqueeze(0)
     # print(f"original shape: {image.size}")
     # image = image.crop((0, 0, image.size[0] // 16 * 16, image.size[1] // 16 * 16))
@@ -141,5 +141,5 @@ if __name__ == "__main__":
     print(features.shape)
     features = low_rank(features)
     print(f"lowrank: {features.shape}")
-    # write_to_image(features, 42, 60, name = "images/ViTTT_cat_optimizer_split 4.png")
-    write_to_image(features, 27, 64, name = "images/ViTTT_sintel_optimizer_split 4.png")
+    write_to_image(features, 42, 60, name = "images/ViTTT_cat_muon_lr 4.png")
+    # write_to_image(features, 27, 64, name = "images/ViTTT_sintel_muon_lr 4.png")

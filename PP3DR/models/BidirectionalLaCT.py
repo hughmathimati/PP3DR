@@ -374,8 +374,6 @@ class GlobalLaCT(torch.nn.Module):
         sin, cos = rope3d
         # This combines/replaces steps 2 and 3. Notice that instead of absorbing nh into B and creating a new tensor
         # with LHW after removing the register tokens, we instead separate L from HW and broadcast the RoPE with a view.
-        print("Pre q:") # DEBUG
-        print(q[0, 0, 5, 0])
         q_tokens, k_tokens = apply_rope_no_prefix(
             # (B, L, HW, nh, hd)
             q[:, :, self.num_registers:, :, :],
@@ -383,8 +381,6 @@ class GlobalLaCT(torch.nn.Module):
             # (broadcast B, L, HW, broadcast nh, hd)
             (sin.view(1, L, -1, 1, self.head_dim), cos.view(1, L, -1, 1, self.head_dim))
         )
-        print("Post q:")  # DEBUG
-        print(q_tokens[0, 0, 0, 0])
         # Step 4 is now no longer needed, as we maintained the original shape from before!
         # Step 5.
         q, k = torch.cat((q_registers, q_tokens), dim = 2), torch.cat((k_registers, k_tokens), dim = 2)

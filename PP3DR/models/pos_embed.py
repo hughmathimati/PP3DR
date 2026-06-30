@@ -230,7 +230,7 @@ class Rope3D(nn.Module):
 
         # Prepare angles and sin/cos
         # coords is [LHW, 3]. periods is [3, self.rope_dim]
-        angles = torch.empty(coords.shape[0], self.D_head // 2)
+        angles = torch.empty(coords.shape[0], self.D_head // 2, **dd)
         # [LHW, self.D_head // 2]
         angles[:, self.remainder_per_half:] = (2 * math.pi * coords[:, :, None] / self.periods[None, :, :]).flatten(1, 2)
         angles[:, :self.remainder_per_half] = 0

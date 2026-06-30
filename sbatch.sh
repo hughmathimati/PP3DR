@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=optimizer_split
-#SBATCH --output=optimizer_split-%j.out
+#SBATCH --job-name=finetune
+#SBATCH --output=finetune-%j.out
 #SBATCH --partition=vulcan-ampere
 #SBATCH --ntasks 1
 #SBATCH --cpus-per-task=32
@@ -20,4 +20,4 @@ cd /vulcanscratch/hughma/ViT/
 module load gcc
 module load cuda
 export PYTORCH_ALLOC_CONF=expandable_segments:True
-accelerate launch ViTTT_distill_optimizer_split.py # Don't forget you need to `accelerate launch`, not just `python`!!!
+accelerate launch ViTTT_distill_finetune.py # Don't forget you need to `accelerate launch`, not just `python`!!!

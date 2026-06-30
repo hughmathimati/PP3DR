@@ -228,11 +228,11 @@ class PP3DR(nn.Module):
         self.global_blocks = nn.ModuleList([GlobalBlock(dim, num_heads, ffn_ratio)] * self.blocks_each)
         self.local_blocks = nn.ModuleList([LocalBlock(dim, num_heads, ffn_ratio)] * self.blocks_each)
         # We don't store num_registers here. It gets stored in the decoder heads.
-        self.rope2d = RopePositionEmbedding(embed_dim = dim, num_heads = num_heads)
-        self.rope3d = Rope3D(embed_dim = dim, num_heads = num_heads)
+        self.rope2d = RopePositionEmbedding(embed_dim = dim, num_heads = num_heads, device = "cuda")
+        self.rope3d = Rope3D(embed_dim = dim, num_heads = num_heads, device = "cuda")
 
         self.processor, self.dino = load_dinov3()
-        self.dino.eval()
+        self.dino = self.dino.to("cuda").eval()
 
         # ViTTT puts in the registers for me.
         self.num_registers = num_registers
@@ -279,11 +279,7 @@ class PP3DR(nn.Module):
         """
         We will now perform alternating-attention, starting with global attention and ending with frame-wise attention.
         """
-        rope2d, rope3d = self.rope2d(H, W), self.rope3d(L, H, W)
-        print("pre blocks shape:")
-        print(x.shape)
-        print("rope shapes:")
-        print(rope2d[0].shape, rope3d[0].shape)
+        rope2d, rope3d = self.rope2d(H // 16, W // 16), self.rope3d(L, H // 16, W // 16)
         for i in range(self.blocks_each):
             if self.training and i >= self.start_checkpointing:
                 # Global attention: absorb frame-length into patch-length dimension.
