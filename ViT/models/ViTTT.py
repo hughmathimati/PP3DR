@@ -44,7 +44,7 @@ class Block(nn.Module):
         x = x + self.drop_path(self.layer_scale_2(self.ffn(self.layer_norm_2(x))))
         return x
 
-@torch.compile(dynamic = True) # If you compile this module, comment the assert first.
+@torch.compile()
 class ViTTT(nn.Module):
     def __init__(
             self,
@@ -141,5 +141,5 @@ if __name__ == "__main__":
     print(features.shape)
     features = low_rank(features)
     print(f"lowrank: {features.shape}")
-    write_to_image(features, 42, 60, name = "images/ViTTT_cat_muon_lr 4.png")
-    # write_to_image(features, 27, 64, name = "images/ViTTT_sintel_muon_lr 4.png")
+    write_to_image(features, 42, 60, name = "images/ViTTT_cat_finetune 8.png")
+    # write_to_image(features, 27, 64, name = "images/ViTTT_sintel_finetune 8.png")

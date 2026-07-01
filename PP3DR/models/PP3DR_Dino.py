@@ -88,8 +88,8 @@ class PointHead(nn.Module):
         assert blocks % 2 == 0, f"Number of decoder blocks ({blocks}) must be even for alternating global and frame-wise attention"
         self.blocks_each = blocks // 2
         self.dim = dim
-        self.global_blocks = nn.ModuleList([GlobalBlock(dim, num_heads, ffn_ratio)] * self.blocks_each)
-        self.local_blocks = nn.ModuleList([LocalBlock(dim, num_heads, ffn_ratio)] * self.blocks_each)
+        self.global_blocks = nn.ModuleList([GlobalBlock(dim, num_heads, ffn_ratio) for _ in range(self.blocks_each)])
+        self.local_blocks = nn.ModuleList([LocalBlock(dim, num_heads, ffn_ratio) for _ in range(self.blocks_each)])
         self.layer_norm = nn.LayerNorm(dim) # Pre-projection layer norm.
         self.dim_proj = nn.Linear(dim, 16**2 * output_dim)
         self.num_registers = num_registers
@@ -151,8 +151,8 @@ class PoseHead(nn.Module):
         assert blocks % 2 == 0, f"Number of decoder blocks ({blocks}) must be even for alternating global and frame-wise attention"
         self.blocks_each = blocks // 2
         self.dim = dim
-        self.global_blocks = nn.ModuleList([GlobalBlock(dim, num_heads, ffn_ratio)] * self.blocks_each)
-        self.local_blocks = nn.ModuleList([LocalBlock(dim, num_heads, ffn_ratio)] * self.blocks_each)
+        self.global_blocks = nn.ModuleList([GlobalBlock(dim, num_heads, ffn_ratio) for _ in range(self.blocks_each)])
+        self.local_blocks = nn.ModuleList([LocalBlock(dim, num_heads, ffn_ratio) for _ in range(self.blocks_each)])
         self.layer_norm = nn.LayerNorm(num_registers * dim) # Pre-projection layer norm.
         self.dim_proj = nn.Linear(num_registers * dim, output_dim)
         self.num_registers = num_registers
@@ -225,8 +225,8 @@ class PP3DR(nn.Module):
 
         # General decoder
         self.dim = dim
-        self.global_blocks = nn.ModuleList([GlobalBlock(dim, num_heads, ffn_ratio)] * self.blocks_each)
-        self.local_blocks = nn.ModuleList([LocalBlock(dim, num_heads, ffn_ratio)] * self.blocks_each)
+        self.global_blocks = nn.ModuleList([GlobalBlock(dim, num_heads, ffn_ratio) for _ in range(self.blocks_each)])
+        self.local_blocks = nn.ModuleList([LocalBlock(dim, num_heads, ffn_ratio) for _ in range(self.blocks_each)])
         # We don't store num_registers here. It gets stored in the decoder heads.
         self.rope2d = RopePositionEmbedding(embed_dim = dim, num_heads = num_heads, device = "cuda")
         self.rope3d = Rope3D(embed_dim = dim, num_heads = num_heads, device = "cuda")

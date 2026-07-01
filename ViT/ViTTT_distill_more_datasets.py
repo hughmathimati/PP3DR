@@ -8,6 +8,9 @@ from datasets.dynamic_replica_dataset import dynamic_replica_dataset
 from datasets.mega_depth_dataset import mega_depth_dataset
 from datasets.object_net_dataset import object_net_dataset
 from datasets.eth3d_dataset import eth3d_dataset
+from datasets.from_games_dataset import from_games_dataset
+from datasets.open_images_dataset import open_images_dataset
+from datasets.youtube_vis_dataset import youtube_vis_dataset
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -71,6 +74,8 @@ def train_on_dataset(name, iterator, dataloader):
         pred = ViTTT_model(batch.to(accelerator.device, non_blocking=True))[:, 5:] # Discard register tokens
         loss = metric(pred, gt)
         state.train_losses[state.epoch - 1] += loss.detach()
+        AdamW.zero_grad()
+        Muon.zero_grad()
         accelerator.backward(loss)
         # Clamps the total norm of the gradients to 1.0
         torch.nn.utils.clip_grad_norm_(ViTTT_model.parameters(), max_norm=1.0)
@@ -78,8 +83,6 @@ def train_on_dataset(name, iterator, dataloader):
         Muon.step()
         AdamW_scheduler.step()
         Muon_scheduler.step()
-        AdamW.zero_grad()
-        Muon.zero_grad()
 
 
 def val_on_dataset(name, iterator, dataloader):
@@ -94,9 +97,9 @@ def val_on_dataset(name, iterator, dataloader):
         state.val_losses[state.epoch - 1] += metric(pred, gt).detach()
 
 
-def get_vittt_param_groups(model: nn.Module, adamw_lr: float = 1e-6, muon_lr: float = 5e-4,
+def get_vittt_param_groups(model: nn.Module, adamw_lr: float = 1e-5, muon_lr: float = 5e-3,
                            # For fine-tuning with a very low lr, we'll discard weight decay.
-                           weight_decay: float = 0, layer_decay: float = 0.99,
+                           weight_decay: float = 0.04, layer_decay: float = 0.9,
                            num_layers: int = 24):
     """
     Separates model parameters into AdamW and Muon parameter groups,
@@ -200,6 +203,9 @@ def prepare_dataloaders():
             mega_depth_dataset(),
             object_net_dataset(),
             eth3d_dataset(),
+            from_games_dataset(),
+            open_images_dataset(),
+            youtube_vis_dataset()
         ]),
         batch_size=128, # is 128 any better than 64?
         shuffle=True,  # Critical: Shuffles across all domains!
@@ -214,7 +220,7 @@ def prepare_dataloaders():
     return train_dataloader, val_dataloader
 
 
-@torch.compile(dynamic=True)
+@torch.compile()
 class CosineLoss(nn.Module):
     def __init__(self):
         super().__init__()
@@ -232,9 +238,9 @@ if __name__ == "__main__":
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"/tmp/torchinductor_cache_rank_{os.environ.get("LOCAL_RANK", "0")}"
     torch.set_float32_matmul_precision('high')
 
-    epochs = 16
-    checkpoint_every = 4
-    checkpoint = "/vulcanscratch/hughma/ViT/muon_lr/epoch 8"
+    epochs = 4
+    checkpoint_every = 1
+    checkpoint = None
     jobs = [
         partial(initialize, epochs),
         load_dinov3,
@@ -274,23 +280,65 @@ if __name__ == "__main__":
         processor, dino.eval(), ViTTT_model, AdamW, Muon, AdamW_scheduler, Muon_scheduler
     )
 
-    accelerator.load_state(checkpoint)
-    if accelerator.is_local_main_process:
-        print(f"Loaded checkpoint from {checkpoint}")
-    # For some reason, accelerate seems to load the `state` tensors on the cpu. I don't know why this is, but I'll
-    # just move them back.
-    state.train_losses = state.train_losses.to(accelerator.device, non_blocking=True)
-    state.val_losses = state.val_losses.to(accelerator.device, non_blocking=True)
+    if checkpoint is not None:
+        accelerator.load_state(checkpoint)
+        if accelerator.is_local_main_process:
+            print(f"Loaded checkpoint from {checkpoint}")
+        # For some reason, accelerate seems to load the `state` tensors on the cpu. I don't know why this is, but I'll
+        # just move them back.
+        state.train_losses = state.train_losses.to(accelerator.device, non_blocking=True)
+        state.val_losses = state.val_losses.to(accelerator.device, non_blocking=True)
+    else:
+        accelerate.utils.set_seed(42)
+        if accelerator.is_local_main_process:
+            print("Starting from scratch, with seed 42.")
 
+    train_iter = iter(train_dataloader)
+
+    # with accelerator.profile() as prof:
+    # Training loop
+    start = state.epoch
+    while state.epoch <= epochs:
+        val_iter = iter(val_dataloader)
+        if state.epoch % checkpoint_every == 0 or state.epoch == 1:
+            accelerator.save_state(output_dir=f"/vulcanscratch/hughma/ViT/more_datasets/epoch {state.epoch}",
+                                   total_limit=3)
+            if accelerator.is_local_main_process:
+                print("Checkpoint saved.")
+
+        if accelerator.is_local_main_process:
+            print(f"Epoch {state.epoch}/{epochs}:")
+
+        ViTTT_model.train()
+        train_on_dataset("Combined train set", train_iter, train_dataloader)
+
+        # Pre-load NRGBD iterator for the next epoch.
+        if state.epoch != epochs:
+            train_iter = iter(train_dataloader)
+
+        # Validation on Sintel
+        ViTTT_model.eval()
+        with torch.no_grad():
+            val_on_dataset("Sintel", val_iter, val_dataloader)
+
+        state.epoch += 1
+
+    # End of training loop; write losses to file
+    if accelerator.is_local_main_process:
+        print("Training done.")
     accelerator.reduce(state.train_losses, "sum")
     accelerator.reduce(state.val_losses, "sum")
 
     if accelerator.is_local_main_process:
-        with open("partial losses/train_losses.pkl", "wb") as f:
+        with open("/vulcanscratch/hughma/ViT/more_datasets/train_losses.pkl", "wb") as f:
             pickle.dump(state.train_losses.numpy(force=True), f)
         print("Saved train_losses")
-        with open("partial losses/val_losses.pkl", "wb") as f:
+        with open("/vulcanscratch/hughma/ViT/more_datasets/val_losses.pkl", "wb") as f:
             pickle.dump(state.val_losses.numpy(force=True), f)
         print("Saved val_losses")
-        torch.save(ViTTT_model.state_dict(), "partial losses/ViTTT.pth")
+        torch.save(ViTTT_model.state_dict(), "/vulcanscratch/hughma/ViT/more_datasets/ViTTT.pth")
         print("Saved model")
+
+    # if accelerator.is_local_main_process:
+    #     prof.export_chrome_trace(f"trace.json")
+    #     print("Saved trace")
