@@ -13,10 +13,7 @@ class youtube_vis_dataset(torch.utils.data.Dataset):
     90160 images in total.
     """
     # The shortest sequence only has 20 images.
-    def __init__(self,
-                 dir="/fs/vulcan-datasets/YouTubeVIS-2021/train/train/JPEGImages/",
-                 invalid_files_list = "/vulcanscratch/hughma/ViT/datasets/invalid_youtube_vis_files.txt"
-                 ):
+    def __init__(self, dir="/fs/vulcan-datasets/YouTubeVIS-2021/train/train/JPEGImages/"):
         super().__init__()
         self.sequences = os.listdir(dir)
         # (sequence, image #)
@@ -25,22 +22,6 @@ class youtube_vis_dataset(torch.utils.data.Dataset):
             sequence_dir = os.path.join(dir, sequence)
             for image in os.listdir(sequence_dir):
                 self.image_paths.append(os.path.join(sequence_dir, image))
-
-        invalid_set = set()
-        if os.path.exists(invalid_files_list):
-            with open(invalid_files_list, 'r') as f:
-                # .strip() is mandatory to remove the hidden '\n' from each line
-                invalid_set = {line.strip() for line in f}
-            print(f"YoutubeVis-2021: Loaded {len(invalid_set)} known invalid file paths.")
-        else:
-            print(f"YoutubeVis-2021: Warning: Exclusion list '{invalid_files_list}' not found. Proceeding unfiltered.")
-
-        # 3. Filter the main list
-        # We cast `p` to string just in case your discovery method returns Pathlib objects
-        self.image_paths = [
-            p for p in self.image_paths
-            if str(p) not in invalid_set
-        ]
 
         self.len = len(self.image_paths)
         self.crop = transforms.RandomCrop(512)

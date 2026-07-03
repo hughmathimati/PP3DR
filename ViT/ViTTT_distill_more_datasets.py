@@ -86,8 +86,9 @@ def train_on_dataset(name, iterator, dataloader):
 
 
 def val_on_dataset(name, iterator, dataloader):
-    for batch in tqdm(iterator, desc=f"Validation {name}", disable=not accelerator.is_local_main_process,
-                      total=len(dataloader)):
+    for batch in tqdm(
+            iterator, desc=f"Validation {name}", disable=not accelerator.is_local_main_process, total=len(dataloader), mininterval = 1
+    ):
         # Accelerate automatically handles autocast.
         # torch.no_grad() is included inside obtain_features().
         # with torch.profiler.record_function("dino_val_inference"):

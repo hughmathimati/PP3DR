@@ -17,10 +17,7 @@ class open_images_dataset(torch.utils.data.Dataset):
     """
 
     # The shortest sequence only has 20 images.
-    def __init__(self,
-                 dir="/fs/vulcan-datasets/OpenImagesv4/train_",
-                 invalid_files_list="/vulcanscratch/hughma/ViT/datasets/invalid_open_images_files.txt"
-                 ):
+    def __init__(self, dir="/fs/vulcan-datasets/OpenImagesv4/train_"):
         train_sets = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f']
         # (sequence, image #)
         self.image_paths = []
@@ -28,22 +25,6 @@ class open_images_dataset(torch.utils.data.Dataset):
             folder = dir + image_set
             for image in tqdm(os.listdir(folder), desc=f"Precomputing OpenImagesv4 image file paths (train set {image_set})"):
                 self.image_paths.append(os.path.join(folder, image))
-
-        invalid_set = set()
-        if os.path.exists(invalid_files_list):
-            with open(invalid_files_list, 'r') as f:
-                # .strip() is mandatory to remove the hidden '\n' from each line
-                invalid_set = {line.strip() for line in f}
-            print(f"OpenImagesv4: Loaded {len(invalid_set)} known invalid file paths.")
-        else:
-            print(f"OpenImagesv4: Warning: Exclusion list '{invalid_files_list}' not found. Proceeding unfiltered.")
-
-        # 3. Filter the main list
-        # We cast `p` to string just in case your discovery method returns Pathlib objects
-        self.image_paths = [
-            p for p in self.image_paths
-            if str(p) not in invalid_set
-        ]
 
         self.len = len(self.image_paths)
         self.crop = transforms.RandomCrop(512)

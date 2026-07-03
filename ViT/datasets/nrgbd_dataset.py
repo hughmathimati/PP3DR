@@ -8,7 +8,7 @@ from tqdm import tqdm
 class nrgbd_dataset(torch.utils.data.Dataset):
     """
     Dataset for NRGBD images only.
-    680 x 480
+    640 x 480
     10970 images in total.
     """
     # The shortest sequence only has 20 images.

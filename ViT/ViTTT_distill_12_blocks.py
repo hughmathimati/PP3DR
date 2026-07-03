@@ -1,3 +1,4 @@
+name = "12_blocks"
 import transformers.optimization
 from models.ViTTT import ViTTT
 from models.Dinov3 import load_dinov3, obtain_features
@@ -99,7 +100,6 @@ def val_on_dataset(name, iterator, dataloader):
 
 
 def get_vittt_param_groups(model: nn.Module, adamw_lr: float = 1e-5, muon_lr: float = 5e-3,
-                           # For fine-tuning with a very low lr, we'll discard weight decay.
                            weight_decay: float = 0.04, layer_decay: float = 0.9,
                            num_layers: int = 24):
     """
@@ -164,8 +164,8 @@ def get_vittt_param_groups(model: nn.Module, adamw_lr: float = 1e-5, muon_lr: fl
     return list(AdamW_params.values()), list(Muon_params.values())
 
 
-def initialize(epochs, pretrained_path = "/vulcanscratch/hughma/ViT/optimizer_split/optimizer_split ViTTT epoch 4.pth"):
-    ViTTT_model = ViTTT(blocks = 24)
+def initialize(epochs, pretrained_path = None):
+    ViTTT_model = ViTTT(blocks = 12)
     if pretrained_path is not None:
         ViTTT_model.load_state_dict(torch.load(pretrained_path, weights_only=True))
         print("Loaded pretrained weights from", pretrained_path)
@@ -185,7 +185,7 @@ def initialize(epochs, pretrained_path = "/vulcanscratch/hughma/ViT/optimizer_sp
 
     AdamW_params, Muon_params = get_vittt_param_groups(
         model=ViTTT_model,
-        num_layers=24  # Update to match your model depth
+        num_layers=12  # Update to match your model depth
     )
 
     AdamW = torch.optim.AdamW(AdamW_params, betas=(0.9, 0.99), foreach=True)
@@ -239,9 +239,9 @@ if __name__ == "__main__":
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"/tmp/torchinductor_cache_rank_{os.environ.get("LOCAL_RANK", "0")}"
     torch.set_float32_matmul_precision('high')
 
-    epochs = 4
+    epochs = 8
     checkpoint_every = 1
-    checkpoint = "/vulcanscratch/hughma/ViT/more_datasets/epoch 3"
+    checkpoint = None
     jobs = [
         partial(initialize, epochs),
         load_dinov3,
@@ -281,23 +281,65 @@ if __name__ == "__main__":
         processor, dino.eval(), ViTTT_model, AdamW, Muon, AdamW_scheduler, Muon_scheduler
     )
 
-    accelerator.load_state(checkpoint)
-    if accelerator.is_local_main_process:
-        print(f"Loaded checkpoint from {checkpoint}")
-    # For some reason, accelerate seems to load the `state` tensors on the cpu. I don't know why this is, but I'll
-    # just move them back.
-    state.train_losses = state.train_losses.to(accelerator.device, non_blocking=True)
-    state.val_losses = state.val_losses.to(accelerator.device, non_blocking=True)
+    if checkpoint is not None:
+        accelerator.load_state(checkpoint)
+        if accelerator.is_local_main_process:
+            print(f"Loaded checkpoint from {checkpoint}")
+        # For some reason, accelerate seems to load the `state` tensors on the cpu. I don't know why this is, but I'll
+        # just move them back.
+        state.train_losses = state.train_losses.to(accelerator.device, non_blocking=True)
+        state.val_losses = state.val_losses.to(accelerator.device, non_blocking=True)
+    else:
+        accelerate.utils.set_seed(42)
+        if accelerator.is_local_main_process:
+            print("Starting from scratch, with seed 42.")
 
+    train_iter = iter(train_dataloader)
+
+    # with accelerator.profile() as prof:
+    # Training loop
+    start = state.epoch
+    while state.epoch <= epochs:
+        val_iter = iter(val_dataloader)
+        if state.epoch % checkpoint_every == 0 or state.epoch == 1:
+            accelerator.save_state(output_dir=f"/vulcanscratch/hughma/ViT/{name}/epoch {state.epoch}",
+                                   total_limit=3)
+            if accelerator.is_local_main_process:
+                print("Checkpoint saved.")
+
+        if accelerator.is_local_main_process:
+            print(f"Epoch {state.epoch}/{epochs}:")
+
+        ViTTT_model.train()
+        train_on_dataset("Combined train set", train_iter, train_dataloader)
+
+        # Pre-load NRGBD iterator for the next epoch.
+        if state.epoch != epochs:
+            train_iter = iter(train_dataloader)
+
+        # Validation on Sintel
+        ViTTT_model.eval()
+        with torch.no_grad():
+            val_on_dataset("Sintel", val_iter, val_dataloader)
+
+        state.epoch += 1
+
+    # End of training loop; write losses to file
+    if accelerator.is_local_main_process:
+        print("Training done.")
     accelerator.reduce(state.train_losses, "sum")
     accelerator.reduce(state.val_losses, "sum")
 
     if accelerator.is_local_main_process:
-        with open("partial losses/train_losses.pkl", "wb") as f:
+        with open(f"/vulcanscratch/hughma/ViT/{name}/train_losses.pkl", "wb") as f:
             pickle.dump(state.train_losses.numpy(force=True), f)
         print("Saved train_losses")
-        with open("partial losses/val_losses.pkl", "wb") as f:
+        with open(f"/vulcanscratch/hughma/ViT/{name}/val_losses.pkl", "wb") as f:
             pickle.dump(state.val_losses.numpy(force=True), f)
         print("Saved val_losses")
-        torch.save(ViTTT_model.state_dict(), "partial losses/ViTTT.pth")
+        torch.save(ViTTT_model.state_dict(), f"/vulcanscratch/hughma/ViT/{name}/ViTTT.pth")
         print("Saved model")
+
+    # if accelerator.is_local_main_process:
+    #     prof.export_chrome_trace(f"trace.json")
+    #     print("Saved trace")

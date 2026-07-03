@@ -206,8 +206,8 @@ def preprocess(image):
     new_H, new_W = image.shape[-2] // 16, image.shape[-1] // 16
     return transforms.functional.center_crop(image, (new_H, new_W)), new_H, new_W
 
-# @torch.compile(dynamic = True)
-class PP3DR(nn.Module):
+# @torch.compile()
+class PP3DR_Dino(nn.Module):
     def __init__(
             self,
             dim: int = 1280,
@@ -264,7 +264,7 @@ class PP3DR(nn.Module):
         -------
         "XY_ray": Normalized XY ray direction for each pixel's point
 
-        "inverse_depth": Inverse depth for each pixel's point (ReLU'ed to keep non-negative)
+        "log_depth": Log depth for each pixel's point
 
         "relative_camera_translation": (x, y, z) translation between this camera pose and the next one
 
@@ -293,10 +293,11 @@ class PP3DR(nn.Module):
         # x.shape == (B * L, num_registers + HW // 256, dim)
         # Step 2: Per-task decoders
         points = self.point_decoder(x, rope2d, rope3d, L) # (B, L, HW, 3)
-        poses = self.pose_decoder(x, rope2d, rope3d, L) # (B, L, 9)
+        # We're predicting the relative pose from this frame to the next one, which is why our sequence length is L - 1.
+        poses = self.pose_decoder(x, rope2d, rope3d, L)[:, :-1] # (B, L - 1, 9)
 
         # Get the rotation matrix by orthogonalizing the first two 3D vectors, then taking the cross product for the third.
-        rotation = torch.empty(B, L, 3, 3) # going to take the transpose at the end
+        rotation = torch.empty(B, L - 1, 3, 3) # going to take the transpose at the end
         a = F.normalize(poses[:, :, 3:6], dim = -1)
         rotation[:, :, 0] = a
         b = poses[:, :, 6:]
@@ -306,10 +307,10 @@ class PP3DR(nn.Module):
         rotation[:, :, 2] = torch.linalg.cross(a, b, dim = -1)
 
         return {
-            "XY_ray": F.normalize(points[...,:2], dim = -1), # Normalize the XY ray direction
-            "inverse_depth": F.relu(points[...,2]), # ReLU the inverse depth to keep it positive
-            "relative_camera_translation": poses[..., :3], # 3 scalars, (x, y, z)
-            "relative_camera_rotation": rotation.transpose(-1, -2),
+            "XY_rays": F.normalize(points[...,:2], dim = -1), # Normalize the XY ray direction
+            "log_depths": points[...,2],
+            "relative_camera_translations": poses[:, :, :3], # (B, L - 1, 3) -> 3 scalars, (x, y, z)
+            "relative_camera_rotations": rotation.transpose(-1, -2) # (B, L - 1, 3, 3)
         }
 
 
