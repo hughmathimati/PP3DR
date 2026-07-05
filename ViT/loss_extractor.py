@@ -1,3 +1,4 @@
+name = "12_blocks"
 import transformers.optimization
 from models.ViTTT import ViTTT
 from models.Dinov3 import load_dinov3, obtain_features
@@ -99,7 +100,6 @@ def val_on_dataset(name, iterator, dataloader):
 
 
 def get_vittt_param_groups(model: nn.Module, adamw_lr: float = 1e-5, muon_lr: float = 5e-3,
-                           # For fine-tuning with a very low lr, we'll discard weight decay.
                            weight_decay: float = 0.04, layer_decay: float = 0.9,
                            num_layers: int = 24):
     """
@@ -164,8 +164,8 @@ def get_vittt_param_groups(model: nn.Module, adamw_lr: float = 1e-5, muon_lr: fl
     return list(AdamW_params.values()), list(Muon_params.values())
 
 
-def initialize(epochs, pretrained_path = "/vulcanscratch/hughma/ViT/optimizer_split/optimizer_split ViTTT epoch 4.pth"):
-    ViTTT_model = ViTTT(blocks = 24)
+def initialize(epochs, pretrained_path = None):
+    ViTTT_model = ViTTT(blocks = 12)
     if pretrained_path is not None:
         ViTTT_model.load_state_dict(torch.load(pretrained_path, weights_only=True))
         print("Loaded pretrained weights from", pretrained_path)
@@ -185,7 +185,7 @@ def initialize(epochs, pretrained_path = "/vulcanscratch/hughma/ViT/optimizer_sp
 
     AdamW_params, Muon_params = get_vittt_param_groups(
         model=ViTTT_model,
-        num_layers=24  # Update to match your model depth
+        num_layers=12  # Update to match your model depth
     )
 
     AdamW = torch.optim.AdamW(AdamW_params, betas=(0.9, 0.99), foreach=True)
@@ -239,9 +239,9 @@ if __name__ == "__main__":
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"/tmp/torchinductor_cache_rank_{os.environ.get("LOCAL_RANK", "0")}"
     torch.set_float32_matmul_precision('high')
 
-    epochs = 4
+    epochs = 8
     checkpoint_every = 1
-    checkpoint = "/vulcanscratch/hughma/ViT/more_datasets/epoch 3"
+    checkpoint = "/vulcanscratch/hughma/ViT/12_blocks/epoch 6"
     jobs = [
         partial(initialize, epochs),
         load_dinov3,

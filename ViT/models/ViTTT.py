@@ -112,15 +112,15 @@ if __name__ == "__main__":
     torch.set_float32_matmul_precision('high')
     import torchvision
 
-    model = ViTTT(blocks = 24).to("cuda")
+    model = ViTTT(blocks = 12).to("cuda")
     print("loading state dict...")
-    loaded_state_dict = torch.load("/vulcanscratch/hughma/ViT/more_datasets/ViTTT.pth", weights_only=True)
+    loaded_state_dict = torch.load("/vulcanscratch/hughma/ViT/12_blocks/best_checkpoint.pth", weights_only=True)
 
     # The lines here are necessary if all the loaded state dict entries begin with an extra "module."
-    new_state_dict = {}
-    for key in loaded_state_dict:
-        new_state_dict[key[7:]] = loaded_state_dict[key]
-    model.load_state_dict(new_state_dict)
+    # new_state_dict = {}
+    # for key in loaded_state_dict:
+    #     new_state_dict[key[7:]] = loaded_state_dict[key]
+    model.load_state_dict(loaded_state_dict)
 
     model.eval()
     image = load_image("https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/pipeline-cat-chonk.jpeg")
@@ -141,5 +141,5 @@ if __name__ == "__main__":
     print(features.shape)
     features = low_rank(features)
     print(f"lowrank: {features.shape}")
-    write_to_image(features, 42, 60, name = "images/ViTTT_cat_more_datasets final.png")
-    # write_to_image(features, 27, 64, name = "images/ViTTT_sintel_more_datasets final.png")
+    write_to_image(features, 42, 60, name = "images/ViTTT_cat_12_blocks best_checkpoint.png")
+    # write_to_image(features, 27, 64, name = "images/ViTTT_sintel_12_blocks best_checkpoint.png")

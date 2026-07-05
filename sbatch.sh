@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=12_blocks
-#SBATCH --output=12_blocks-%j.out
+#SBATCH --job-name=12_blocks_finetune
+#SBATCH --output=12_blocks_finetune-%j.out
 #SBATCH --partition=vulcan-ampere
 #SBATCH --ntasks 1
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=512gb
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=256gb
 #SBATCH --gres=gpu:h200-sxm:4
 #SBATCH --account=vulcan-jbhuang
 #SBATCH --qos=vulcan-high-h200
@@ -20,4 +20,4 @@ cd /vulcanscratch/hughma/ViT/
 module load gcc
 module load cuda
 export PYTORCH_ALLOC_CONF=expandable_segments:True
-accelerate launch ViTTT_distill_12_blocks.py # Don't forget you need to `accelerate launch`, not just `python`!!!
+accelerate launch ViTTT_distill_12_blocks_finetune.py # Don't forget you need to `accelerate launch`, not just `python`!!!

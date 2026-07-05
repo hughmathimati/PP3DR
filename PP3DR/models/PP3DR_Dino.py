@@ -121,10 +121,8 @@ class PointHead(nn.Module):
         x = x[:, :, self.num_registers:, :]
         # x.shape == (B, L, HW // 256, dim)
         x = self.layer_norm(x)
-        print(x.shape)
         # Project so we end up with the correct number of dimensions at the end
         x = self.dim_proj(x)
-        print(x.shape)
         # x.shape == (B, L, HW // 256, 256 * output_dim)
         x = rearrange(x, "B L X (Y output_dim) -> B L (X Y) output_dim", output_dim = self.output_dim)
         # x.shape == (B, L, HW, output_dim)
@@ -206,7 +204,7 @@ def preprocess(image):
     new_H, new_W = image.shape[-2] // 16, image.shape[-1] // 16
     return transforms.functional.center_crop(image, (new_H, new_W)), new_H, new_W
 
-# @torch.compile()
+@torch.compile()
 class PP3DR_Dino(nn.Module):
     def __init__(
             self,
@@ -233,6 +231,8 @@ class PP3DR_Dino(nn.Module):
 
         self.processor, self.dino = load_dinov3()
         self.dino = self.dino.to("cuda").eval()
+        for parameter in self.dino.parameters():
+            parameter.requires_grad = False
 
         # ViTTT puts in the registers for me.
         self.num_registers = num_registers
@@ -292,12 +292,12 @@ class PP3DR_Dino(nn.Module):
 
         # x.shape == (B * L, num_registers + HW // 256, dim)
         # Step 2: Per-task decoders
-        points = self.point_decoder(x, rope2d, rope3d, L) # (B, L, HW, 3)
+        points = self.point_decoder(x, rope2d, rope3d, L).view(B, L, H, W, 3)
         # We're predicting the relative pose from this frame to the next one, which is why our sequence length is L - 1.
         poses = self.pose_decoder(x, rope2d, rope3d, L)[:, :-1] # (B, L - 1, 9)
 
         # Get the rotation matrix by orthogonalizing the first two 3D vectors, then taking the cross product for the third.
-        rotation = torch.empty(B, L - 1, 3, 3) # going to take the transpose at the end
+        rotation = torch.empty(B, L - 1, 3, 3, device = "cuda") # going to take the transpose at the end
         a = F.normalize(poses[:, :, 3:6], dim = -1)
         rotation[:, :, 0] = a
         b = poses[:, :, 6:]
@@ -315,13 +315,16 @@ class PP3DR_Dino(nn.Module):
 
 
 if __name__ == "__main__":
-    import time
-    from transformers.image_utils import load_image
-    import torchvision.transforms.v2 as transforms
-    model = PP3DR().to("cuda").eval() # You should really rename this
+    model = PP3DR_Dino().to('cuda')
+    print(model.dino.parameters())
+
+    # import time
+    # from transformers.image_utils import load_image
+    # import torchvision.transforms.v2 as transforms
+    # model = PP3DR_Dino().to("cuda").eval() # You should really rename this
     # (batch size, num frames, # channels, image height, image width)
-    fake_input = torch.randn(2, 4, 3, 200, 400).to("cuda")
-    output = model(fake_input)
-    for key in output:
-        print(key)
-        print(output[key].shape)
+    # fake_input = torch.randn(2, 4, 3, 200, 400).to("cuda")
+    # output = model(fake_input)
+    # for key in output:
+    #     print(key)
+    #     print(output[key].shape)

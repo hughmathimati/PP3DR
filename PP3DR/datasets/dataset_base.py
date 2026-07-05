@@ -6,6 +6,8 @@ import numpy as np
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
+import cv2
+cv2.setNumThreads(0)
 
 
 class DatasetBase(torch.utils.data.Dataset):
@@ -23,6 +25,7 @@ class DatasetBase(torch.utils.data.Dataset):
             }
         """
         super().__init__()
+        self.max_sequence_length = 10
 
     def images_helper(self, sequence_index, frame_indices):
         """
@@ -59,7 +62,8 @@ class DatasetBase(torch.utils.data.Dataset):
         -------
         (L, 1, H, W) tensor of the depths for this randomly-sampled sequence.
         """
-        return torch.stack(
+        # We're using torch.cat here instead of torch.stack because we want to get rid of the singleton channel dimension.
+        return torch.cat(
             [
                 transforms.functional.to_dtype(
                     torchvision.io.decode_image(
@@ -108,12 +112,12 @@ class DatasetBase(torch.utils.data.Dataset):
         """
         true_length = len(self.sequences[index]['images'])
         # We should never receive a sequence with only one frame...
-        end_index = max(1, true_length - 500)
-        num_frames = min(100, true_length)
+        end_index = max(1, true_length - 5 * self.max_sequence_length)
+        num_frames = min(self.max_sequence_length, true_length)
         frame_indices = torch.randint(low=0, high=end_index, size=(num_frames,))
         frame_indices.sort()
         # Ensure no frames are more than 10 apart
-        if true_length >= 120:
+        if true_length >= self.max_sequence_length + 10:
             for i in range(1, num_frames):
                 if frame_indices[i] - frame_indices[i - 1] > 10:
                     frame_indices[i] - frame_indices[i - 1] + 10

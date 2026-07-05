@@ -1,9 +1,17 @@
-name = "sanity"
+name = "12_blocks_finetune"
 import transformers.optimization
-from models.PP3DR_Dino import PP3DR_Dino
-from PP3DR_loss import PP3DR_loss
+from models.ViTTT import ViTTT
 from models.Dinov3 import load_dinov3, obtain_features
+from datasets.sintel_dataset import sintel_dataset
 from datasets.nrgbd_dataset import nrgbd_dataset
+from datasets.flying_things_3d_dataset import flying_things_3d_dataset
+from datasets.dynamic_replica_dataset import dynamic_replica_dataset
+from datasets.mega_depth_dataset import mega_depth_dataset
+from datasets.object_net_dataset import object_net_dataset
+from datasets.eth3d_dataset import eth3d_dataset
+from datasets.from_games_dataset import from_games_dataset
+from datasets.open_images_dataset import open_images_dataset
+from datasets.youtube_vis_dataset import youtube_vis_dataset
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -18,7 +26,7 @@ from functools import partial
 import pickle
 import accelerate
 from accelerate import Accelerator, ProfileKwargs, DataLoaderConfiguration
-from accelerate.utils import ProjectConfiguration, DistributedDataParallelKwargs
+from accelerate.utils import ProjectConfiguration
 from torch.utils.data import ConcatDataset, DataLoader
 
 accelerator = Accelerator(
@@ -61,15 +69,17 @@ def train_on_dataset(name, iterator, dataloader):
     ):
         # Accelerate automatically handles autocast.
         # torch.no_grad() is included inside obtain_features().
-        # with torch.profiler.record_function("inference"):
-        pred = PP3DR_model(batch['images'].to(accelerator.device, non_blocking=True))
-        loss = metric(pred, batch)
+        # with torch.profiler.record_function("dino_train_inference"):
+        gt = obtain_features(processor, dino, batch.to(accelerator.device, non_blocking=True))
+        # with torch.profiler.record_function("ViTTT_train_inference"):
+        pred = ViTTT_model(batch.to(accelerator.device, non_blocking=True))[:, 5:] # Discard register tokens
+        loss = metric(pred, gt)
         state.train_losses[state.epoch - 1] += loss.detach()
         AdamW.zero_grad()
         Muon.zero_grad()
         accelerator.backward(loss)
         # Clamps the total norm of the gradients to 1.0
-        torch.nn.utils.clip_grad_norm_(PP3DR_model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(ViTTT_model.parameters(), max_norm=1.0)
         AdamW.step()
         Muon.step()
         AdamW_scheduler.step()
@@ -77,17 +87,19 @@ def train_on_dataset(name, iterator, dataloader):
 
 
 def val_on_dataset(name, iterator, dataloader):
-    for batch in tqdm(iterator, desc=f"Validation {name}", disable=not accelerator.is_local_main_process,
-                      total=len(dataloader)):
+    for batch in tqdm(
+            iterator, desc=f"Validation {name}", disable=not accelerator.is_local_main_process, total=len(dataloader), mininterval = 1
+    ):
         # Accelerate automatically handles autocast.
         # torch.no_grad() is included inside obtain_features().
-        # with torch.profiler.record_function("val_inference"):
-        pred = PP3DR_model(batch['images'].to(accelerator.device, non_blocking=True))
+        # with torch.profiler.record_function("dino_val_inference"):
+        gt = obtain_features(processor, dino, batch.to(accelerator.device, non_blocking=True))
+        # with torch.profiler.record_function("ViTTT_val_inference"):
+        pred = ViTTT_model(batch.to(accelerator.device, non_blocking=True))[:, 5:] # Discard register tokens
         state.val_losses[state.epoch - 1] += metric(pred, gt).detach()
 
 
-def get_pp3dr_param_groups(model: nn.Module, adamw_lr: float = 1e-5, muon_lr: float = 5e-3,
-                           # For fine-tuning with a very low lr, we'll discard weight decay.
+def get_vittt_param_groups(model: nn.Module, adamw_lr: float = 1e-6, muon_lr: float = 5e-4,
                            weight_decay: float = 0.04, layer_decay: float = 0.9,
                            num_layers: int = 24):
     """
@@ -152,10 +164,10 @@ def get_pp3dr_param_groups(model: nn.Module, adamw_lr: float = 1e-5, muon_lr: fl
     return list(AdamW_params.values()), list(Muon_params.values())
 
 
-def initialize(epochs, pretrained_path = None):
-    PP3DR_model = PP3DR_Dino()
+def initialize(epochs, pretrained_path = "/vulcanscratch/hughma/ViT/12_blocks/best_checkpoint.pth"):
+    ViTTT_model = ViTTT(blocks = 12)
     if pretrained_path is not None:
-        PP3DR_model.load_state_dict(torch.load(pretrained_path, weights_only=True))
+        ViTTT_model.load_state_dict(torch.load(pretrained_path, weights_only=True))
         print("Loaded pretrained weights from", pretrained_path)
 
     def init_vit_weights(module):
@@ -169,37 +181,57 @@ def initialize(epochs, pretrained_path = None):
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
-    PP3DR_model.apply(init_vit_weights)
+    ViTTT_model.apply(init_vit_weights)
 
-    AdamW_params, Muon_params = get_pp3dr_param_groups(
-        model=PP3DR_model,
-        num_layers=24  # Update to match your model depth
+    AdamW_params, Muon_params = get_vittt_param_groups(
+        model=ViTTT_model,
+        num_layers=12  # Update to match your model depth
     )
 
     AdamW = torch.optim.AdamW(AdamW_params, betas=(0.9, 0.99), foreach=True)
     Muon = torch.optim.Muon(Muon_params)
     state = State(epochs)
     accelerator.register_for_checkpointing(state)
-    return state, PP3DR_model, AdamW, Muon
+    return state, ViTTT_model, AdamW, Muon
 
 
 def prepare_dataloaders():
     train_dataloader = DataLoader(
         ConcatDataset([
             nrgbd_dataset(),
+            flying_things_3d_dataset(),
+            dynamic_replica_dataset(),
+            mega_depth_dataset(),
+            object_net_dataset(),
+            eth3d_dataset(),
+            from_games_dataset(),
+            open_images_dataset(),
+            youtube_vis_dataset()
         ]),
-        batch_size=1, # If we want to use a batch size larger than 1, we have to perform rescaling.
+        batch_size=128, # is 128 any better than 64?
         shuffle=True,  # Critical: Shuffles across all domains!
-        num_workers=3,
+        # IMPORTANT!!! num_workers IS PER-PROCESS!!!
+        num_workers=8,
         pin_memory=True
     )
 
     # 1024 x 436
-    # No val during sanity check
-    # val_dataloader = DataLoader(sintel_dataset(), batch_size=16, shuffle=False, num_workers=4,
-    #                                              persistent_workers=True, pin_memory=True)
+    val_dataloader = DataLoader(sintel_dataset(), batch_size=4, shuffle=False, num_workers=4,
+                                                 persistent_workers=True, pin_memory=True)
 
-    return train_dataloader
+    return train_dataloader, val_dataloader
+
+
+@torch.compile()
+class CosineLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.sim = nn.CosineSimilarity(
+            dim=-1)  # default dim is 1, so we actually do have to explicitly pass this parameter.
+
+    def forward(self, pred, gt):
+        # Ignore the register tokens. pca_lowrank() to lower dino output to ViTTT dim.
+        return 1 - self.sim(pred, gt).mean()
 
 
 if __name__ == "__main__":
@@ -208,26 +240,30 @@ if __name__ == "__main__":
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"/tmp/torchinductor_cache_rank_{os.environ.get("LOCAL_RANK", "0")}"
     torch.set_float32_matmul_precision('high')
 
-    epochs = 50
-    checkpoint_every = 25
-    checkpoint = None
+    epochs = 8
+    checkpoint_every = 1
+    checkpoint = "/vulcanscratch/hughma/ViT/12_blocks_finetune/epoch 3"
     jobs = [
         partial(initialize, epochs),
+        load_dinov3,
         prepare_dataloaders,
     ]
     # ProcessPoolExecutor -> Cannot re-initialize CUDA in forked subprocess.
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = [executor.submit(job) for job in jobs]
-        metric = PP3DR_loss()
+        metric = CosineLoss()
         # futures.as_completed returns futures in the order they complete, not their original order.
         for future in concurrent.futures.as_completed(futures):
             match futures.index(future):
                 case 0:
-                    state, PP3DR_model, AdamW, Muon = future.result()
+                    state, ViTTT_model, AdamW, Muon = future.result()
                 case 1:
-                    train_dataloader = future.result()
+                    processor, dino = future.result()
+                case 2:
+                    train_dataloader, val_dataloader = future.result()
 
-    train_dataloader = accelerator.prepare(train_dataloader)
+    # Immediately start loading the data.
+    train_dataloader, val_dataloader = accelerator.prepare(train_dataloader, val_dataloader)
     total_training_steps = len(train_dataloader) * epochs
 
     AdamW_scheduler = transformers.optimization.get_cosine_schedule_with_warmup(
@@ -242,8 +278,8 @@ if __name__ == "__main__":
     )
     # Register the LR schedulers
     accelerator.register_for_checkpointing(AdamW_scheduler, Muon_scheduler)
-    PP3DR_model, AdamW, Muon, AdamW_scheduler, Muon_scheduler = accelerator.prepare(
-        PP3DR_model, AdamW, Muon, AdamW_scheduler, Muon_scheduler
+    processor, dino, ViTTT_model, AdamW, Muon, AdamW_scheduler, Muon_scheduler = accelerator.prepare(
+        processor, dino.eval(), ViTTT_model, AdamW, Muon, AdamW_scheduler, Muon_scheduler
     )
 
     if checkpoint is not None:
@@ -265,9 +301,9 @@ if __name__ == "__main__":
     # Training loop
     start = state.epoch
     while state.epoch <= epochs:
-        # val_iter = iter(val_dataloader)
-        if state.epoch % checkpoint_every == 0:
-            accelerator.save_state(output_dir=f"/vulcanscratch/hughma/PP3DR/{name}/epoch {state.epoch}",
+        val_iter = iter(val_dataloader)
+        if state.epoch % checkpoint_every == 0 or state.epoch == 1:
+            accelerator.save_state(output_dir=f"/vulcanscratch/hughma/ViT/{name}/epoch {state.epoch}",
                                    total_limit=3)
             if accelerator.is_local_main_process:
                 print("Checkpoint saved.")
@@ -275,7 +311,7 @@ if __name__ == "__main__":
         if accelerator.is_local_main_process:
             print(f"Epoch {state.epoch}/{epochs}:")
 
-        PP3DR_model.train()
+        ViTTT_model.train()
         train_on_dataset("Combined train set", train_iter, train_dataloader)
 
         # Pre-load NRGBD iterator for the next epoch.
@@ -283,9 +319,9 @@ if __name__ == "__main__":
             train_iter = iter(train_dataloader)
 
         # Validation on Sintel
-        # PP3DR_model.eval()
-        # with torch.no_grad():
-        #     val_on_dataset("Sintel", val_iter, val_dataloader)
+        ViTTT_model.eval()
+        with torch.no_grad():
+            val_on_dataset("Sintel", val_iter, val_dataloader)
 
         state.epoch += 1
 
@@ -296,15 +332,14 @@ if __name__ == "__main__":
     accelerator.reduce(state.val_losses, "sum")
 
     if accelerator.is_local_main_process:
-        with open(f"/vulcanscratch/hughma/PP3DR/{name}/train_losses.pkl", "wb") as f:
+        with open(f"/vulcanscratch/hughma/ViT/{name}/train_losses.pkl", "wb") as f:
             pickle.dump(state.train_losses.numpy(force=True), f)
         print("Saved train_losses")
-        with open(f"/vulcanscratch/hughma/PP3DR/{name}/val_losses.pkl", "wb") as f:
+        with open(f"/vulcanscratch/hughma/ViT/{name}/val_losses.pkl", "wb") as f:
             pickle.dump(state.val_losses.numpy(force=True), f)
         print("Saved val_losses")
-        torch.save(PP3DR_model.state_dict(), f"/vulcanscratch/hughma/PP3DR/{name}/PP3DR.pth")
+        torch.save(ViTTT_model.state_dict(), f"/vulcanscratch/hughma/ViT/{name}/ViTTT.pth")
         print("Saved model")
 
     # if accelerator.is_local_main_process:
-    #     prof.export_chrome_trace(f"trace.json")
-    #     print("Saved trace")
+    #     prof.export_chrome_tr
