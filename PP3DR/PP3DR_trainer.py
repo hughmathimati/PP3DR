@@ -1,4 +1,4 @@
-name = "sanity"
+name = "sanity_monodepth"
 import transformers.optimization
 from models.PP3DR_Dino import PP3DR_Dino
 from PP3DR_loss import PP3DR_loss
@@ -65,15 +65,16 @@ def train_on_dataset(name, iterator, dataloader):
         pred = PP3DR_model(batch['images'].to(accelerator.device, non_blocking=True))
         loss = metric(pred, batch)
         state.train_losses[state.epoch - 1] += loss.detach()
-        AdamW.zero_grad()
-        Muon.zero_grad()
-        accelerator.backward(loss)
-        # Clamps the total norm of the gradients to 1.0
-        torch.nn.utils.clip_grad_norm_(PP3DR_model.parameters(), max_norm=1.0)
-        AdamW.step()
-        Muon.step()
-        AdamW_scheduler.step()
-        Muon_scheduler.step()
+        with torch.autocast(device_type=accelerator.device.type, enabled=False):
+            AdamW.zero_grad()
+            # Muon.zero_grad()
+            accelerator.backward(loss)
+            # Clamps the total norm of the gradients to 1.0
+            torch.nn.utils.clip_grad_norm_(PP3DR_model.parameters(), max_norm=1.0)
+            AdamW.step()
+            # Muon.step()
+            AdamW_scheduler.step()
+            # Muon_scheduler.step()
 
 
 def val_on_dataset(name, iterator, dataloader):
@@ -85,9 +86,8 @@ def val_on_dataset(name, iterator, dataloader):
         pred = PP3DR_model(batch['images'].to(accelerator.device, non_blocking=True))
         state.val_losses[state.epoch - 1] += metric(pred, gt).detach()
 
-
-def get_pp3dr_param_groups(model: nn.Module, adamw_lr: float = 1e-5, muon_lr: float = 5e-3,
-                           # For fine-tuning with a very low lr, we'll discard weight decay.
+# DEBUG: Eliminating Muon for now. Changing AdamW lr to 1e-4.
+def get_pp3dr_param_groups(model: nn.Module, adamw_lr: float = 1e-4, muon_lr: float = 5e-3,
                            weight_decay: float = 0.04, layer_decay: float = 0.9,
                            num_layers: int = 24):
     """
@@ -131,7 +131,9 @@ def get_pp3dr_param_groups(model: nn.Module, adamw_lr: float = 1e-5, muon_lr: fl
         # ==========================================
         # 3. Route to Optimizers with Decoupled Base LRs
         # ==========================================
-        if param.dim() == 2:
+        # DEBUG: Eliminating Muon for now
+        if False:
+        # if param.dim() == 2:
             # Muon strictly uses the massive base LR, scaled by the decay multiplier
             lr = muon_lr * lr_mult
             group_key = (lr, wd)
@@ -177,10 +179,10 @@ def initialize(epochs, pretrained_path = None):
     )
 
     AdamW = torch.optim.AdamW(AdamW_params, betas=(0.9, 0.99), foreach=True)
-    Muon = torch.optim.Muon(Muon_params)
+    # Muon = torch.optim.Muon(Muon_params)
     state = State(epochs)
     accelerator.register_for_checkpointing(state)
-    return state, PP3DR_model, AdamW, Muon
+    return state, PP3DR_model, AdamW#, Muon
 
 
 def prepare_dataloaders():
@@ -208,9 +210,9 @@ if __name__ == "__main__":
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"/tmp/torchinductor_cache_rank_{os.environ.get("LOCAL_RANK", "0")}"
     torch.set_float32_matmul_precision('high')
 
-    epochs = 50
-    checkpoint_every = 25
-    checkpoint = None
+    epochs = 1000
+    checkpoint_every = 100
+    checkpoint = "/vulcanscratch/hughma/PP3DR/sanity_monodepth/epoch 800"
     jobs = [
         partial(initialize, epochs),
         prepare_dataloaders,
@@ -223,7 +225,9 @@ if __name__ == "__main__":
         for future in concurrent.futures.as_completed(futures):
             match futures.index(future):
                 case 0:
-                    state, PP3DR_model, AdamW, Muon = future.result()
+                    # DEBUG: Removing Muon for now
+                    # state, PP3DR_model, AdamW, Muon = future.result()
+                    state, PP3DR_model, AdamW = future.result()
                 case 1:
                     train_dataloader = future.result()
 
@@ -235,15 +239,19 @@ if __name__ == "__main__":
         total_training_steps // 10,
         total_training_steps
     )
-    Muon_scheduler = transformers.optimization.get_cosine_schedule_with_warmup(
-        Muon,
-        total_training_steps // 10,
-        total_training_steps
-    )
+    # Muon_scheduler = transformers.optimization.get_cosine_schedule_with_warmup(
+    #     Muon,
+    #     total_training_steps // 10,
+    #     total_training_steps
+    # )
     # Register the LR schedulers
-    accelerator.register_for_checkpointing(AdamW_scheduler, Muon_scheduler)
-    PP3DR_model, AdamW, Muon, AdamW_scheduler, Muon_scheduler = accelerator.prepare(
-        PP3DR_model, AdamW, Muon, AdamW_scheduler, Muon_scheduler
+    # accelerator.register_for_checkpointing(AdamW_scheduler, Muon_scheduler)
+    accelerator.register_for_checkpointing(AdamW_scheduler)
+    # PP3DR_model, AdamW, Muon, AdamW_scheduler, Muon_scheduler = accelerator.prepare(
+    #     PP3DR_model, AdamW, Muon, AdamW_scheduler, Muon_scheduler
+    # )
+    PP3DR_model, AdamW, AdamW_scheduler = accelerator.prepare(
+        PP3DR_model, AdamW, AdamW_scheduler
     )
 
     if checkpoint is not None:

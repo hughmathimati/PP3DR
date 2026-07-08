@@ -7,7 +7,7 @@ import torch.cuda.amp as amp
 from einops import rearrange
 from typing import Callable
 
-@torch.compile() # Uncomment once you've made sure it works. Do we need dynamic=True? Documentation says don't use it...
+@torch.compile()
 class PP3DR_loss(nn.Module):
     """
     Right now, I'm just doing a sanity check to see if my model can at least overfit on NRGBD. I'll stick with:
@@ -169,7 +169,8 @@ class PP3DR_loss(nn.Module):
         weights = weights * gt_valid_depth_mask
 
         pred_points, gt_points = self.obtain_pred_3D_points(pred), self.obtain_gt_3D_points(gt)
-        scale = self.calculate_scale(pred_points, gt_points, weights) # (B)
+        # DEBUG: Removing scale for now
+        # scale = self.calculate_scale(pred_points, gt_points, weights) # (B)
 
         """
         Weighted Huber loss for 3D point coordinates (per-frame, in camera coordinates)
@@ -179,20 +180,22 @@ class PP3DR_loss(nn.Module):
         """
         final_loss += torch.mean(
             F.huber_loss(
-                pred_points * scale.view(B, 1, 1, 1, 1),
+                # DEBUG: Removing scale for now
+                # pred_points * scale.view(B, 1, 1, 1, 1),
+                pred_points,
                 gt_points,
                 reduction='none'
             ) * weights.view(B, L, H, W, 1)
         )
 
-        # (Unweighted) Huber loss for relative camera translation. Hopefully none of the gt camera poses are NaN...
-        gt_relative_rotations, gt_relative_translations = self.obtain_gt_relative_poses(gt['extrinsics'].to("cuda", non_blocking = True))
-        final_loss += F.huber_loss(scale.view(B, 1, 1) * pred['relative_camera_translations'], gt_relative_translations)
-
-        # Cosine similarity loss for relative camera rotation
-        # cos = (Tr(R_1^TR_2) - 1)/2. Since Tr(R_1^TR_2) is equal to the inner product of R_1 and R_2, our loss is:
-        # (3 - <R_1, R_2>)/2
-        trace = (pred['relative_camera_rotations'] * gt_relative_rotations).sum(dim=(-2, -1)) # (B, L)
-        final_loss += torch.clamp((3 - trace) / 2, min = 0).mean()
+        # # (Unweighted) Huber loss for relative camera translation. Hopefully none of the gt camera poses are NaN...
+        # gt_relative_rotations, gt_relative_translations = self.obtain_gt_relative_poses(gt['extrinsics'].to("cuda", non_blocking = True))
+        # final_loss += F.huber_loss(scale.view(B, 1, 1) * pred['relative_camera_translations'], gt_relative_translations)
+        #
+        # # Cosine similarity loss for relative camera rotation
+        # # cos = (Tr(R_1^TR_2) - 1)/2. Since Tr(R_1^TR_2) is equal to the inner product of R_1 and R_2, our loss is:
+        # # (3 - <R_1, R_2>)/2
+        # trace = (pred['relative_camera_rotations'] * gt_relative_rotations).sum(dim=(-2, -1)) # (B, L)
+        # final_loss += torch.clamp((3 - trace) / 2, min = 0).mean()
 
         return final_loss

@@ -192,7 +192,11 @@ if __name__ == "__main__":
     for key in pred:
         pred[key] = pred[key].to(torch.float32).cpu().numpy(force=True)
         print(f"{key}: {pred[key].shape}")
-        print(pred[key])
+    # Since we ran point-prediction only, we need to manually add back in some fake camera poses.
+    B, L = pred['log_depths'].shape[:2]
+    pred["relative_camera_translations"] = np.random.uniform(-0.1, 0.1, (B, L - 1, 3))
+    pred["relative_camera_rotations"] = np.tile(np.eye(3), (B, L - 1, 1, 1))
+
     for key in data:
         data[key] = data[key].to(torch.float32).cpu().numpy(force=True)
         print(f"{key}: {data[key].shape}")

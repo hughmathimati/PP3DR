@@ -10,11 +10,11 @@ from torch.utils.checkpoint import checkpoint
 import torchvision.transforms.v2 as transforms
 # try block contains imports for calling from trainer, and except block contains imports for running this file itself
 try:
-    from .BidirectionalLaCT import GlobalLaCT, LocalLaCT
+    from .BidirectionalLaCT import GlobalLaCT, LocalLaCT, BidirectionalLaCT
     from .pos_embed import RopePositionEmbedding, Rope3D
     from .Dinov3 import load_dinov3, obtain_features
 except:
-    from BidirectionalLaCT import GlobalLaCT, LocalLaCT
+    from BidirectionalLaCT import GlobalLaCT, LocalLaCT, BidirectionalLaCT
     from pos_embed import RopePositionEmbedding, Rope3D
     from Dinov3 import load_dinov3, obtain_features
 from xformers.ops import SwiGLU
@@ -27,6 +27,23 @@ class LayerScale(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.scale * x
+
+
+class Block(nn.Module):
+    def __init__(self, dim, num_heads, ffn_ratio, drop_path = 0):
+        super().__init__()
+        self.layer_norm_1 = nn.LayerNorm(dim)
+        self.TTT = BidirectionalLaCT(dim, num_heads)
+        self.layer_scale_1 = LayerScale(dim)
+        self.layer_norm_2 = nn.LayerNorm(dim)
+        self.ffn = SwiGLU(in_features = dim, hidden_features = dim * ffn_ratio)
+        self.layer_scale_2 = LayerScale(dim)
+        self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor, rope) -> torch.Tensor:
+        x = x + self.drop_path(self.layer_scale_1(self.TTT(self.layer_norm_1(x), rope)))
+        x = x + self.drop_path(self.layer_scale_2(self.ffn(self.layer_norm_2(x))))
+        return x
 
 
 class GlobalBlock(nn.Module):
@@ -82,21 +99,22 @@ class PointHead(nn.Module):
             num_heads = 20,
             blocks = 4,  # Pi3 has 5 transformer blocks per decoder
             ffn_ratio = 4,
-            output_dim = 3,
     ):
         super().__init__()
         assert blocks % 2 == 0, f"Number of decoder blocks ({blocks}) must be even for alternating global and frame-wise attention"
         self.blocks_each = blocks // 2
         self.dim = dim
-        self.global_blocks = nn.ModuleList([GlobalBlock(dim, num_heads, ffn_ratio) for _ in range(self.blocks_each)])
-        self.local_blocks = nn.ModuleList([LocalBlock(dim, num_heads, ffn_ratio) for _ in range(self.blocks_each)])
+
+        # self.global_blocks = nn.ModuleList([GlobalBlock(dim, num_heads, ffn_ratio) for _ in range(self.blocks_each)])
+        # self.local_blocks = nn.ModuleList([LocalBlock(dim, num_heads, ffn_ratio) for _ in range(self.blocks_each)])
+        self.blocks = nn.ModuleList([Block(dim, num_heads, ffn_ratio) for _ in range(blocks)])
+
         self.layer_norm = nn.LayerNorm(dim) # Pre-projection layer norm.
-        self.dim_proj = nn.Linear(dim, 16**2 * output_dim)
+        self.dim_proj = nn.Linear(dim, 256 * 3, bias = False)
         self.num_registers = num_registers
-        self.output_dim = output_dim
         self.num_blocks = blocks
 
-    def forward(self, x: torch.Tensor, rope2d, rope3d, L) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, rope2d, rope3d, L, H, W) -> torch.Tensor:
         """
         Parameters
         ----------
@@ -105,15 +123,20 @@ class PointHead(nn.Module):
         rope3d: 3D RoPE positional embedding
         L: Number of frames. Necessary for the rearrange operations.
         """
-        for i in range(self.blocks_each):
+        # for i in range(self.blocks_each):
+        #     if self.training:
+        #         # Global attention: absorb frame-length into patch-length dimension.
+        #         x = checkpoint(self.global_blocks[i], x, rope3d, L, use_reentrant = False)
+        #         # Local attention: absorb frame-length into batch dimension. Sequence length is now patch-length.
+        #         x = checkpoint(self.local_blocks[i], x, rope2d, L, use_reentrant = False)
+        #     else:
+        #         x = self.global_blocks[i](x, rope3d, L)
+        #         x = self.local_blocks[i](x, rope2d, L)
+        for i in range(self.blocks_each * 2):
             if self.training:
-                # Global attention: absorb frame-length into patch-length dimension.
-                x = checkpoint(self.global_blocks[i], x, rope3d, L, use_reentrant = False)
-                # Local attention: absorb frame-length into batch dimension. Sequence length is now patch-length.
-                x = checkpoint(self.local_blocks[i], x, rope2d, L, use_reentrant = False)
+                x = checkpoint(self.blocks[i], x, rope2d, use_reentrant=False)
             else:
-                x = self.global_blocks[i](x, rope3d, L)
-                x = self.local_blocks[i](x, rope2d, L)
+                x = self.blocks[i](x, rope2d)
 
         x = rearrange(x, "(B L) X dim -> B L X dim", L=L)
         # x.shape == (B, L, num_registers + HW // 256, dim)
@@ -123,9 +146,15 @@ class PointHead(nn.Module):
         x = self.layer_norm(x)
         # Project so we end up with the correct number of dimensions at the end
         x = self.dim_proj(x)
-        # x.shape == (B, L, HW // 256, 256 * output_dim)
-        x = rearrange(x, "B L X (Y output_dim) -> B L (X Y) output_dim", output_dim = self.output_dim)
-        # x.shape == (B, L, HW, output_dim)
+        # x.shape == (B, L, HW // 256, 256 * 3)
+        # We must take into account that each token represents the 16x16 patch at that location.
+        # Naively rearranging leads to each 16x16 patch being mapped to a contiguous line of 256 pixels.
+        x = rearrange(
+            x,
+            "B L (h_p w_p) (p1 p2 c) -> B L (h_p p1) (w_p p2) c",
+            h_p=H // 16, w_p=W // 16, p1=16, p2=16, c=3
+        )
+        # x.shape == (B, L, HW, 3)
         return x
 
 
@@ -223,8 +252,11 @@ class PP3DR_Dino(nn.Module):
 
         # General decoder
         self.dim = dim
-        self.global_blocks = nn.ModuleList([GlobalBlock(dim, num_heads, ffn_ratio) for _ in range(self.blocks_each)])
-        self.local_blocks = nn.ModuleList([LocalBlock(dim, num_heads, ffn_ratio) for _ in range(self.blocks_each)])
+
+        # self.global_blocks = nn.ModuleList([GlobalBlock(dim, num_heads, ffn_ratio) for _ in range(self.blocks_each)])
+        # self.local_blocks = nn.ModuleList([LocalBlock(dim, num_heads, ffn_ratio) for _ in range(self.blocks_each)])
+        self.blocks = nn.ModuleList([Block(dim, num_heads, ffn_ratio) for _ in range(decoder_blocks)])
+
         # We don't store num_registers here. It gets stored in the decoder heads.
         self.rope2d = RopePositionEmbedding(embed_dim = dim, num_heads = num_heads, device = "cuda")
         self.rope3d = Rope3D(embed_dim = dim, num_heads = num_heads, device = "cuda")
@@ -239,7 +271,7 @@ class PP3DR_Dino(nn.Module):
 
         # Per-task decoders
         """
-        The point decoder will predict a normalised XY ray direction, along with inverse depth.
+        The point decoder will predict a depth-normalised XY ray direction (X/Z and Y/Z), along with log depth.
         """
         self.point_decoder = PointHead(dim, num_registers, num_heads)
         """
@@ -247,7 +279,7 @@ class PP3DR_Dino(nn.Module):
         We are parameterizing our camera with three scalars for the translation and six scalars for the rotation.
         Details of how the rotation prediction works are in the forward() method.
         """
-        self.pose_decoder = PoseHead(dim, num_registers, num_heads)
+        # self.pose_decoder = PoseHead(dim, num_registers, num_heads)
 
     def ViT(self, image):
         return obtain_features(self.processor, self.dino, image, remove_registers = False)
@@ -273,44 +305,49 @@ class PP3DR_Dino(nn.Module):
         B, L, C, H, W = x.shape
 
         # Step 1: ViT
-        # ViT is frame-wise. We need to collapse the batch dimension into the sequence dimension before passing it into ViTTT.
+        # ViT is frame-wise. We need to collapse the batch dimension into the sequence dimension before passing it into Dino.
         x = self.ViT(x.flatten(0, 1))
         # x.shape == (B * L, num_registers + HW // 256, dim)
         """
         We will now perform alternating-attention, starting with global attention and ending with frame-wise attention.
         """
         rope2d, rope3d = self.rope2d(H // 16, W // 16), self.rope3d(L, H // 16, W // 16)
-        for i in range(self.blocks_each):
+        # for i in range(self.blocks_each):
+        #     if self.training and i >= self.start_checkpointing:
+        #         # Global attention: absorb frame-length into patch-length dimension.
+        #         x = checkpoint(self.global_blocks[i], x, rope3d, L, use_reentrant = False)
+        #         # Local attention: absorb frame-length into batch dimension. Sequence length is now patch-length.
+        #         x = checkpoint(self.local_blocks[i], x, rope2d, L, use_reentrant = False)
+        #     else:
+        #         x = self.global_blocks[i](x, rope3d, L)
+        #         x = self.local_blocks[i](x, rope2d, L)
+        for i in range(self.blocks_each * 2):
             if self.training and i >= self.start_checkpointing:
-                # Global attention: absorb frame-length into patch-length dimension.
-                x = checkpoint(self.global_blocks[i], x, rope3d, L, use_reentrant = False)
-                # Local attention: absorb frame-length into batch dimension. Sequence length is now patch-length.
-                x = checkpoint(self.local_blocks[i], x, rope2d, L, use_reentrant = False)
+                x = checkpoint(self.blocks[i], x, rope2d, use_reentrant = False)
             else:
-                x = self.global_blocks[i](x, rope3d, L)
-                x = self.local_blocks[i](x, rope2d, L)
+                x = self.blocks[i](x, rope2d)
 
         # x.shape == (B * L, num_registers + HW // 256, dim)
         # Step 2: Per-task decoders
-        points = self.point_decoder(x, rope2d, rope3d, L).view(B, L, H, W, 3)
+        points = self.point_decoder(x, rope2d, rope3d, L, H, W)
         # We're predicting the relative pose from this frame to the next one, which is why our sequence length is L - 1.
-        poses = self.pose_decoder(x, rope2d, rope3d, L)[:, :-1] # (B, L - 1, 9)
+        # poses = self.pose_decoder(x, rope2d, rope3d, L)[:, :-1] # (B, L - 1, 9)
 
         # Get the rotation matrix by orthogonalizing the first two 3D vectors, then taking the cross product for the third.
-        rotation = torch.empty(B, L - 1, 3, 3, device = "cuda") # going to take the transpose at the end
-        a = F.normalize(poses[:, :, 3:6], dim = -1)
-        rotation[:, :, 0] = a
-        b = poses[:, :, 6:]
+        # rotation = torch.empty(B, L - 1, 3, 3, device = "cuda") # going to take the transpose at the end
+        # a = F.normalize(poses[:, :, 3:6], dim = -1)
+        # rotation[:, :, 0] = a
+        # b = poses[:, :, 6:]
         # Unsqueeze after the dot product so the resulting scalars broadcast correctly against the vector a.
-        b = F.normalize(b - torch.linalg.vecdot(a, b, dim = -1).unsqueeze(-1) * a, dim = -1)
-        rotation[:, :, 1] = b
-        rotation[:, :, 2] = torch.linalg.cross(a, b, dim = -1)
+        # b = F.normalize(b - torch.linalg.vecdot(a, b, dim = -1).unsqueeze(-1) * a, dim = -1)
+        # rotation[:, :, 1] = b
+        # rotation[:, :, 2] = torch.linalg.cross(a, b, dim = -1)
 
         return {
-            "XY_rays": F.normalize(points[...,:2], dim = -1), # Normalize the XY ray direction
+            "XY_rays": points[...,:2],
             "log_depths": points[...,2],
-            "relative_camera_translations": poses[:, :, :3], # (B, L - 1, 3) -> 3 scalars, (x, y, z)
-            "relative_camera_rotations": rotation.transpose(-1, -2) # (B, L - 1, 3, 3)
+            # "relative_camera_translations": poses[:, :, :3], # (B, L - 1, 3) -> 3 scalars, (x, y, z)
+            # "relative_camera_rotations": rotation.transpose(-1, -2) # (B, L - 1, 3, 3)
         }
 
 

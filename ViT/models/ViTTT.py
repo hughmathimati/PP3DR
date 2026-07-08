@@ -114,32 +114,34 @@ if __name__ == "__main__":
 
     model = ViTTT(blocks = 12).to("cuda")
     print("loading state dict...")
-    loaded_state_dict = torch.load("/vulcanscratch/hughma/ViT/12_blocks/best_checkpoint.pth", weights_only=True)
+    loaded_state_dict = torch.load("/vulcanscratch/hughma/ViT/12_blocks_finetune/ViTTT.pth", weights_only=True)
 
     # The lines here are necessary if all the loaded state dict entries begin with an extra "module."
-    # new_state_dict = {}
-    # for key in loaded_state_dict:
-    #     new_state_dict[key[7:]] = loaded_state_dict[key]
-    model.load_state_dict(loaded_state_dict)
+    new_state_dict = {}
+    for key in loaded_state_dict:
+        new_state_dict[key[7:]] = loaded_state_dict[key]
+    model.load_state_dict(new_state_dict)
 
     model.eval()
-    image = load_image("https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/pipeline-cat-chonk.jpeg")
-    # image = transforms.functional.to_dtype(torchvision.io.decode_image("/vulcanscratch/hughma/data/sintel/training/final/alley_1/frame_0001.png"), torch.float32, scale=True)
+    image1 = load_image("https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/pipeline-cat-chonk.jpeg")
+    image2 = transforms.functional.to_dtype(torchvision.io.decode_image("/vulcanscratch/hughma/data/sintel/training/final/alley_1/frame_0001.png"), torch.float32, scale=True)
     # image = image.unsqueeze(0)
     # print(f"original shape: {image.size}")
     # image = image.crop((0, 0, image.size[0] // 16 * 16, image.size[1] // 16 * 16))
     image_to_tensor = transforms.Compose([transforms.ToImage(), transforms.ToDtype(torch.float32, scale=True)])
     # Unsqueeze for the batch dimension.
-    image = image_to_tensor(image).unsqueeze(0)
+    image1 = image_to_tensor(image1).unsqueeze(0)
+    image2 = image_to_tensor(image2).unsqueeze(0)
     # print(f"resized shape: {image.shape}")
     with torch.no_grad():
         start = time.time()
-        features = model(image.to("cuda"))
+        features1 = model(image1.to("cuda", non_blocking = True))
+        features2 = model(image2.to("cuda", non_blocking = True))
         end = time.time()
     print("Elapsed time (slight overestimation):", end - start)
-    features = features[:,5:]
-    print(features.shape)
-    features = low_rank(features)
-    print(f"lowrank: {features.shape}")
-    write_to_image(features, 42, 60, name = "images/ViTTT_cat_12_blocks best_checkpoint.png")
-    # write_to_image(features, 27, 64, name = "images/ViTTT_sintel_12_blocks best_checkpoint.png")
+    features1, features2 = features1[:,5:], features2[:,5:]
+    print(features1.shape, features2.shape)
+    features1, features2 = low_rank(features1), low_rank(features2)
+    print(f"lowrank: {features1.shape}, {features2.shape}")
+    write_to_image(features1, 42, 60, name = "images/ViTTT_cat_12_blocks_finetune best_checkpoint.png")
+    write_to_image(features2, 27, 64, name = "images/ViTTT_sintel_12_blocks_finetune best_checkpoint.png")
