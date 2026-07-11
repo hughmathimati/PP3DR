@@ -4,6 +4,12 @@ from models.PP3DR_Dino import PP3DR_Dino
 from PP3DR_loss import PP3DR_loss
 from models.Dinov3 import load_dinov3, obtain_features
 from datasets.nrgbd_dataset import nrgbd_dataset
+from datasets.dtu_dataset import dtu_dataset
+from datasets.dynamic_replica_dataset import dynamic_replica_dataset
+from datasets.eth3d_dataset import eth3d_dataset
+from datasets.flying_things_3d_dataset import flying_things_3d_dataset
+from datasets.sintel_dataset import sintel_dataset
+from datasets.nrgbd_dataset import nrgbd_dataset
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -13,7 +19,7 @@ from tqdm import tqdm, trange
 import os
 import threading
 import queue
-import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 import pickle
 import accelerate
@@ -53,41 +59,60 @@ class State:
         self.val_losses = state["val_losses"]
 
 
-def train_on_dataset(name, iterator, dataloader):
-    """dataloader parameter is solely for the tqdm progress bar."""
-    # I'm basically just expecting python to correctly reference the non-parameter variables.
-    for batch in tqdm(
-            iterator, desc=name, disable=not accelerator.is_local_main_process, total=len(dataloader), mininterval = 1
-    ):
-        # Accelerate automatically handles autocast.
-        # torch.no_grad() is included inside obtain_features().
-        # with torch.profiler.record_function("inference"):
-        pred = PP3DR_model(batch['images'].to(accelerator.device, non_blocking=True))
-        loss = metric(pred, batch)
-        state.train_losses[state.epoch - 1] += loss.detach()
-        with torch.autocast(device_type=accelerator.device.type, enabled=False):
-            AdamW.zero_grad()
-            # Muon.zero_grad()
-            accelerator.backward(loss)
-            # Clamps the total norm of the gradients to 1.0
-            torch.nn.utils.clip_grad_norm_(PP3DR_model.parameters(), max_norm=1.0)
-            AdamW.step()
-            # Muon.step()
-            AdamW_scheduler.step()
-            # Muon_scheduler.step()
+def prepare_dataloaders():
+    datasets = [nrgbd_dataset, dtu_dataset, dynamic_replica_dataset, eth3d_dataset, flying_things_3d_dataset]
+    constructed = []
+    with ThreadPoolExecutor() as executor:
+        tasks = [executor.submit(dataset) for dataset in datasets]
+        for completed in as_completed(tasks):
+             constructed.append(completed.result())
+    train_dataloader = DataLoader(
+        ConcatDataset(constructed),
+        batch_size=1, # If we want to use a batch size larger than 1, we have to perform rescaling.
+        shuffle=True,  # Critical: Shuffles across all domains!
+        num_workers=8,
+        pin_memory=True
+    )
+
+    # 1024 x 436
+    val_dataloader = DataLoader(sintel_dataset(), batch_size=16, shuffle=False, num_workers=4,
+                                                 persistent_workers=True, pin_memory=True)
+
+    return train_dataloader, val_dataloader
 
 
-def val_on_dataset(name, iterator, dataloader):
-    for batch in tqdm(iterator, desc=f"Validation {name}", disable=not accelerator.is_local_main_process,
-                      total=len(dataloader)):
-        # Accelerate automatically handles autocast.
-        # torch.no_grad() is included inside obtain_features().
-        # with torch.profiler.record_function("val_inference"):
-        pred = PP3DR_model(batch['images'].to(accelerator.device, non_blocking=True))
-        state.val_losses[state.epoch - 1] += metric(pred, gt).detach()
+def initialize(epochs, pretrained_path = None):
+    PP3DR_model = PP3DR_Dino()
+    if pretrained_path is not None:
+        PP3DR_model.load_state_dict(torch.load(pretrained_path, weights_only=True))
+        print("Loaded pretrained weights from", pretrained_path)
 
-# DEBUG: Eliminating Muon for now. Changing AdamW lr to 1e-4.
-def get_pp3dr_param_groups(model: nn.Module, adamw_lr: float = 1e-4, muon_lr: float = 5e-3,
+    def init_vit_weights(module):
+        if isinstance(module, nn.Linear):
+            # Truncated normal tightly bounds the initial weights
+            nn.init.trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.ones_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    PP3DR_model.apply(init_vit_weights)
+
+    AdamW_params, Muon_params = get_pp3dr_param_groups(
+        model=PP3DR_model,
+        num_layers=24  # Update to match your model depth
+    )
+
+    AdamW = torch.optim.AdamW(AdamW_params, betas=(0.9, 0.99), foreach=True)
+    Muon = torch.optim.Muon(Muon_params)
+    state = State(epochs)
+    accelerator.register_for_checkpointing(state)
+    return state, PP3DR_model, AdamW, Muon
+
+
+def get_pp3dr_param_groups(model: nn.Module, adamw_lr: float = 1e-5, muon_lr: float = 5e-3,
                            weight_decay: float = 0.04, layer_decay: float = 0.9,
                            num_layers: int = 24):
     """
@@ -131,9 +156,7 @@ def get_pp3dr_param_groups(model: nn.Module, adamw_lr: float = 1e-4, muon_lr: fl
         # ==========================================
         # 3. Route to Optimizers with Decoupled Base LRs
         # ==========================================
-        # DEBUG: Eliminating Muon for now
-        if False:
-        # if param.dim() == 2:
+        if param.dim() == 2:
             # Muon strictly uses the massive base LR, scaled by the decay multiplier
             lr = muon_lr * lr_mult
             group_key = (lr, wd)
@@ -154,54 +177,38 @@ def get_pp3dr_param_groups(model: nn.Module, adamw_lr: float = 1e-4, muon_lr: fl
     return list(AdamW_params.values()), list(Muon_params.values())
 
 
-def initialize(epochs, pretrained_path = None):
-    PP3DR_model = PP3DR_Dino()
-    if pretrained_path is not None:
-        PP3DR_model.load_state_dict(torch.load(pretrained_path, weights_only=True))
-        print("Loaded pretrained weights from", pretrained_path)
-
-    def init_vit_weights(module):
-        if isinstance(module, nn.Linear):
-            # Truncated normal tightly bounds the initial weights
-            nn.init.trunc_normal_(module.weight, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.ones_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-
-    PP3DR_model.apply(init_vit_weights)
-
-    AdamW_params, Muon_params = get_pp3dr_param_groups(
-        model=PP3DR_model,
-        num_layers=24  # Update to match your model depth
-    )
-
-    AdamW = torch.optim.AdamW(AdamW_params, betas=(0.9, 0.99), foreach=True)
-    # Muon = torch.optim.Muon(Muon_params)
-    state = State(epochs)
-    accelerator.register_for_checkpointing(state)
-    return state, PP3DR_model, AdamW#, Muon
+def train_on_dataset(name, iterator, dataloader):
+    """dataloader parameter is solely for the tqdm progress bar."""
+    # I'm basically just expecting python to correctly reference the non-parameter variables.
+    for batch in tqdm(
+            iterator, desc=name, disable=not accelerator.is_local_main_process, total=len(dataloader), mininterval = 1
+    ):
+        # Accelerate automatically handles autocast.
+        # torch.no_grad() is included inside obtain_features().
+        # with torch.profiler.record_function("inference"):
+        pred = PP3DR_model(batch['images'].to(accelerator.device, non_blocking=True))
+        loss = metric(pred, batch)
+        state.train_losses[state.epoch - 1] += loss.detach()
+        with torch.autocast(device_type=accelerator.device.type, enabled=False):
+            AdamW.zero_grad()
+            # Muon.zero_grad()
+            accelerator.backward(loss)
+            # Clamps the total norm of the gradients to 1.0
+            torch.nn.utils.clip_grad_norm_(PP3DR_model.parameters(), max_norm=1.0)
+            AdamW.step()
+            # Muon.step()
+            AdamW_scheduler.step()
+            # Muon_scheduler.step()
 
 
-def prepare_dataloaders():
-    train_dataloader = DataLoader(
-        ConcatDataset([
-            nrgbd_dataset(),
-        ]),
-        batch_size=1, # If we want to use a batch size larger than 1, we have to perform rescaling.
-        shuffle=True,  # Critical: Shuffles across all domains!
-        num_workers=3,
-        pin_memory=True
-    )
-
-    # 1024 x 436
-    # No val during sanity check
-    # val_dataloader = DataLoader(sintel_dataset(), batch_size=16, shuffle=False, num_workers=4,
-    #                                              persistent_workers=True, pin_memory=True)
-
-    return train_dataloader
+def val_on_dataset(name, iterator, dataloader):
+    for batch in tqdm(iterator, desc=f"Validation {name}", disable=not accelerator.is_local_main_process,
+                      total=len(dataloader)):
+        # Accelerate automatically handles autocast.
+        # torch.no_grad() is included inside obtain_features().
+        # with torch.profiler.record_function("val_inference"):
+        pred = PP3DR_model(batch['images'].to(accelerator.device, non_blocking=True))
+        state.val_losses[state.epoch - 1] += metric(pred, gt).detach()
 
 
 if __name__ == "__main__":
@@ -210,26 +217,17 @@ if __name__ == "__main__":
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"/tmp/torchinductor_cache_rank_{os.environ.get("LOCAL_RANK", "0")}"
     torch.set_float32_matmul_precision('high')
 
-    epochs = 1000
-    checkpoint_every = 100
+    epochs = 10
+    checkpoint_every = 2
     checkpoint = "/vulcanscratch/hughma/PP3DR/sanity_monodepth/epoch 800"
-    jobs = [
-        partial(initialize, epochs),
-        prepare_dataloaders,
-    ]
+
     # ProcessPoolExecutor -> Cannot re-initialize CUDA in forked subprocess.
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = [executor.submit(job) for job in jobs]
+    with ThreadPoolExecutor() as executor:
+        a = executor.submit(prepare_dataloaders)
+        b = executor.submit(partial(initialize, epochs))
         metric = PP3DR_loss()
-        # futures.as_completed returns futures in the order they complete, not their original order.
-        for future in concurrent.futures.as_completed(futures):
-            match futures.index(future):
-                case 0:
-                    # DEBUG: Removing Muon for now
-                    # state, PP3DR_model, AdamW, Muon = future.result()
-                    state, PP3DR_model, AdamW = future.result()
-                case 1:
-                    train_dataloader = future.result()
+        train_dataloader, val_dataloader = a.result()
+        state, PP3DR_model, AdamW, Muon = b.result()
 
     train_dataloader = accelerator.prepare(train_dataloader)
     total_training_steps = len(train_dataloader) * epochs
@@ -239,19 +237,15 @@ if __name__ == "__main__":
         total_training_steps // 10,
         total_training_steps
     )
-    # Muon_scheduler = transformers.optimization.get_cosine_schedule_with_warmup(
-    #     Muon,
-    #     total_training_steps // 10,
-    #     total_training_steps
-    # )
+    Muon_scheduler = transformers.optimization.get_cosine_schedule_with_warmup(
+        Muon,
+        total_training_steps // 10,
+        total_training_steps
+    )
     # Register the LR schedulers
-    # accelerator.register_for_checkpointing(AdamW_scheduler, Muon_scheduler)
-    accelerator.register_for_checkpointing(AdamW_scheduler)
-    # PP3DR_model, AdamW, Muon, AdamW_scheduler, Muon_scheduler = accelerator.prepare(
-    #     PP3DR_model, AdamW, Muon, AdamW_scheduler, Muon_scheduler
-    # )
-    PP3DR_model, AdamW, AdamW_scheduler = accelerator.prepare(
-        PP3DR_model, AdamW, AdamW_scheduler
+    accelerator.register_for_checkpointing(AdamW_scheduler, Muon_scheduler)
+    PP3DR_model, AdamW, Muon, AdamW_scheduler, Muon_scheduler = accelerator.prepare(
+        PP3DR_model, AdamW, Muon, AdamW_scheduler, Muon_scheduler
     )
 
     if checkpoint is not None:
@@ -273,7 +267,7 @@ if __name__ == "__main__":
     # Training loop
     start = state.epoch
     while state.epoch <= epochs:
-        # val_iter = iter(val_dataloader)
+        val_iter = iter(val_dataloader)
         if state.epoch % checkpoint_every == 0:
             accelerator.save_state(output_dir=f"/vulcanscratch/hughma/PP3DR/{name}/epoch {state.epoch}",
                                    total_limit=3)
@@ -291,9 +285,9 @@ if __name__ == "__main__":
             train_iter = iter(train_dataloader)
 
         # Validation on Sintel
-        # PP3DR_model.eval()
-        # with torch.no_grad():
-        #     val_on_dataset("Sintel", val_iter, val_dataloader)
+        PP3DR_model.eval()
+        with torch.no_grad():
+            val_on_dataset("Sintel", val_iter, val_dataloader)
 
         state.epoch += 1
 

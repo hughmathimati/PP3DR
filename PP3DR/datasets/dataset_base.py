@@ -13,10 +13,15 @@ cv2.setNumThreads(0)
 class DatasetBase(torch.utils.data.Dataset):
     """
     Base dataset class.
-    You have to write __init__(), poses_helper(), and intrinsics_helper().
+
+    You have to write __init__(), extrinsics_helper(), and intrinsics_helper().
+
+    images_helper() and depths_helper() are optional overrides. Overriding depths_helper() is much more common.
+
+    __getitem__() is intentionally implemented here, to be inherited by all children classes.
     """
 
-    def __init__(self):
+    def __init__(self, dir):
         """
         Must create self.sequences, a list where each sequence corresponds to a dict with at least the following elements:
             {
@@ -26,6 +31,8 @@ class DatasetBase(torch.utils.data.Dataset):
         """
         super().__init__()
         self.max_sequence_length = 10
+        self.sequence_names = os.listdir(dir)
+        self.sequences = [dict(images=[], depths=[]) for _ in range(len(self.sequence_names))]
 
     def images_helper(self, sequence_index, frame_indices):
         """
@@ -46,7 +53,7 @@ class DatasetBase(torch.utils.data.Dataset):
                     ),
                     torch.float32,
                     scale=True
-                )
+                )[:3] # I'm including this here for the RGBA datasets.
                 for i in frame_indices
             ]
         )
@@ -60,7 +67,7 @@ class DatasetBase(torch.utils.data.Dataset):
                        randomly-sampled sequence.
         Returns
         -------
-        (L, 1, H, W) tensor of the depths for this randomly-sampled sequence.
+        (L, H, W) tensor of the depths for this randomly-sampled sequence.
         """
         # We're using torch.cat here instead of torch.stack because we want to get rid of the singleton channel dimension.
         return torch.cat(
@@ -69,8 +76,8 @@ class DatasetBase(torch.utils.data.Dataset):
                     torchvision.io.decode_image(
                         self.sequences[sequence_index]['depths'][i]
                     ),
-                    torch.float32,
-                    scale=True
+                    torch.float32
+                    # DON'T scale the depth.
                 )
                 for i in frame_indices
             ]
@@ -78,6 +85,9 @@ class DatasetBase(torch.utils.data.Dataset):
 
     def extrinsics_helper(self, sequence_index, frame_indices):
         """
+        If you choose not to override this function, it will assume you have an (L, 4, 3) tensor for each
+        self.sequences[sequence_index]['extrinsic'].
+
         Parameters
         ----------
         sequence_index
@@ -87,59 +97,57 @@ class DatasetBase(torch.utils.data.Dataset):
         -------
         (L, 3, 4) tensor of the 3x4 camera extrinsic matrices for this randomly-sampled sequence.
         """
-        pass
+        return self.sequences[sequence_index]['extrinsics'][frame_indices]
 
-    def intrinsic_helper(self, sequence_index):
+    def intrinsics_helper(self, sequence_index, frame_indices):
         """
+        If you choose not to override this function, it will assume you have an (L, 4, 3) tensor for each
+        self.sequences[sequence_index]['intrinsic'].
+
         Parameters
         ----------
         sequence_index
 
         Returns
         -------
-        (3, 3) tensor of the 3x3 camera intrinsic matrix for this randomly-sampled sequence.
+        (L, 3, 3) tensor of the 3x3 camera intrinsic matrix for this randomly-sampled sequence.
         """
-        pass
+        return self.sequences[sequence_index]['intrinsics'][frame_indices]
 
     def __len__(self):
         return len(self.sequences)
 
     def __getitem__(self, index):
         """
-        Pick a random starting frame before the last 500 frames, then randomly sample 100 frames from the subsequent
-        500 frames.
+        Pick a random starting frame before the last 3 * x frames, then randomly sample x frames from the subsequent
+        3 * x frames.
         We probably can't do a random crop due to the camera pose, but if we wanted, we could do rescale...
         """
         true_length = len(self.sequences[index]['images'])
-        # We should never receive a sequence with only one frame...
-        end_index = max(1, true_length - 5 * self.max_sequence_length)
         num_frames = min(self.max_sequence_length, true_length)
-        frame_indices = torch.randint(low=0, high=end_index, size=(num_frames,))
-        frame_indices.sort()
+        window_size = 3 * self.max_sequence_length
+        if true_length < window_size:
+            start = 0
+        else:
+            max_start = max(0, true_length - window_size)
+            start = torch.randint(low=0, high=max_start, size=())
+        frame_indices = torch.randint(low = start, high = min(start + window_size, true_length), size=(num_frames,))
+        frame_indices = frame_indices.sort().values
+        print(frame_indices)
         # Ensure no frames are more than 10 apart
         if true_length >= self.max_sequence_length + 10:
             for i in range(1, num_frames):
                 if frame_indices[i] - frame_indices[i - 1] > 10:
                     frame_indices[i] - frame_indices[i - 1] + 10
-        jobs = [
-            partial(self.images_helper, index, frame_indices),
-            partial(self.depths_helper, index, frame_indices),
-            partial(self.extrinsics_helper, index, frame_indices),
-            partial(self.intrinsic_helper, index),
-        ]
         output = {}
         # ProcessPoolExecutor -> Cannot re-initialize CUDA in forked subprocess.
         with ThreadPoolExecutor() as executor:
-            futures = [executor.submit(job) for job in jobs]
-            # futures.as_completed returns futures in the order they complete, not their original order.
-            for future in as_completed(futures):
-                match futures.index(future):
-                    case 0:
-                        output['images'] = future.result()
-                    case 1:
-                        output['depths'] = future.result()
-                    case 2:
-                        output['extrinsics'] = future.result()
-                    case 3:
-                        output['intrinsic'] = future.result()
+            a = executor.submit(partial(self.images_helper, index, frame_indices))
+            b = executor.submit(partial(self.depths_helper, index, frame_indices))
+            c = executor.submit(partial(self.extrinsics_helper, index, frame_indices))
+            d = executor.submit(partial(self.intrinsics_helper, index, frame_indices))
+            output['images'] = a.result()
+            output['depths'] = b.result()
+            output['extrinsics'] = c.result()
+            output['intrinsics'] = d.result()
         return output
