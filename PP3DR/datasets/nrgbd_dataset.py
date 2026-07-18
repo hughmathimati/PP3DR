@@ -72,16 +72,8 @@ class nrgbd_dataset(DatasetBase):
 
 if __name__ == "__main__":
     dataset = nrgbd_dataset()
-    print(len(dataset))
-    first = dataset[0]
-    for key in first:
-        print(key)
-        print(first[key].shape)
-    print(first['depths'].min(), first['depths'].max())
-
-    # I need to know what kind of depth they're using.
-    # depth = first['depths'][0]
-    # dmin, dmax = depth.min(), depth.max()
-    # depth = (255 * (depth - dmin) / (dmax - dmin)).permute(1, 2, 0)
-    # print(depth.shape)
-    # cv2.imwrite("test_nrgbd_depth.png", depth.detach().numpy(force = True).astype(np.uint8))
+    empty = []
+    for i, data in tqdm(enumerate(dataset), desc="Scanning sequences..."):
+        if len(data['images']) == 0:
+            empty.append(i)
+    print(empty)

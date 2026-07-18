@@ -4,7 +4,6 @@ import torchvision
 import os
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
 try:
     from .dataset_base import DatasetBase
 except:
@@ -40,7 +39,7 @@ class sintel_dataset(DatasetBase):
                 self.sequences[i]['extrinsics'] = torch.empty(seq_length, 3, 4)
                 self.sequences[i]['intrinsics'] = torch.empty(seq_length, 3, 3)
 
-                executor.submit(partial(self.cams_helper, cams, i))
+                executor.submit(self.cams_helper, cams, i)
                 for image in images_list:
                     self.sequences[i]['images'].append(os.path.join(images, image))
                 for depth in os.listdir(depths):
@@ -73,9 +72,8 @@ class sintel_dataset(DatasetBase):
 
 if __name__ == "__main__":
     dataset = sintel_dataset()
-    print(len(dataset))
-    first = dataset[0]
-    for key in first:
-        print(key)
-        print(first[key].shape)
-    print(first['depths'].min(), first['depths'].max())
+    empty = []
+    for i, data in tqdm(enumerate(dataset), desc="Scanning sequences..."):
+        if len(data['images']) == 0:
+            empty.append(i)
+    print(empty)

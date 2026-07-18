@@ -83,10 +83,8 @@ class dtu_dataset(DatasetBase):
 
 if __name__ == "__main__":
     dataset = dtu_dataset()
-    print(len(dataset))
-    first = dataset[0]
-    for key in first:
-        print(key)
-        print(first['depths'].min(), first['depths'].max())
-        print(first[key].shape)
-    print(first['depths'].min(), first['depths'].max())
+    empty = []
+    for i, data in tqdm(enumerate(dataset), desc="Scanning sequences..."):
+        if len(data['images']) == 0:
+            empty.append(i)
+    print(empty)

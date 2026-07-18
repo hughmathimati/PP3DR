@@ -5,7 +5,6 @@ import os
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
-from functools import partial
 try:
     from .dataset_base import DatasetBase
 except:
@@ -32,7 +31,7 @@ class eth3d_dataset(DatasetBase):
                 self.sequences[i]['extrinsics'] = torch.empty(seq_length, 3, 4)
                 self.sequences[i]['intrinsics'] = torch.empty(seq_length, 3, 3)
 
-                executor.submit(partial(self.cams_helper, cams_dir, i))
+                executor.submit(self.cams_helper, cams_dir, i)
                 for image in images_list:
                     self.sequences[i]['images'].append(os.path.join(image_dir, image))
                 for depth in os.listdir(depth_dir):
@@ -79,9 +78,8 @@ class eth3d_dataset(DatasetBase):
 
 if __name__ == "__main__":
     dataset = eth3d_dataset()
-    print(len(dataset))
-    first = dataset[0]
-    for key in first:
-        print(key)
-        print(first[key].shape)
-    print(first['depths'].min(), first['depths'].max())
+    empty = []
+    for i, data in tqdm(enumerate(dataset), desc="Scanning sequences..."):
+        if len(data['images']) == 0:
+            empty.append(i)
+    print(empty)

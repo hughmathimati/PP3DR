@@ -85,6 +85,11 @@ def rope_apply(x: Tensor, sin: Tensor, cos: Tensor) -> Tensor:
     return (x * cos) + (rope_rotate_half(x) * sin)
 
 def apply_rope(q: Tensor, k: Tensor, rope: Tensor | Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
+    """
+    If this function is getting called from BidirectionalLaCT, q and k will have shape (B L nh) X hd, and rope will have
+    shape (HW, hd). The block itself instead uses (b h) l d for q and k, but this is only because the feature extractor
+    absorbs L into B (X is then renamed to l).
+    """
     # All operations will use the dtype of rope, the output is cast back to the dtype of q and k
     q_dtype = q.dtype
     k_dtype = k.dtype
@@ -105,33 +110,6 @@ def apply_rope(q: Tensor, k: Tensor, rope: Tensor | Tuple[Tensor, Tensor]) -> Tu
     k_prefix = k[:, :prefix, :]
     k = rope_apply(k[:, prefix:, :], sin, cos)  # [B * head, hw, D//head]
     k = torch.cat((k_prefix, k), dim=-2)  # [B * head, N, D//head]
-    q = q.to(dtype=q_dtype)
-    k = k.to(dtype=k_dtype)
-    return q, k
-
-def apply_rope_no_prefix(q: Tensor, k: Tensor, rope3d: Tensor | Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
-    """
-    Primarily used for RoPE3D, where we'll be juggling the views/dimensions and registers inside the block itself, and
-    passing only a contiguous block of real patch tokens into this function for positional embedding.
-    Parameters
-    ----------
-    q
-    k
-    rope3d
-
-    Returns
-    -------
-    q, k (with positional embeddings)
-    """
-    # All operations will use the dtype of rope, the output is cast back to the dtype of q and k
-    q_dtype = q.dtype
-    k_dtype = k.dtype
-    sin, cos = rope3d
-    rope_dtype = sin.dtype
-    q = q.to(dtype=rope_dtype)
-    k = k.to(dtype=rope_dtype)
-    q = rope_apply(q, sin, cos)  # [B * head, LHW, D//head]
-    k = rope_apply(k, sin, cos)  # [B * head, LHW, D//head]
     q = q.to(dtype=q_dtype)
     k = k.to(dtype=k_dtype)
     return q, k
@@ -160,7 +138,7 @@ def bidirectional_lact_swiglu(
     """
 
     # adding detach here sometimes improves stability.
-    w1_norm = vector_norm(w1, dim=2, keepdim=True)
+    w1_norm = vector_norm(w1.detach(), dim=2, keepdim=True)
 
     q = q.transpose(1, 2)  # [b, dk, l]
     v = v.transpose(1, 2)
@@ -340,6 +318,7 @@ class GlobalLaCT(torch.nn.Module):
         GlobalBlock forward.
         Input shape: ((B L), X, dim)
         Output shape: (B, (L X), dim)
+        rope3d: (B, L, HW, head_dim)
         """
         B, X = x.shape[0] // L, x.shape[1]
 
@@ -366,32 +345,31 @@ class GlobalLaCT(torch.nn.Module):
         The order of operations below does not strictly follow the order above, because I use view instead of rearrange
         to minimise memory reallocations.
         """
-        # Step 1. (B, L, self.num_registers, nh, hd)
-        q_registers, k_registers = q[:, :, :self.num_registers, :, :], k[:, :, :self.num_registers, :, :]
+        # Step 1.
+        q_registers, k_registers = q[:, :, :self.num_registers, :, :], k[:, :, :self.num_registers, :, :] # (B, L, self.num_registers, nh, hd)
+        q_tokens, k_tokens = q[:, :, self.num_registers:, :, :], k[:, :, self.num_registers:, :, :] # (B, L, HW, nh, hd)
 
-        # We could optimise this by outputting Rope3D already in the desired (L, HW) (rather than LHW) shape. However,
-        # to keep things somewhat compartamentalised, I'm just going to stick with my extra few operations here.
-        sin, cos = rope3d
+        sin, cos = rope3d # 2 x (B, L, HW, hd)
+        sin, cos = sin.unsqueeze(-2), cos.unsqueeze(-2) # 2 x (B, L, HW, 1, hd)
+        rope_dtype = sin.dtype
+
         # This combines/replaces steps 2 and 3. Notice that instead of absorbing nh into B and creating a new tensor
         # with LHW after removing the register tokens, we instead separate L from HW and broadcast the RoPE with a view.
-        q_tokens, k_tokens = apply_rope_no_prefix(
-            # (B, L, HW, nh, hd)
-            q[:, :, self.num_registers:, :, :],
-            k[:, :, self.num_registers:, :, :],
-            # (broadcast B, L, HW, broadcast nh, hd)
-            (sin.view(1, L, -1, 1, self.head_dim), cos.view(1, L, -1, 1, self.head_dim))
-        )
+        q_tokens = rope_apply(q_tokens.to(dtype=rope_dtype), sin, cos).to(dtype=q.dtype)
+        k_tokens = rope_apply(k_tokens.to(dtype=rope_dtype), sin, cos).to(dtype=k.dtype)
         # Step 4 is now no longer needed, as we maintained the original shape from before!
+
         # Step 5.
         q, k = torch.cat((q_registers, q_tokens), dim = 2), torch.cat((k_registers, k_tokens), dim = 2)
         # q, k, and v now all have the shape (B, L, X, nh, hd)
-        # 6.
+
+        # Step 6.
         q = rearrange(q, "B L X h d -> (B h) (L X) d", h = self.num_heads, L = L)
         k = rearrange(k, "B L X h d -> (B h) (L X) d", h = self.num_heads, L = L)
         v = rearrange(v, "B L X h d -> (B h) (L X) d", h = self.num_heads, L = L)
 
+        # All done! TTT time.
         # [nh, d, d] -> [B * nh, d, d]
-        B = x.shape[0] // L
         w0 = self.w0.repeat(B, 1, 1)
         w1 = self.w1.repeat(B, 1, 1)
         w2 = self.w2.repeat(B, 1, 1)
@@ -400,7 +378,8 @@ class GlobalLaCT(torch.nn.Module):
         output = bidirectional_lact_swiglu(w0, w1, w2, q, k, v)
 
         output = self.o_norm(output)
-        output = rearrange(output, "(B h) (L X) d -> B (L X) (h d)", h=self.num_heads, L = L)
+        # Einops complains about not being able to identify L if I write (L X).
+        output = rearrange(output, "(B nh) LX hd -> B LX (nh hd)", nh=self.num_heads)
         output = self.o_proj(output)
         return output # Output shape: (B, (L X), dim)
 
@@ -410,6 +389,7 @@ class LocalLaCT(torch.nn.Module):
             self,
             dim: int,
             num_heads: int,
+            num_registers: int = 5,
             inter_multi: float = 1, # Hidden dimension = head dimension * inter_multi.
             use_o_norm: bool = True,  # recommended to be True
             qk_l2_norm: bool = True,  # recommended to be True
@@ -420,6 +400,7 @@ class LocalLaCT(torch.nn.Module):
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        self.num_registers = num_registers
         self.inter_multi = inter_multi
         self.use_o_norm = use_o_norm
         self.qk_l2_norm = qk_l2_norm
@@ -447,50 +428,53 @@ class LocalLaCT(torch.nn.Module):
 
         self.layer_norm = layer_norm(dim, bias=False) # New
 
-    def forward(self, x: torch.Tensor, rope, L) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, rope2d, L) -> torch.Tensor:
         """
         LocalBlock forward.
         Input shape: (B, (L X), dim)
         Output shape: ((B L), X, dim)
+        rope2d: (B * L, HW, head_dim)
         """
-        """
-        Simply rearrange at the start. Easy!
-        """
-        x = rearrange(x, "B (L X) dim -> (B L) X dim", L = L)
-
+        B, X = x.shape[0], x.shape[1] // L
+        BL = B * L
         x = self.layer_norm(x) # New
 
         qkv = F.silu(self.to_qkv(x), inplace=True)  # SiLU - Linear
 
-        # [b * num_heads, l, head_dim]
-        q, k, v = rearrange(
-            qkv,
-            "(B L) X (qkv h d) -> qkv (B L h) X d",
-            qkv=3,
-            h=self.num_heads,
-            d=self.head_dim,
-            L = L
-        )
+        # (B, L * X, 3 * dim) -> (B * L, X, 3, nh, hd) -> 3 * (B * L, X, nh, hd)
+        q, k, v = qkv.view(BL, X, 3, self.num_heads, self.head_dim).unbind(2)
 
         if self.qk_l2_norm:
             q = l2_norm(q)
             k = l2_norm(k)
 
-        # Original DINO rope expects q, k to be (B, # heads, sequence length, dim per head). Here we instead use
-        # (B * heads, sequence length, dim per head), which simply entails merging the first two dimensions.
-        q, k = apply_rope(q, k, rope)
+        q_registers, k_registers = q[:, :self.num_registers, :, :], k[:, :self.num_registers, :, :] # (B * L, num_registers, nh, hd)
+        q_tokens, k_tokens = q[:, self.num_registers:, :, :], k[:, self.num_registers:, :, :] # (B * L, HW, nh, hd)
+
+        sin, cos = rope2d # 2 x (B * L, HW, hd)
+        sin, cos = sin.unsqueeze(2), cos.unsqueeze(2) # 2 x (B * L, HW, 1, hd)
+        rope_dtype = sin.dtype
+        q_tokens = rope_apply(q_tokens.to(dtype=rope_dtype), sin, cos).to(dtype=q.dtype)
+        k_tokens = rope_apply(k_tokens.to(dtype=rope_dtype), sin, cos).to(dtype=k.dtype)
+        q, k = torch.cat((q_registers, q_tokens), dim = 1), torch.cat((k_registers, k_tokens), dim = 1)
 
         # [nh, d, d] -> [B * L * nh, d, d]
         # x gets rearranged at the beginning, so we can just do x.shape[0] here.
-        w0 = self.w0.repeat(x.shape[0], 1, 1)
-        w1 = self.w1.repeat(x.shape[0], 1, 1)
-        w2 = self.w2.repeat(x.shape[0], 1, 1)
+
+        w0 = self.w0.repeat(BL, 1, 1)
+        w1 = self.w1.repeat(BL, 1, 1)
+        w2 = self.w2.repeat(BL, 1, 1)
 
         # [b * num_heads, l, head_dim]
+        # bidirectional_lact_swiglu() expects q, k, and v to have shape (B, L, hd).
+        # In our case, that's (B L nh) X hd.
+        q = rearrange(q, "BL X nh hd -> (BL nh) X hd")
+        k = rearrange(k, "BL X nh hd -> (BL nh) X hd")
+        v = rearrange(v, "BL X nh hd -> (BL nh) X hd")
         output = bidirectional_lact_swiglu(w0, w1, w2, q, k, v)
 
         output = self.o_norm(output)
-        output = rearrange(output, "(B L h) X d -> (B L) X (h d)", h=self.num_heads, L = L)
+        output = rearrange(output, "(BL nh) X hd -> BL X (nh hd)", nh=self.num_heads)
         output = self.o_proj(output)
         return output # Output shape: ((B L), X, dim)
 

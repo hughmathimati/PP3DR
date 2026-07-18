@@ -21,36 +21,54 @@ class dynamic_replica_dataset(DatasetBase):
     """
     # The shortest sequence only has 20 images.
     def __init__(self, dir="/fs/vulcan-datasets/dynamic_replica/train"):
-        super().__init__(dir)
-        for sequence in self.sequences:
-            sequence['extrinsics'] = torch.empty(300, 3, 4)
-            sequence['intrinsics'] = torch.zeros(300, 3, 3)
-        for i, sequence in tqdm(enumerate(self.sequence_names), desc="Precomputing Dynamic Replica image file paths"):
-            if sequence == "frame_annotations_train.jgz" or sequence[-5:] == "right":
-                continue
-            sequence_dir = os.path.join(dir, sequence)
-            image_dir = os.path.join(sequence_dir, "images")
-            depth_dir = os.path.join(sequence_dir, "depths")
+        with ThreadPoolExecutor() as executor:
+            # Extracting the camera matrices requires self.sequence_names to be filled. However, reading the jgz file
+            # does not. So we'll do that first.
+            a = executor.submit(self.load_jgz, os.path.join(dir, "frame_annotations_train.jgz"))
 
-            for image in os.listdir(image_dir):
-                if image == "done.ok": continue
-                self.sequences[i]['images'].append(os.path.join(image_dir, image))
-            for depth in os.listdir(depth_dir):
-                self.sequences[i]['depths'].append(os.path.join(depth_dir, depth))
-        # Have to wait until the end to add this because I need self.sequences to be filled
-        self.extract_sequence_cameras(os.path.join(dir, "frame_annotations_train.jgz"))
+            super().__init__(dir)
+            # Filter out the right-camera sequences (and the jgz file) ahead of time.
+            # We need to do this since extract_sequence_cameras relies on self.sequence_names.index().
+            # It will happen concurrently with self.load_jgz().
+            valid_indices = [
+                i for i, name in enumerate(self.sequence_names)
+                if name != "frame_annotations_train.jgz" and not name.endswith("right")
+            ]
+            self.sequence_names = [self.sequence_names[i] for i in valid_indices]
+            self.sequences = [self.sequences[i] for i in valid_indices]
+            self.name_to_idx = {name: i for i, name in enumerate(self.sequence_names)}
+            for sequence in self.sequences:
+                sequence['extrinsics'] = torch.empty(300, 3, 4)
+                sequence['intrinsics'] = torch.zeros(300, 3, 3)
 
-    def extract_sequence_cameras(self, jgz_path):
-        """
-        Extracts and standardizes camera matrices from a PyTorch3D .jgz file.
-        """
-        print(f"DynamicReplica: Loading {jgz_path}...")
+            # Now that self.sequence_names is filled, we can submit self.extract_sequence_cameras().
+            b = executor.submit(self.extract_sequence_cameras, a.result())
 
-        # Read the gzipped JSON file using standard libraries
-        with gzip.open(jgz_path, 'rt', encoding='utf-8') as f:
+            for i, sequence in tqdm(enumerate(self.sequence_names), desc="Precomputing Dynamic Replica image file paths"):
+                sequence_dir = os.path.join(dir, sequence)
+                image_dir = os.path.join(sequence_dir, "images")
+                depth_dir = os.path.join(sequence_dir, "depths")
+
+                for image in os.listdir(image_dir):
+                    if image == "done.ok": continue
+                    self.sequences[i]['images'].append(os.path.join(image_dir, image))
+                for depth in os.listdir(depth_dir):
+                    self.sequences[i]['depths'].append(os.path.join(depth_dir, depth))
+
+            # Make sure we don't proceed until b is done running.
+            b.result()
+
+    def load_jgz(self, path):
+        with gzip.open(path, 'rt', encoding='utf-8') as f:
             data = json.load(f)
+        return data
+
+    def extract_sequence_cameras(self, data):
         for frame in tqdm(data, desc="Reading camera matrices..."):
-            sequence_index = self.sequence_names.index(frame['sequence_name'] + "_source_left")
+            if frame['camera_name'] == "right":
+                continue
+            target_name = frame['sequence_name'] + "_source_left"
+            sequence_index = self.name_to_idx[target_name]
             frame_index = frame['frame_number']
             viewpoint = frame["viewpoint"]
 
@@ -98,38 +116,10 @@ class dynamic_replica_dataset(DatasetBase):
             self.sequences[sequence_index]['intrinsics'][frame_index][1, 2] = cy_px
 
 
-# 1. Define a top-level function so it can be pickled by multiprocessing
-def verify_index(dataset, idx):
-    try:
-        # The worker accesses the globally scoped 'dataset'
-        # and performs the heavy I/O on its own CPU core.
-        _ = dataset[idx]
-        return None
-    except Exception:
-        # Catch the exception locally so the ProcessPool doesn't crash
-        return dataset.image_paths[idx]
-
 if __name__ == "__main__":
-    from functools import partial
     dataset = dynamic_replica_dataset()
-    total_files = len(dataset)
-    print(total_files)
-    first = dataset[0]
-    for key in first:
-        print(key)
-        print(first[key].shape)
-    print(first['depths'].min(), first['depths'].max())
-    # invalid_files = []
-    # with ProcessPoolExecutor() as executor:
-    #     results = executor.map(partial(verify_index, dataset), range(total_files), chunksize=64)
-    #     with tqdm(total=total_files, desc="Processing", unit="file", mininterval = 1) as pbar:
-    #         for result in results:
-    #             if result is not None:
-    #                 invalid_files.append(result)
-    #             pbar.update(1)
-    #
-    # print(f"\nScan complete. Found {len(invalid_files)} invalid images.")
-    # if invalid_files:
-    #     with open("invalid_dynamic_replica_files.txt", "w") as f:
-    #         for path in invalid_files:
-    #             f.write(f"{path}\n")
+    empty = []
+    for i, data in tqdm(enumerate(dataset), desc="Scanning sequences", mininterval=1):
+        if len(data['images']) == 0:
+            empty.append(i)
+    print(empty)
