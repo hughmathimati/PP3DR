@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=with-scale
-#SBATCH --output=with-scale-%j.out
+#SBATCH --job-name=pi3-loss
+#SBATCH --output=pi3-loss-%j.out
 #SBATCH --partition=vulcan-ampere
 #SBATCH --ntasks 1
 #SBATCH --cpus-per-task=64

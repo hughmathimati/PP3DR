@@ -30,7 +30,7 @@ class DatasetBase(torch.utils.data.Dataset):
             }
         """
         super().__init__()
-        self.sequence_length = 10
+        self.sequence_length = 10 # Try 16 next
         self.sequence_names = os.listdir(dir)
         self.sequences = [dict(images=[], depths=[]) for _ in range(len(self.sequence_names))]
         # Start with a lower dimension for initial training and sanity-checking. You can fine-tune at a higher
@@ -252,8 +252,8 @@ class DatasetBase(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
         """
-        Pick a random starting frame before the last 5 * x frames, then randomly sample x frames from the subsequent
-        5 * x frames.
+        Pick a random starting frame before the last 10 * x frames, then randomly sample x frames from the subsequent
+        10 * x frames.
 
         Returns
         -------
@@ -276,7 +276,7 @@ class DatasetBase(torch.utils.data.Dataset):
 
         assert true_length > 0, f"{type(self).__name__}, sequence {index} has 0 images!"
 
-        window_size = 5 * self.sequence_length
+        window_size = 10 * self.sequence_length
         if true_length < window_size:
             start = 0
         else:
@@ -288,7 +288,7 @@ class DatasetBase(torch.utils.data.Dataset):
         frame_indices = frame_indices.sort().values
         # print(frame_indices)
         # Ensure no frames are more than 10 apart
-        if true_length >= self.sequence_length + 10:
+        if true_length >= self.sequence_length + 20:
             for i in range(1, self.sequence_length):
                 if frame_indices[i] - frame_indices[i - 1] > 10:
                     frame_indices[i] = frame_indices[i - 1] + 10

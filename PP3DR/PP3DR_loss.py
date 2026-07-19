@@ -18,8 +18,9 @@ class PP3DR_loss(nn.Module):
     We're going to solve for a universal scale factor before we do all this. The scale factor will be averaged across
     all depths for each frame in a given sequence. Thus, our scale will have shape (B,).
     """
-    def __init__(self):
+    def __init__(self, scale = True):
         super().__init__()
+        self.scale = scale
         pass
 
     def calculate_scale(self, pred_pts, gt_pts, weights):
@@ -34,8 +35,8 @@ class PP3DR_loss(nn.Module):
         -------
         The scale factor minimising L1 3D point coordinate loss across all frames (B)
         """
-        # Flatten all points, per batch
-        pred = pred_pts.flatten(1, -2) # New shape: (B, NHW, 3)
+        # Flatten all points, per batch. Detach pred first!
+        pred = pred_pts.detach().flatten(1, -2) # New shape: (B, NHW, 3)
         gt = gt_pts.flatten(1, -2)  # New shape: (B, NHW, 3)
         # Repeat (reallocate), because we're going to perform manual per-coordinate masking later.
         weights = weights.flatten(1).unsqueeze(-1).repeat(1, 1, 3)  # New shape: (B, NHW, 3)
@@ -44,24 +45,19 @@ class PP3DR_loss(nn.Module):
         valid_mask = pred.abs() > 1e-8
         weights = weights * valid_mask
         assert weights.isnan().sum() == 0, f"{weights.isnan().sum()} NaNs in weights"
-        # Now simply clamp pred to a minimum of 1e-8, and we're all good.
-        ratios = torch.flatten(gt / torch.clamp(pred, min = 1e-8), start_dim = 1) # (B, 3NHW)
-
-        """
-        pred is not going to be NaN. gt could be NaN, meaning certain elements of ratios could be NaN.
-        The trick is that we never actually multiply by ratios; we pretty much only work with effective_weights, and
-        since the effective weights of invalid gt points are zero, they won't affect our cumsum and this won't affect
-        our computed median.
-        """
-        effective_weights = torch.flatten(weights * pred.abs(), start_dim = 1) # (B, 3NHW)
+        ratios = gt / pred # (B, NHW, 3)
+        # Fill all invalid ratios with 0.
+        ratios = ratios.masked_fill(~valid_mask, 0)
+        effective_weights = torch.flatten(weights * pred.abs(), start_dim = 1) # (B, NHW * 3)
+        # assert effective_weights.isnan().sum() == 0, f"{effective_weights.isnan().sum()} NaNs in effective_weights"
 
         # Sort the ratios (O(N log N))
-        sorted_ratios, sort_indices = torch.sort(ratios)
-        sorted_weights = torch.gather(effective_weights, dim=-1, index=sort_indices) # (B, 3NHW)
+        sorted_ratios, sort_indices = torch.sort(ratios.flatten(start_dim=1))
+        sorted_weights = torch.gather(effective_weights, dim=-1, index=sort_indices) # (B, NHW * 3)
 
         # The median is the first ratio where the cumulative sum passes 50%
         # Casting to float32 because we're performing additions here
-        cum_weights = torch.cumsum(sorted_weights.to(torch.float32), dim=-1) # (B, 3NHW)
+        cum_weights = torch.cumsum(sorted_weights.to(torch.float32), dim=-1) # (B, NHW * 3)
         # We keep the last dimension as a singleton dimension because that's what torch.searchsorted requires.
         half_total_weight = cum_weights[:, -1:] / 2.0 # (B)
         # Binary search
@@ -85,21 +81,21 @@ class PP3DR_loss(nn.Module):
         Returns
         -------
         Relative pose changes between frame i and frame i + 1 for i in [0, L - 1).
-        Specifically, our extrinsics are c2w matrices, and we'd like to obtain the next extrinsic by left-multiplying
-         the current extrinsic by the following relative extrinsic. Thus, the relative extrinsic from A to B is
-         BA^-1.
+        Our extrinsics are c2w matrices, and we'd like to obtain the next extrinsic rotation matrix by left-multiplying
+         the current rotation matrix by the following relative rotation matrix. Thus, the relative rotation from A to B
+         is BA^-1.
+        As for the translation, we'll just add on the next relative translation to the current one. Thus, the relative
+         translation from A to B is B - A.
         relative_rotations: (B, L - 1, 3, 3), relative_translations: (B, L - 1, 3)
         """
-        B, L = extrinsics.shape[:2]
-        relative_rotations = torch.empty(B, L - 1, 3, 3, device = extrinsics.device)
-        relative_translations = torch.empty(B, L - 1, 3, device = extrinsics.device)
-        # current_rotation: (B, 1, 3, 3), current_translation: (B, 1, 3, 1)
-        current_rotation, current_translation = extrinsics[:, 0, :, :3], extrinsics [:, 0, :, 3]
-        for i in range(0, L - 1):
-            next_rotation, next_translation = extrinsics[:, i + 1, :, :3], extrinsics[:, i + 1, :, 3]
-            # current_rotation.transpose(-1, -2), not current_rotation.T, because we need to keep the batch dimension.
-            relative_rotations[:, i] = next_rotation @ current_rotation.transpose(-1, -2)
-            relative_translations[:, i] = next_translation - current_translation
+        current_rotations = extrinsics[:, :-1, :, :3]  # (B, L-1, 3, 3)
+        next_rotations = extrinsics[:, 1:, :, :3]  # (B, L-1, 3, 3)
+        relative_rotations = next_rotations @ current_rotations.transpose(-1, -2)
+
+        current_translations = extrinsics[:, :-1, :, 3]  # (B, L-1, 3)
+        next_translations = extrinsics[:, 1:, :, 3]  # (B, L-1, 3)
+        relative_translations = next_translations - current_translations
+
         return relative_rotations, relative_translations
 
     def obtain_pred_3D_points(self, pred):
@@ -156,8 +152,7 @@ class PP3DR_loss(nn.Module):
             "relative_camera_rotations": (B, L - 1, 3, 3)
         }
         gt: {
-            "inputs": (B, L, 3, input_dim, input_dim)
-            "valid_mask": (B, 1, input_dim, input_dim)
+            "inputs": (B, L, 3, H, W)
             "depths": (B, L, H, W)
             "extrinsics": (B, L, 3, 4)
             "intrinsics": (B, L, 3, 3)
@@ -169,9 +164,21 @@ class PP3DR_loss(nn.Module):
         -------
         A single scalar, representing the loss.
         """
+        # First of all, check the model predictions for infs and nans.
+        torch._assert(
+            (~pred['XY_rays'].isfinite()).sum() + (~pred['log_depths'].isfinite()).sum()
+            + (~pred['relative_camera_translations'].isfinite()).sum()
+            + (~pred['relative_camera_rotations'].isfinite()).sum() == 0,
+            f"Pred has invalid values. XY_rays: {(~pred['XY_rays'].isfinite()).sum()}, "
+            f"log_depths: {(~pred['log_depths'].isfinite()).sum()}, "
+            f"relative_camera_translations: {(~pred['relative_camera_translations'].isfinite()).sum()}, "
+            f"relative_camera_rotations: {(~pred['relative_camera_rotations'].isfinite()).sum()}"
+        )
+
         B, L, H, W = pred['log_depths'].shape
 
-        gt_invalid_depth_mask = ~(torch.isfinite(gt['depths']) & (gt['depths'] != 0))
+        gt_valid_depth_mask = torch.isfinite(gt['depths']) & (gt['depths'] != 0)
+        gt_invalid_depth_mask = ~gt_valid_depth_mask
 
         # First, normalise the MEDIAN ground-truth depth to 1.
         # Calculate the median over only valid elements by filling all invalid with NaN and using torch.nanmedian().
@@ -179,51 +186,84 @@ class PP3DR_loss(nn.Module):
             gt['depths'].masked_fill(gt_invalid_depth_mask, float('nan')).flatten(1),
             dim=-1
         )[0] # (B)
-        assert median_depths.isnan().sum() == 0, f"{median_depths.isnan().sum()} batch's gt depths are completely invalid."
+        torch._assert(
+            median_depths.isnan().sum() == 0,
+            f"{median_depths.isnan().sum()} batch's gt depths are completely invalid."
+        )
         gt['depths'] = gt['depths'] / median_depths.view(B, 1, 1, 1)
-        weights = 2 / (1 + gt['depths']) # multiplied by 2 so the median weight is 1to
-
+        # Sanitize GT depths before they touch the predictions by setting all invalid values to the median depth, 1.
+        gt['depths'] = gt['depths'].masked_fill(gt_invalid_depth_mask, 1)
+        weights = 2 / (1 + gt['depths']) # multiplied by 2 so the median weight is 1
         # Multiply weights by gt_valid_depth_mask to zero the weights of any points with invalid gt depths.
         weights = weights.masked_fill(gt_invalid_depth_mask, 0)
 
         pred_points, gt_points = self.obtain_pred_3D_points(pred), self.obtain_gt_3D_points(gt)
-        # NOTE: I still have my reservations regarding whether this scale hurts me more than it helps me.
-        # I'll leave it on for now, but it will be the first thing I try turning off if things go awry.
-        scale = self.calculate_scale(pred_points, gt_points, weights) # (B, 1)
-        # EXPERIMENT: No scale
-        # scale = torch.tensor([1] * B, device = "cuda")
+        if self.scale:
+            scale = self.calculate_scale(pred_points, gt_points, weights) # (B, 1)
+        else:
+            scale = torch.tensor([1], device = "cuda").expand(B)
 
         """
         Weighted Huber loss for 3D point coordinates (per-frame, in camera coordinates)
-        Weird views ensure scale and view are broadcast correctly.
-        It's okay for us to simply multiply by weights at the end, because whatever NaNs come up inside huber_loss
-        are contained only in that element itself, because reduction='none'.
         """
         total_point_loss = F.huber_loss(
-            pred_points * scale.view(B, 1, 1, 1, 1),
+            (pred_points * scale.view(B, 1, 1, 1, 1)),
             gt_points,
             reduction='none'
-        ) * weights.view(B, L, H, W, 1)
-        point_loss = total_point_loss.sum() / ((~gt_invalid_depth_mask).sum() * 3)
-        assert point_loss.is_finite(), f"Point loss invalid ({point_loss})\ttotal_point_loss = {total_point_loss}"
+        ) * weights.view(B, L, H, W, 1) # Broadcasts against all 3 coordinates of each point.
+        # We shouldn't have to masked_fill() total_point_loss here, as pred and gt should all be valid by this point.
+        point_loss = total_point_loss.sum() / (gt_valid_depth_mask.sum() * 3) # *3 for x, y, and z
+        torch._assert(
+            point_loss.isfinite(),
+            f"Point loss invalid ({point_loss})\ttotal_point_loss = {total_point_loss}"
+        )
 
-        # (Unweighted) Huber loss for relative camera translation. Hopefully none of the gt camera poses are NaN...
         gt_relative_rotations, gt_relative_translations = self.obtain_gt_relative_poses(gt['extrinsics'])
-        # Our predicted camera translations need to be scaled by our scale factor, and the gt camera translations need
-        # to be scaled by the same median factor with which we scaled the gt depths.
-        translation_loss = F.huber_loss(scale.view(B, 1, 1) * pred['relative_camera_translations'], gt_relative_translations / median_depths.view(B, 1, 1))
-        assert translation_loss.is_finite(), f"Translation loss invalid ({translation_loss})"
+        """
+        Huber loss for relative camera translation.
+        """
+        # If any of the 3 coordinates for a GT camera translation are invalid, we want to ignore that entire translation.
+        gt_valid_translation_mask = gt_relative_translations.isfinite().any(dim=-1, keepdim=True) # (B, L - 1, 1)
+        gt_invalid_translation_mask = ~gt_valid_translation_mask
+        gt_relative_translations = gt_relative_translations.masked_fill(gt_invalid_translation_mask, 0)
+        total_translation_loss = F.huber_loss(
+            scale.view(B, 1, 1) * pred['relative_camera_translations'],
+            gt_relative_translations / median_depths.view(B, 1, 1),
+            reduction='none'
+        )
+        total_translation_loss = total_translation_loss.masked_fill(~gt_invalid_translation_mask, 0)
+        translation_loss = total_translation_loss.sum() / ((gt_valid_translation_mask).sum() * 3) # *3 for x, y, and z
+        torch._assert(translation_loss.isfinite(), f"Translation loss invalid ({translation_loss})")
 
-        # Cosine similarity loss for relative camera rotation
-        # cos = (Tr(R_1^TR_2) - 1)/2. Since Tr(R_1^TR_2) is equal to the inner product of R_1 and R_2, our loss is:
-        # (3 - <R_1, R_2>)/2
-        trace = (pred['relative_camera_rotations'] * gt_relative_rotations).sum(dim=(-2, -1)) # (B, L)
-        rotation_loss = torch.clamp((3 - trace) / 2, min = 0).mean()
-        assert rotation_loss.is_finite(), f"Translation loss invalid ({rotation_loss})"
+        """
+        Cosine similarity loss for relative camera rotation
+        cos = (Tr(R_1^TR_2) - 1)/2. Since Tr(R_1^TR_2) is equal to the inner product of R_1 and R_2, our loss is:
+        (3 - <R_1, R_2>)/2
+        """
+        # (B, L - 1)
+        gt_rotation_valid_mask = (
+                gt_relative_rotations.isfinite().all(dim=-1).all(dim=-1)
+                                  & (gt_relative_rotations.flatten(start_dim=2).abs().max(dim=-1).values <= 1.05)
+        )
+        gt_rotation_invalid_mask = ~gt_rotation_valid_mask
+        identity_matrix = torch.eye(
+            3,
+            device=gt_relative_rotations.device,
+            dtype=gt_relative_rotations.dtype
+        ).view(1, 1, 3, 3)
+        gt_relative_rotations = torch.where(
+            gt_rotation_valid_mask.view(B, L - 1, 1, 1),
+            gt_relative_rotations,
+            identity_matrix
+        )
+        trace = (pred['relative_camera_rotations'] * gt_relative_rotations).sum(dim=(-2, -1)) # (B, L - 1)
+        # assert (~trace.isfinite()).sum() == 0, f"trace has {(~trace.isfinite()).sum()} invalid elements"
 
-        # print(f"Point loss: {point_loss}\tTranslation loss: {translation_loss}\tRotation loss: {rotation_loss}") # DEBUG
-        # NOTE: If not using scale, translation_loss weight should really be 10 instead of 20.
-        total_loss = 10 * point_loss + 20 * translation_loss + rotation_loss
+        raw_rotation_loss = torch.clamp((3 - trace) / 2, min = 0)
+        rotation_loss = raw_rotation_loss.masked_fill(gt_rotation_invalid_mask, 0).sum() / gt_rotation_valid_mask.sum()
+        torch._assert(rotation_loss.isfinite(), f"Rotation loss invalid ({rotation_loss})")
+
+        total_loss = 20 * point_loss + 10 * translation_loss + rotation_loss
         return total_loss, dict(
             total_loss=total_loss,
             point_loss=point_loss,

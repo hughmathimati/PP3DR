@@ -1,8 +1,10 @@
-name = "checkpoints"
+name = "pi3-loss"
 import transformers.optimization
 from models.PP3DR import PP3DR
 from PP3DR_loss import PP3DR_loss
+from adapted_pi3_loss import Adapted_Pi3_loss
 from models.Dinov3 import load_dinov3, obtain_features
+
 from datasets.nrgbd_dataset import nrgbd_dataset
 from datasets.dtu_dataset import dtu_dataset
 from datasets.dynamic_replica_dataset import dynamic_replica_dataset
@@ -10,6 +12,7 @@ from datasets.eth3d_dataset import eth3d_dataset
 from datasets.flying_things_3d_dataset import flying_things_3d_dataset
 from datasets.sintel_dataset import sintel_dataset
 from datasets.nrgbd_dataset import nrgbd_dataset
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -32,9 +35,11 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 accelerator = Accelerator(
     # kwargs_handlers=[ProfileKwargs(activities=["cpu", "cuda"])],
     dataloader_config=DataLoaderConfiguration(non_blocking=True),
-    log_with="wandb", project_dir="/vulcanscratch/hughma/PP3DR/tensorboard"
+    log_with="wandb", project_dir="/vulcanscratch/hughma/PP3DR/tensorboard",
+    gradient_accumulation_steps=4
 )
-accelerator.init_trackers(project_name="PP3DR")
+if accelerator.is_local_main_process:
+    accelerator.init_trackers(project_name="PP3DR")
 torch.cuda.set_device(accelerator.device)
 
 
@@ -207,32 +212,31 @@ def train_on_dataset(name, iterator, dataloader):
     """
     dataloader parameter is solely for the tqdm progress bar.
 
-    Losses will be logged to Tensorboard every batch. This notably differs from the validation logging behaviour.
+    Losses will be logged to WandB every batch. This notably differs from the validation logging behaviour.
     """
     global global_step
     # I'm basically just expecting python to correctly reference the non-parameter variables.
     for batch in tqdm(
             iterator, desc=name, disable=not accelerator.is_local_main_process, total=len(dataloader), mininterval=1
     ):
-        # Accelerate automatically handles autocast.
-        # Accelerate automatically moves batch['images'] to the right GPU.
-        pred = PP3DR_model(batch['images'], batch['rope_x'], batch['rope_y'])
-        loss, loss_dict = metric(pred, batch)
-        state.train_losses[state.epoch - 1] += loss.detach()
-        with torch.autocast(device_type=accelerator.device.type, enabled=False):
-            AdamW.zero_grad()
-            Muon.zero_grad()
-            accelerator.backward(loss)
-            # Clamps the total norm of the gradients to 1.0
-            torch.nn.utils.clip_grad_norm_(PP3DR_model.parameters(), max_norm=1.0)
-            AdamW.step()
-            Muon.step()
-            AdamW_scheduler.step()
-            Muon_scheduler.step()
-        # Log to Tensorboard once per batch
+        with accelerator.accumulate(PP3DR_model):
+            # Accelerate automatically handles autocast and automatically moves the batch's tensors to the right GPU.
+            pred = PP3DR_model(batch['images'], batch['rope_x'], batch['rope_y'])
+            loss, loss_dict = metric(pred, batch)
+            state.train_losses[state.epoch - 1] += loss.detach()
+            with torch.autocast(device_type=accelerator.device.type, enabled=False):
+                AdamW.zero_grad()
+                Muon.zero_grad()
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    torch.nn.utils.clip_grad_norm_(PP3DR_model.parameters(), max_norm=1.0)
+                AdamW.step()
+                Muon.step()
+                AdamW_scheduler.step()
+                Muon_scheduler.step()
+        # Log to WandB once per batch
         if accelerator.is_local_main_process:
-            loss_dict = {f"train/{key}": value for key, value in loss_dict.items()}
-            accelerator.log(loss_dict, step=global_step)
+            accelerator.log({f"train/{key}": value for key, value in loss_dict.items()}, step=global_step)
             global_step += 1
 
 
@@ -243,7 +247,7 @@ def val_on_dataset(name, iterator, dataloader):
     Average validation loss per epoch getes logged. This notably differs from the training logging behaviour.
     """
     global global_step
-    sum_loss_dict = dict(total_loss=0, point_loss=0, translation_loss=0, rotation_loss=0)
+    sum_loss_dict = dict(total_loss=0, point_loss=0, translation_loss=0, rotation_loss=0, normal_loss=0)
     len_dataloader = len(dataloader)
     for batch in tqdm(iterator, desc=f"Validation {name}", disable=not accelerator.is_local_main_process,
                       total=len_dataloader):
@@ -275,7 +279,10 @@ if __name__ == "__main__":
     with ThreadPoolExecutor() as executor:
         a = executor.submit(prepare_dataloaders)
         b = executor.submit(initialize, epochs)
-        metric = PP3DR_loss()
+
+        # metric = PP3DR_loss(scale=False)
+        metric = Adapted_Pi3_loss()
+
         train_dataloader, val_dataloader = a.result()
         state, PP3DR_model, AdamW, Muon = b.result()
 
@@ -366,4 +373,5 @@ if __name__ == "__main__":
         print("Saved val_losses")
         torch.save(PP3DR_model.state_dict(), f"/vulcanscratch/hughma/PP3DR/{name}/PP3DR.pth")
         print("Saved model")
-    accelerator.end_training()
+    if accelerator.is_local_main_process:
+        accelerator.end_training()
