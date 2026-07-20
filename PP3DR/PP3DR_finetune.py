@@ -1,4 +1,4 @@
-name = "no-scale"
+name = "finetune-longer"
 import transformers.optimization
 from models.PP3DR import PP3DR
 from models.PP3DR_Dino import PP3DR_Dino
@@ -37,7 +37,7 @@ accelerator = Accelerator(
     # kwargs_handlers=[ProfileKwargs(activities=["cpu", "cuda"])],
     dataloader_config=DataLoaderConfiguration(non_blocking=True),
     log_with="wandb", project_dir="/vulcanscratch/hughma/PP3DR/tensorboard",
-    gradient_accumulation_steps=8
+    gradient_accumulation_steps=16
 )
 if accelerator.is_local_main_process:
     accelerator.init_trackers(project_name="PP3DR")
@@ -75,7 +75,7 @@ def prepare_dataloaders():
         # Concurrently load Sintel while we're waiting.
         val_dataloader = DataLoader(
             sintel_dataset(),
-            batch_size=6,
+            batch_size=1,
             shuffle=False,
             num_workers=4,
             persistent_workers=True,
@@ -88,7 +88,7 @@ def prepare_dataloaders():
     train_dataloader = DataLoader(
         ConcatDataset(constructed),
         # Batch size of 6 sequences, each with 10 images (60 images total)
-        batch_size=6,
+        batch_size=1,
         shuffle=True,  # Critical: Shuffles across all domains!
         num_workers=8,
         pin_memory=True,
@@ -98,8 +98,8 @@ def prepare_dataloaders():
     return train_dataloader, val_dataloader
 
 # "/vulcanscratch/hughma/PP3DR/no-scale/PP3DR.pth"
-def initialize(epochs, pretrained_path=None):
-    PP3DR_model = PP3DR()
+def initialize(epochs, pretrained_path="/vulcanscratch/hughma/PP3DR/no-scale/PP3DR.pth"):
+    PP3DR_model = PP3DR(freeze_feature_extractor=False)
     # PP3DR_model = PP3DR_Dino()
     if pretrained_path is not None:
         PP3DR_model.load_state_dict(torch.load(pretrained_path, weights_only=True, map_location="cpu"))

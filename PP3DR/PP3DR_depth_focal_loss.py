@@ -6,10 +6,11 @@ from torch.linalg import vector_norm
 import torch.cuda.amp as amp
 from einops import rearrange
 from typing import Callable
+from PP3DR_loss import PP3DR_loss
 
 
 @torch.compile()
-class PP3DR_loss(nn.Module):
+class PP3DR_loss(PP3DR_loss):
     """
     Current losses are:
      - Huber loss for 3D coordinates per frame
@@ -18,86 +19,6 @@ class PP3DR_loss(nn.Module):
     We're going to solve for a universal scale factor before we do all this. The scale factor will be averaged across
     all depths for each frame in a given sequence. Thus, our scale will have shape (B,).
     """
-    def __init__(self, scale = True):
-        super().__init__()
-        self.scale = scale
-        pass
-
-    def calculate_scale(self, pred_pts, gt_pts, weights):
-        """
-        Parameters
-        ----------
-        pred_pts: Unprojected predicted points in each camera's own reference frame (B, N, H, W, 3)
-        gt_pts: Unprojected ground-truth points in each camera's own reference frame (B, N, H, W, 3)
-        weights: Per-point weights (e.g. for depth-weighted loss) (B, N, H, W)
-
-        Returns
-        -------
-        The scale factor minimising L1 3D point coordinate loss across all frames (B)
-        """
-        # Flatten all points, per batch. Detach pred first!
-        pred = pred_pts.detach().flatten(1, -2) # New shape: (B, NHW, 3)
-        gt = gt_pts.flatten(1, -2)  # New shape: (B, NHW, 3)
-        # Repeat (reallocate), because we're going to perform manual per-coordinate masking later.
-        weights = weights.flatten(1).unsqueeze(-1).repeat(1, 1, 3)  # New shape: (B, NHW, 3)
-
-        # Force the weights of any near-zero coordinates to zero, so we don't end up dividing by them.
-        valid_mask = pred.abs() > 1e-8
-        weights = weights * valid_mask
-        assert weights.isnan().sum() == 0, f"{weights.isnan().sum()} NaNs in weights"
-        ratios = gt / pred # (B, NHW, 3)
-        # Fill all invalid ratios with 0.
-        ratios = ratios.masked_fill(~valid_mask, 0)
-        effective_weights = torch.flatten(weights * pred.abs(), start_dim = 1) # (B, NHW * 3)
-        # assert effective_weights.isnan().sum() == 0, f"{effective_weights.isnan().sum()} NaNs in effective_weights"
-
-        # Sort the ratios (O(N log N))
-        sorted_ratios, sort_indices = torch.sort(ratios.flatten(start_dim=1))
-        sorted_weights = torch.gather(effective_weights, dim=-1, index=sort_indices) # (B, NHW * 3)
-
-        # The median is the first ratio where the cumulative sum passes 50%
-        # Casting to float32 because we're performing additions here
-        cum_weights = torch.cumsum(sorted_weights.to(torch.float32), dim=-1) # (B, NHW * 3)
-        # We keep the last dimension as a singleton dimension because that's what torch.searchsorted requires.
-        half_total_weight = cum_weights[:, -1:] / 2.0 # (B)
-        # Binary search
-        median_idx = torch.searchsorted(cum_weights, half_total_weight) # (B)
-
-        # I don't think the below case is possible.
-        # Handle the edge case where median_idx hits the end of the array
-        # median_idx = torch.clamp(median_idx, max=len(sorted_ratios) - 1)
-
-        # sorted_ratios has shape (B, 3LHW). median_idx has shape (B, 1).
-        assert median_idx.max() < sorted_ratios.shape[1] and median_idx.min() > 0, \
-            f"median_idx min/max = {median_idx.min().item()} / {median_idx.max().item()}\n{median_idx}"
-        return torch.gather(sorted_ratios, dim=1, index=median_idx) # (B, 1)
-
-    def obtain_gt_relative_poses(self, extrinsics):
-        """
-        Parameters
-        ----------
-        extrinsics: gt['extrinsics']
-
-        Returns
-        -------
-        Relative pose changes between frame i and frame i + 1 for i in [0, L - 1).
-        Our extrinsics are c2w matrices, and we'd like to obtain the next extrinsic rotation matrix by left-multiplying
-         the current rotation matrix by the following relative rotation matrix. Thus, the relative rotation from A to B
-         is BA^-1.
-        As for the translation, we'll just add on the next relative translation to the current one. Thus, the relative
-         translation from A to B is B - A.
-        relative_rotations: (B, L - 1, 3, 3), relative_translations: (B, L - 1, 3)
-        """
-        current_rotations = extrinsics[:, :-1, :, :3]  # (B, L-1, 3, 3)
-        next_rotations = extrinsics[:, 1:, :, :3]  # (B, L-1, 3, 3)
-        relative_rotations = next_rotations @ current_rotations.transpose(-1, -2)
-
-        current_translations = extrinsics[:, :-1, :, 3]  # (B, L-1, 3)
-        next_translations = extrinsics[:, 1:, :, 3]  # (B, L-1, 3)
-        relative_translations = next_translations - current_translations
-
-        return relative_rotations, relative_translations
-
     def obtain_pred_3D_points(self, pred):
         """
         Parameters
@@ -106,36 +27,19 @@ class PP3DR_loss(nn.Module):
 
         Returns
         -------
-        (B, L, H, W, 3) of 3D-coordinates for each pixel's point, in the given frame's 3D coordinate system, UNSCALED.
-        We won't scale yet, because we need the initial points to calculate the scale itself.
+        (B, L, H, W, 3) of world-frame 3D-coordinates, unprojected from pred, unscaled.
         """
         B, L, H, W = pred['log_depths'].shape
-        depths = torch.exp(pred['log_depths']).unsqueeze(-1)
-        xy = pred['XY_rays'] * depths
-        return torch.cat((xy, depths), dim = -1)
-
-    def obtain_gt_3D_points(self, gt):
-        """
-        Parameters
-        ----------
-        gt
-
-        Returns
-        -------
-        (B, L, H, W, 3) of world-frame 3D-coordinates, unprojected from gt, UN-NORMALISED.
-        We won't normalize here; we'll normalize in the main function.
-        """
-        B, L, H, W = gt['depths'].shape
-        device = gt['depths'].device
+        device = pred['log_depths'].device
         y, x = torch.meshgrid(
             torch.arange(H, device = device) + 0.5,
             torch.arange(W, device = device) + 0.5,
             indexing='ij'
         ) # (H, W)
         y, x = y.view(1, 1, H, W), x.view(1, 1, H, W)
-        Z = gt['depths'] # (B, L, H, W)
-        fx, fy = gt['intrinsics'][..., 0, 0].view(B, L, 1, 1), gt['intrinsics'][..., 1, 1].view(B, L, 1, 1)
-        cx, cy = gt['intrinsics'][..., 0, 2].view(B, L, 1, 1), gt['intrinsics'][..., 1, 2].view(B, L, 1, 1)
+        Z = torch.exp(pred['log_depths']) # (B, L, H, W)
+        fx, fy = pred['fx'].view(B, L, 1, 1), pred['fy'].view(B, L, 1, 1)
+        cx, cy = pred['cx'].view(B, L, 1, 1), pred['cy'].view(B, L, 1, 1)
         X = (x - cx) * Z / fx # (B, L, H, W)
         Y = (y - cy) * Z / fy # (B, L, H, W)
 
@@ -146,8 +50,11 @@ class PP3DR_loss(nn.Module):
         Parameters
         ----------
         pred: {
-            "XY_rays": (B, L, H, W, 2)
             "log_depths": (B, L, H, W)
+            "fx": (B, L)
+            "fy": (B, L)
+            "cx": (B, L)
+            "cy": (B, L)
             "relative_camera_translations": (B, L - 1, 3)
             "relative_camera_rotations": (B, L - 1, 3, 3)
         }
@@ -166,11 +73,15 @@ class PP3DR_loss(nn.Module):
         """
         # First of all, check the model predictions for infs and nans.
         torch._assert(
-            (~pred['XY_rays'].isfinite()).sum() + (~pred['log_depths'].isfinite()).sum()
+            (~pred['log_depths'].isfinite()).sum() + (~pred['fx'].isfinite()).sum()
+            + (~pred['fy'].isfinite()).sum() + (~pred['cx'].isfinite()).sum() + (~pred['cy'].isfinite()).sum()
             + (~pred['relative_camera_translations'].isfinite()).sum()
             + (~pred['relative_camera_rotations'].isfinite()).sum() == 0,
-            f"Pred has invalid values. XY_rays: {(~pred['XY_rays'].isfinite()).sum()}, "
-            f"log_depths: {(~pred['log_depths'].isfinite()).sum()}, "
+            f"Pred has invalid values. log_depths: {(~pred['log_depths'].isfinite()).sum()}, "
+            f"fx: {(~pred['fx'].isfinite()).sum()}, "
+            f"fy: {(~pred['fy'].isfinite()).sum()}, "
+            f"cx: {(~pred['cx'].isfinite()).sum()}, "
+            f"cy: {(~pred['cy'].isfinite()).sum()}, "
             f"relative_camera_translations: {(~pred['relative_camera_translations'].isfinite()).sum()}, "
             f"relative_camera_rotations: {(~pred['relative_camera_rotations'].isfinite()).sum()}"
         )

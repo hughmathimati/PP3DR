@@ -81,7 +81,10 @@ class LocalBlock(nn.Module):
         return x
 
 @torch.compile()
-class PointHead(nn.Module):
+class DepthFocalHead(nn.Module):
+    """
+    Predicts depths for all points + fx, fy, cx, cy per frame.
+    """
     def __init__(
             self,
             dim,
@@ -98,8 +101,10 @@ class PointHead(nn.Module):
         self.global_blocks = nn.ModuleList([GlobalBlock(dim, num_heads, ffn_ratio) for _ in range(self.blocks_each)])
         self.local_blocks = nn.ModuleList([LocalBlock(dim, num_heads, ffn_ratio) for _ in range(self.blocks_each)])
 
-        self.layer_norm = nn.LayerNorm(dim) # Pre-projection layer norm.
-        self.dim_proj = nn.Linear(dim, 256 * 3, bias = False)
+        self.registers_layer_norm = nn.LayerNorm(num_registers) # Pre-projection layer norm.
+        self.tokens_layer_norm = nn.LayerNorm(dim) # Pre-projection layer norm.
+        self.focal_proj = nn.Linear(num_registers * dim, 4, bias=False) # fx, fy, cx, cy
+        self.depths_proj = nn.Linear(dim, 256, bias=False)
         self.num_registers = num_registers
         self.num_blocks = blocks
 
@@ -122,24 +127,20 @@ class PointHead(nn.Module):
                 x = self.global_blocks[i](x, rope3d, L)
                 x = self.local_blocks[i](x, rope2d, L)
 
-        x = rearrange(x, "(B L) X dim -> B L X dim", L=L)
-        # x.shape == (B, L, num_registers + HW // 256, dim)
-        # Drop the register tokens (recall that they're concatenated along the sequence dimension, not the embedding dimension).
-        x = x[:, :, self.num_registers:, :]
-        # x.shape == (B, L, HW // 256, dim)
-        x = self.layer_norm(x)
-        # Project so we end up with the correct number of dimensions at the end
-        x = self.dim_proj(x)
-        # x.shape == (B, L, HW // 256, 256 * 3)
+        x = rearrange(x, "(B L) X dim -> B L X dim", L=L) # (B, L, num_registers + HW // 256, dim)
+        registers = self.registers_layer_norm(x[:, :, :self.num_registers, :]) # (B, L, num_registers, dim)
+        tokens = self.tokens_layer_norm(x[:, :, self.num_registers:, :]) # (B, L, HW // 256, dim)
+        # (B, L, num_registers * dim) -> (B, L, 4) -> 4 x (B, L)
+        fx, fy, cx, cy = self.focal_proj(registers.flatten(start_dim=2)).unbind(-1)
         # We must take into account that each token represents the 16x16 patch at that location.
         # Naively rearranging leads to each 16x16 patch being mapped to a contiguous line of 256 pixels.
-        x = rearrange(
-            x,
-            "B L (h_p w_p) (p1 p2 c) -> B L (h_p p1) (w_p p2) c",
-            h_p=H // 16, w_p=W // 16, p1=16, p2=16, c=3
+        depths = rearrange(
+            self.depths_proj(tokens), # (B, L, HW // 256, 256)
+            "B L (h_p w_p) (p1 p2) -> B L (h_p p1) (w_p p2)",
+            h_p=H // 16, w_p=W // 16, p1=16, p2=16
         )
-        # x.shape == (B, L, HW, 3)
-        return x
+        # depths has shape (B, L, HW). fx, fy, cx, and cy have shape (B, L).
+        return depths, fx, fy, cx, cy
 
 @torch.compile()
 class PoseHead(nn.Module):
@@ -202,9 +203,8 @@ class PoseHead(nn.Module):
         return x
 
 
-# I'm refraining from compiling the entire model for now because I keep hitting the recompile limit due to DropPath.
 @torch.compile()
-class PP3DR(nn.Module):
+class PP3DR_depth_focal(nn.Module):
     def __init__(
             self,
             dim: int = 1280,
@@ -214,6 +214,7 @@ class PP3DR(nn.Module):
             ffn_ratio: int = 4,
             num_registers: int = 5,
             start_checkpointing = 7,
+            freeze_feature_extractor = True,
     ):
         super().__init__()
         assert decoder_blocks % 2 == 0, f"Number of decoder blocks ({decoder_blocks}) must be even for alternating global and frame-wise attention"
@@ -240,27 +241,21 @@ class PP3DR(nn.Module):
         self.ViTTT.load_state_dict(torch.load("/vulcanscratch/hughma/ViT/best_checkpoint.pth",
                                               weights_only=True,
                                               map_location="cpu"))
-        for parameter in self.ViTTT.parameters():
-            parameter.requires_grad = False
-        self.ViTTT.eval()
+        if self.freeze_feature_extractor:
+            for parameter in self.ViTTT.parameters():
+                parameter.requires_grad = False
+            self.ViTTT.eval()
         # ViTTT puts in the registers for me.
         self.num_registers = num_registers
 
         # Per-task decoders
-        """
-        The point decoder will predict a depth-normalised XY ray direction (X/Z and Y/Z), along with log depth.
-        """
-        self.point_decoder = PointHead(dim, num_registers, num_heads)
-        """
-        The camera decoder will predict the relative SE3 transformation to the next frame.
-        We are parameterizing our camera with three scalars for the translation and six scalars for the rotation.
-        Details of how the rotation prediction works are in the forward() method.
-        """
+        self.depth_focal_decoder = DepthFocalHead(dim, num_registers, num_heads)
         self.pose_decoder = PoseHead(dim, num_registers, num_heads)
 
     def train(self, mode=True):
         super().train(mode)
-        self.ViTTT.eval()
+        if self.freeze_feature_extractor:
+            self.ViTTT.eval()
         return self
 
     def ViT(self, image):
@@ -316,7 +311,7 @@ class PP3DR(nn.Module):
 
         # x.shape == (B * L, num_registers + HW // 256, dim)
         # Step 2: Per-task decoders
-        points = self.point_decoder(x, rope2d, rope3d, L, H, W)
+        depths, fx, fy, cx, cy = self.depth_focal_decoder(x, rope2d, rope3d, L, H, W)
         # We're predicting the relative pose from this frame to the next one, which is why our sequence length is L - 1.
         poses = self.pose_decoder(x, rope2d, rope3d, L)[:, :-1] # (B, L - 1, 9)
 
@@ -330,9 +325,12 @@ class PP3DR(nn.Module):
         c = torch.linalg.cross(a, b, dim = -1)
 
         return {
-            "XY_rays": points[...,:2],
             # e^-80 to e^80 is safely within the range of bfloat16.
-            "log_depths": torch.clamp(points[...,2], min=-80, max=80),
+            "log_depths": torch.clamp(depths, min=-80, max=80),
+            "fx": fx,
+            "fy": fy,
+            "cx": cx,
+            "cy": cy,
             "relative_camera_translations": poses[:, :, :3], # (B, L - 1, 3) -> 3 scalars, (x, y, z)
             "relative_camera_rotations": torch.stack([a, b, c], dim=-1) # (B, L - 1, 3, 3)
         }
