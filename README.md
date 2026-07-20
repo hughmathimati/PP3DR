@@ -18,7 +18,7 @@
 
 ## PP3DR (name subject to change):
 - ### datasets
-  - **dataset_base.py**: The (virtual/abstract) base dataset class, which includes basic init and helper functions and handles `__getitem()`
+  - **dataset_base.py**: The (virtual/abstract) base dataset class, which includes basic init and helper functions and handles `__getitem__()`
   - **sintel_io.py**: Provided by the Sintel dataset to aid in processing their files
   - The rest of the files are datasets implemented for their respective file structures.
 - **models**:
