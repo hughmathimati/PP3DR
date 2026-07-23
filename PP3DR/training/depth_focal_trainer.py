@@ -1,9 +1,7 @@
-name = "no-scale"
+name = "depth-focal"
 import transformers.optimization
-from models.PP3DR import PP3DR
-from models.PP3DR_Dino import PP3DR_Dino
-from PP3DR_loss import PP3DR_loss
-from adapted_pi3_loss import Adapted_Pi3_loss
+from models.PP3DR_depth_focal import PP3DR_depth_focal
+from PP3DR_depth_focal_loss import PP3DR_loss
 from models.Dinov3 import load_dinov3, obtain_features
 
 from datasets.nrgbd_dataset import nrgbd_dataset
@@ -99,8 +97,7 @@ def prepare_dataloaders():
 
 # "/vulcanscratch/hughma/PP3DR/no-scale/PP3DR.pth"
 def initialize(epochs, pretrained_path=None):
-    PP3DR_model = PP3DR()
-    # PP3DR_model = PP3DR_Dino()
+    PP3DR_model = PP3DR_depth_focal()
     if pretrained_path is not None:
         PP3DR_model.load_state_dict(torch.load(pretrained_path, weights_only=True, map_location="cpu"))
         print("Loaded pretrained weights from", pretrained_path)
@@ -274,7 +271,7 @@ if __name__ == "__main__":
     torch.set_float32_matmul_precision('high')
 
     epochs = 50
-    checkpoint_every = 25
+    checkpoint_every = 10
     checkpoint = None
 
     # ProcessPoolExecutor -> Cannot re-initialize CUDA in forked subprocess.
@@ -283,7 +280,6 @@ if __name__ == "__main__":
         b = executor.submit(initialize, epochs)
 
         metric = PP3DR_loss(scale=False)
-        # metric = Adapted_Pi3_loss()
 
         train_dataloader, val_dataloader = a.result()
         state, PP3DR_model, AdamW, Muon = b.result()
@@ -358,7 +354,6 @@ if __name__ == "__main__":
     #     prof.export_chrome_trace(f"trace.json")
     #     print("Saved trace")
     # accelerator.end_training()
-    exit(0)
 
     # End of training loop; write losses to file
     if accelerator.is_local_main_process:

@@ -101,7 +101,7 @@ class DepthFocalHead(nn.Module):
         self.global_blocks = nn.ModuleList([GlobalBlock(dim, num_heads, ffn_ratio) for _ in range(self.blocks_each)])
         self.local_blocks = nn.ModuleList([LocalBlock(dim, num_heads, ffn_ratio) for _ in range(self.blocks_each)])
 
-        self.registers_layer_norm = nn.LayerNorm(num_registers) # Pre-projection layer norm.
+        self.registers_layer_norm = nn.LayerNorm(dim) # Pre-projection layer norm.
         self.tokens_layer_norm = nn.LayerNorm(dim) # Pre-projection layer norm.
         self.focal_proj = nn.Linear(num_registers * dim, 4, bias=False) # fx, fy, cx, cy
         self.depths_proj = nn.Linear(dim, 256, bias=False)
@@ -132,6 +132,11 @@ class DepthFocalHead(nn.Module):
         tokens = self.tokens_layer_norm(x[:, :, self.num_registers:, :]) # (B, L, HW // 256, dim)
         # (B, L, num_registers * dim) -> (B, L, 4) -> 4 x (B, L)
         fx, fy, cx, cy = self.focal_proj(registers.flatten(start_dim=2)).unbind(-1)
+        # fx and fy will be passed into softplus to ensure they're always positive.
+        fx, fy = F.softplus(fx), F.softplus(fy)
+        # cx and cy will actually be the residuals to the image center point.
+        cx, cy = cx + W / 2, cy + H / 2
+
         # We must take into account that each token represents the 16x16 patch at that location.
         # Naively rearranging leads to each 16x16 patch being mapped to a contiguous line of 256 pixels.
         depths = rearrange(
@@ -215,6 +220,8 @@ class PP3DR_depth_focal(nn.Module):
             num_registers: int = 5,
             start_checkpointing = 7,
             freeze_feature_extractor = True,
+            PP3DR_drop_rates = None,
+            ViTTT_drop_rates = None
     ):
         super().__init__()
         assert decoder_blocks % 2 == 0, f"Number of decoder blocks ({decoder_blocks}) must be even for alternating global and frame-wise attention"
@@ -223,7 +230,10 @@ class PP3DR_depth_focal(nn.Module):
 
         # General decoder
         self.dim = dim
-        drop_rates = [x.item() for x in torch.linspace(0, 0.1, decoder_blocks)]
+        drop_rates = [
+            x.item() for x in
+            (torch.linspace(0, 0.1, decoder_blocks) if PP3DR_drop_rates is None else PP3DR_drop_rates)
+        ]
         self.global_blocks = nn.ModuleList([
             GlobalBlock(dim, num_heads, ffn_ratio, drop_rates[2 * i])
             for i in range(self.blocks_each)
@@ -237,10 +247,11 @@ class PP3DR_depth_focal(nn.Module):
         self.rope2d = Rope2D(embed_dim = dim, num_heads = num_heads, device = "cuda")
         self.rope3d = Rope3D(embed_dim = dim, num_heads = num_heads, device = "cuda")
 
-        self.ViTTT = ViTTT(dim, num_heads, encoder_blocks, ffn_ratio)  # Import ViTTT!
+        self.ViTTT = ViTTT(dim, num_heads, encoder_blocks, ffn_ratio, drop_rates=ViTTT_drop_rates)  # Import ViTTT!
         self.ViTTT.load_state_dict(torch.load("/vulcanscratch/hughma/ViT/best_checkpoint.pth",
                                               weights_only=True,
                                               map_location="cpu"))
+        self.freeze_feature_extractor = freeze_feature_extractor
         if self.freeze_feature_extractor:
             for parameter in self.ViTTT.parameters():
                 parameter.requires_grad = False

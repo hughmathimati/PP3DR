@@ -30,7 +30,7 @@ class DatasetBase(torch.utils.data.Dataset):
             }
         """
         super().__init__()
-        self.sequence_length = 128
+        self.sequence_length = 10
         self.sequence_names = os.listdir(dir)
         self.sequences = [dict(images=[], depths=[]) for _ in range(len(self.sequence_names))]
         # Start with a lower dimension for initial training and sanity-checking. You can fine-tune at a higher

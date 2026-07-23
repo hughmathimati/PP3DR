@@ -1,7 +1,7 @@
 import numpy as np
 import viser
 import time
-from models.PP3DR_Dino import PP3DR_Dino
+from models.PP3DR import PP3DR
 import torch
 from datasets.nrgbd_dataset import nrgbd_dataset
 
@@ -21,7 +21,7 @@ def visualize_reconstruction(pred: dict, gt: dict):
             - "depths": (B, L, H, W)
     """
     # Start the viser server
-    server = viser.ViserServer()
+    server = viser.ViserServer(port=8080)
 
     # Extract dimensions
     B, L, H, W, _ = pred["XY_rays"].shape
@@ -175,8 +175,8 @@ def visualize_reconstruction(pred: dict, gt: dict):
 # Example Execution Context Block
 # -------------------------------------------------------------------------
 if __name__ == "__main__":
-    model = PP3DR_Dino()
-    loaded_state_dict = torch.load("/vulcanscratch/hughma/PP3DR/sanity/PP3DR.pth", weights_only=True)
+    model = PP3DR()
+    loaded_state_dict = torch.load("/vulcanscratch/hughma/PP3DR/finetune/PP3DR.pth", weights_only=True)
     # The lines here are necessary if all the loaded state dict entries begin with an extra "module."
     new_state_dict = {}
     for key in loaded_state_dict:
@@ -188,7 +188,7 @@ if __name__ == "__main__":
     for key in data:
         data[key] = data[key].unsqueeze(0)
     with torch.amp.autocast("cuda", dtype = torch.bfloat16), torch.no_grad():
-        pred = model(data['images'].to("cuda"))
+        pred = model(data['images'].cuda(), data['rope_x'].cuda(), data['rope_y'].cuda())
     for key in pred:
         pred[key] = pred[key].to(torch.float32).cpu().numpy(force=True)
         print(f"{key}: {pred[key].shape}")

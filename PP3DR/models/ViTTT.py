@@ -55,14 +55,18 @@ class ViTTT(nn.Module):
             blocks = 12, # DINOv3 H+ has 32 layers.
             ffn_ratio = 4,
             num_registers = 5,
-            start_checkpointing = 6
+            start_checkpointing = 6,
+            drop_rates = None
     ):
         super().__init__()
         self.dim = dim
         self.rope = RopePositionEmbedding(dim, num_heads=num_heads)
         self.patch_conv = nn.Conv2d(3, dim, kernel_size=(16, 16), stride=(16, 16))
 
-        drop_rates = [x.item() for x in torch.linspace(0, 0.1, blocks)]
+        drop_rates = [
+            x.item() for x in
+            (torch.linspace(0, 0.1, blocks) if drop_rates is None else drop_rates)
+        ]
         self.blocks = nn.ModuleList([
             Block(dim, num_heads, ffn_ratio, drop_rates[i]) for i in range(blocks)
         ])

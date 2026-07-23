@@ -1,8 +1,8 @@
-name = "finetune-longer"
+name = "finetune-depth-focal"
 import transformers.optimization
 from models.PP3DR import PP3DR
-from models.PP3DR_Dino import PP3DR_Dino
-from PP3DR_loss import PP3DR_loss
+from models.PP3DR_depth_focal import PP3DR_depth_focal
+from PP3DR_depth_focal_loss import PP3DR_loss
 from adapted_pi3_loss import Adapted_Pi3_loss
 from models.Dinov3 import load_dinov3, obtain_features
 
@@ -37,7 +37,7 @@ accelerator = Accelerator(
     # kwargs_handlers=[ProfileKwargs(activities=["cpu", "cuda"])],
     dataloader_config=DataLoaderConfiguration(non_blocking=True),
     log_with="wandb", project_dir="/vulcanscratch/hughma/PP3DR/tensorboard",
-    gradient_accumulation_steps=16
+    gradient_accumulation_steps=32 # Increase this if you're overfitting.
 )
 if accelerator.is_local_main_process:
     accelerator.init_trackers(project_name="PP3DR")
@@ -97,30 +97,28 @@ def prepare_dataloaders():
 
     return train_dataloader, val_dataloader
 
-# "/vulcanscratch/hughma/PP3DR/no-scale/PP3DR.pth"
-def initialize(epochs, pretrained_path="/vulcanscratch/hughma/PP3DR/no-scale/PP3DR.pth"):
-    PP3DR_model = PP3DR(freeze_feature_extractor=False)
-    # PP3DR_model = PP3DR_Dino()
+def initialize(epochs, pretrained_path="/vulcanscratch/hughma/PP3DR/depth-focal/PP3DR.pth"):
+    drop_rates = torch.linspace(0, 0.1, 48) # Decoder heads don't get dropped.
+    PP3DR_model = PP3DR_depth_focal(
+        freeze_feature_extractor=False,
+        PP3DR_drop_rates = drop_rates[12:],
+        ViTTT_drop_rates=drop_rates[:12]
+    )
+    # ViTTT has 6 uncheckpointed blocks, which form the start of our model. If we also don't checkpoint 6 of PP3DR's
+    # blocks, we'll instantly OOM.
+    PP3DR_model.start_checkpointing = 0
+
     if pretrained_path is not None:
-        PP3DR_model.load_state_dict(torch.load(pretrained_path, weights_only=True, map_location="cpu"))
+        loaded_state_dict = torch.load(pretrained_path, weights_only=True, map_location="cpu")
+        new_state_dict = {}
+        for key in loaded_state_dict:
+            new_state_dict[key[7:]] = loaded_state_dict[key]
+        PP3DR_model.load_state_dict(new_state_dict)
         print("Loaded pretrained weights from", pretrained_path)
-
-    def init_vit_weights(module):
-        if isinstance(module, nn.Linear):
-            # Truncated normal tightly bounds the initial weights
-            nn.init.trunc_normal_(module.weight, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.ones_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-
-    PP3DR_model.apply(init_vit_weights)
 
     AdamW_params, Muon_params = get_pp3dr_param_groups(
         model=PP3DR_model,
-        num_layers=40  # 36 blocks + 4 blocks in each per-task head
+        num_layers=52  # 12 ViTTT blocks + 36 encoder blocks + 4 decoder blocks in each per-task head
     )
 
     AdamW = torch.optim.AdamW(AdamW_params, betas=(0.9, 0.99), foreach=True)
@@ -130,7 +128,7 @@ def initialize(epochs, pretrained_path="/vulcanscratch/hughma/PP3DR/no-scale/PP3
     return state, PP3DR_model, AdamW, Muon
 
 
-def get_pp3dr_param_groups(model: nn.Module, adamw_lr: float = 1e-5, muon_lr: float = 5e-3,
+def get_pp3dr_param_groups(model: nn.Module, adamw_lr: float = 1e-6, muon_lr: float = 5e-4,
                            weight_decay: float = 0.04, layer_decay: float = 0.95,
                            num_layers: int = 36):
     """
@@ -165,7 +163,7 @@ def get_pp3dr_param_groups(model: nn.Module, adamw_lr: float = 1e-5, muon_lr: fl
         Thus, the "true" index of a global block is 2 * i, and the "true" index of a local block is 2 * i + 1.
         """
         # Calculate the depth multiplier (0.0 to 1.0 scale)
-        offset = 0
+        offset = 12
         if "pose_decoder." in name or "point_decoder." in name:
             offset += 36
         if "global_blocks." in name:
@@ -178,6 +176,12 @@ def get_pp3dr_param_groups(model: nn.Module, adamw_lr: float = 1e-5, muon_lr: fl
             try:
                 layer_id = int(name.split("blocks.")[1].split(".")[0])
                 lr_mult = layer_decay ** (num_layers - (2 * layer_id + 1 + offset))
+            except ValueError:
+                lr_mult = 1.0
+        elif "blocks." in name: # ViTTT -> offset = 0
+            try:
+                layer_id = int(name.split("blocks.")[1].split(".")[0])
+                lr_mult = layer_decay ** (num_layers - layer_id)
             except ValueError:
                 lr_mult = 1.0
         elif any(k in name for k in ["patch_embed", "pos_embed", "token"]):
@@ -273,8 +277,8 @@ if __name__ == "__main__":
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"/tmp/torchinductor_cache_rank_{os.environ.get("LOCAL_RANK", "0")}"
     torch.set_float32_matmul_precision('high')
 
-    epochs = 50
-    checkpoint_every = 25
+    epochs = 10 # It's like an hour an epoch bro.
+    checkpoint_every = 3
     checkpoint = None
 
     # ProcessPoolExecutor -> Cannot re-initialize CUDA in forked subprocess.
@@ -358,7 +362,6 @@ if __name__ == "__main__":
     #     prof.export_chrome_trace(f"trace.json")
     #     print("Saved trace")
     # accelerator.end_training()
-    exit(0)
 
     # End of training loop; write losses to file
     if accelerator.is_local_main_process:

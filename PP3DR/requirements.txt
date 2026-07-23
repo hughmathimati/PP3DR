@@ -8,6 +8,7 @@ pypng
 #hydra-core
 #hydra-colorlog
 #open3d
+matplotlib
 plyfile
 huggingface_hub
 safetensors
@@ -16,5 +17,6 @@ xformers
 wandb
 timm
 accelerate
+# Below modules are for when module load gcc doesn't actually laod gcc-16.
 c-compiler
 cxx-compiler
