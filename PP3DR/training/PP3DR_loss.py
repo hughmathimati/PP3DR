@@ -6,7 +6,51 @@ from torch.linalg import vector_norm
 import torch.cuda.amp as amp
 from einops import rearrange
 from typing import Callable
+import math
 
+
+def _smooth(err: torch.Tensor, beta: float = 0.0) -> torch.Tensor:
+    if beta == 0:
+        return err
+    else:
+        return torch.where(err < beta, 0.5 * err.square() / beta, err - 0.5 * beta)
+
+
+def angle_diff_vec3(v1: torch.Tensor, v2: torch.Tensor, eps: float = 1e-8):
+    """Safely computes the angular difference, immune to the norm(0) singularity."""
+    v1, v2 = v1.to(torch.float32), v2.to(torch.float32)
+    # Normalize both vectors first!
+    # Otherwise, the tiny unnormalized cross-product magnitudes get completely overpowered by `eps`.
+    v1 = F.normalize(v1, dim=-1, eps=1e-6)
+    v2 = F.normalize(v2, dim=-1, eps=1e-6)
+    cross = torch.linalg.cross(v1, v2, dim=-1)
+    cross_norm = torch.sqrt(torch.sum(cross.square(), dim=-1) + eps)
+    dot = (v1 * v2).sum(dim=-1)
+    return torch.atan2(cross_norm, dot).to(v1.dtype)
+
+
+def depth_edge(depth: torch.Tensor, rtol: float = 0.03) -> torch.Tensor:
+    """
+    Rewritten to avoid in-place bitwise mutations (|=) on zeros_like tensors.
+    Dynamo/Triton loses track of the torch.bool dtype during in-place mutations
+    and attempts to execute bitwise operations on float32s, causing a crash.
+    F.pad is safer, compiles perfectly, and executes faster on the GPU.
+    """
+    dy = torch.abs(depth[..., 1:, :] - depth[..., :-1, :]) / depth[..., :-1, :].clamp_min(1e-6)
+    dx = torch.abs(depth[..., :, 1:] - depth[..., :, :-1]) / depth[..., :, :-1].clamp_min(1e-6)
+
+    dy_mask = dy > rtol
+    dx_mask = dx > rtol
+
+    # Pad the masks to align back to the original depth shape.
+    # F.pad format: (pad_left, pad_right, pad_top, pad_bottom)
+    dy_up = F.pad(dy_mask, (0, 0, 0, 1))
+    dy_down = F.pad(dy_mask, (0, 0, 1, 0))
+    dx_left = F.pad(dx_mask, (0, 1, 0, 0))
+    dx_right = F.pad(dx_mask, (1, 0, 0, 0))
+
+    # Pure boolean combination entirely bypasses in-place mutation bugs
+    return dy_up | dy_down | dx_left | dx_right
 
 @torch.compile()
 class PP3DR_loss(nn.Module):
@@ -18,9 +62,19 @@ class PP3DR_loss(nn.Module):
     We're going to solve for a universal scale factor before we do all this. The scale factor will be averaged across
     all depths for each frame in a given sequence. Thus, our scale will have shape (B,).
     """
-    def __init__(self, scale = True):
+    def __init__(self,
+        scale = False,
+        # point_loss = True,
+        # normal_loss = True,
+        # translation_loss = True,
+        # rotation_loss = True,
+    ):
         super().__init__()
         self.scale = scale
+        # self.point_loss = point_loss
+        # self.normal_loss = normal_loss
+        # self.translation_loss = translation_loss
+        # self.rotation_loss = rotation_loss
         pass
 
     def calculate_scale(self, pred_pts, gt_pts, weights):
@@ -141,6 +195,54 @@ class PP3DR_loss(nn.Module):
 
         return torch.stack((X, Y, Z), dim=-1) # (B, N, H, W, 3)
 
+    def normal_loss(self, points, gt_points, mask, gt_depths):
+        not_edge = ~depth_edge(gt_depths, rtol=0.03)
+        mask = mask & not_edge
+
+        leftup, rightup, leftdown, rightdown = points[..., :-1, :-1, :], points[..., :-1, 1:, :], points[
+            ..., 1:, :-1, :], points[..., 1:, 1:, :]
+        upxleft = rightup - rightdown
+        leftxdown = leftup - rightup
+        downxright = leftdown - leftup
+        rightxup = rightdown - leftdown
+
+        mask_leftup, mask_rightup, mask_leftdown, mask_rightdown = mask[..., :-1, :-1], mask[..., :-1, 1:], mask[
+            ..., 1:, :-1], mask[..., 1:, 1:]
+        mask_upxleft = mask_rightup & mask_leftdown & mask_rightdown
+        mask_leftxdown = mask_leftup & mask_rightdown & mask_rightup
+        mask_downxright = mask_leftdown & mask_rightup & mask_leftup
+        mask_rightxup = mask_rightdown & mask_leftup & mask_leftdown
+
+        MIN_ANGLE, MAX_ANGLE, BETA_RAD = math.radians(1), math.radians(90), math.radians(3)
+
+        gt_leftup, gt_rightup, gt_leftdown, gt_rightdown = gt_points[..., :-1, :-1, :], gt_points[..., :-1, 1:, :], \
+        gt_points[..., 1:, :-1, :], gt_points[..., 1:, 1:, :]
+
+        # Explicitly cast the final boolean masks to float32 before multiplication to prevent Dynamo type inference bugs
+        loss = mask_upxleft.to(torch.float32) * _smooth(
+            angle_diff_vec3(torch.cross(upxleft, leftdown - rightdown, dim=-1),
+                            torch.cross(gt_rightup - gt_rightdown, gt_leftdown - gt_rightdown, dim=-1)).clamp(MIN_ANGLE,
+                                                                                                              MAX_ANGLE),
+            beta=BETA_RAD) \
+               + mask_leftxdown.to(torch.float32) * _smooth(
+            angle_diff_vec3(torch.cross(leftxdown, rightdown - rightup, dim=-1),
+                            torch.cross(gt_leftup - gt_rightup, gt_rightdown - gt_rightup, dim=-1)).clamp(MIN_ANGLE,
+                                                                                                          MAX_ANGLE),
+            beta=BETA_RAD) \
+               + mask_downxright.to(torch.float32) * _smooth(
+            angle_diff_vec3(torch.cross(downxright, rightup - leftup, dim=-1),
+                            torch.cross(gt_leftdown - gt_leftup, gt_rightup - gt_leftup, dim=-1)).clamp(MIN_ANGLE,
+                                                                                                        MAX_ANGLE),
+            beta=BETA_RAD) \
+               + mask_rightxup.to(torch.float32) * _smooth(
+            angle_diff_vec3(torch.cross(rightxup, leftup - leftdown, dim=-1),
+                            torch.cross(gt_rightdown - gt_leftdown, gt_leftup - gt_leftdown, dim=-1)).clamp(MIN_ANGLE,
+                                                                                                            MAX_ANGLE),
+            beta=BETA_RAD)
+
+        # Added + 1e-6 to prevent division by zero if an entire patch/batch is masked out!
+        return loss.sum() / (mask.sum() * 4 + 1e-6)
+
     def forward(self, pred, gt):
         """
         Parameters
@@ -190,6 +292,7 @@ class PP3DR_loss(nn.Module):
             median_depths.isnan().sum() == 0,
             f"{median_depths.isnan().sum()} batch's gt depths are completely invalid."
         )
+
         gt['depths'] = gt['depths'] / median_depths.view(B, 1, 1, 1)
         # Sanitize GT depths before they touch the predictions by setting all invalid values to the median depth, 1.
         gt['depths'] = gt['depths'].masked_fill(gt_invalid_depth_mask, 1)
@@ -216,6 +319,15 @@ class PP3DR_loss(nn.Module):
         torch._assert(
             point_loss.isfinite(),
             f"Point loss invalid ({point_loss})\ttotal_point_loss = {total_point_loss}"
+        )
+        """
+        Normal direction loss
+        """
+        normal_loss = self.normal_loss(
+            points=pred_points,
+            gt_points=gt_points,
+            mask=gt_valid_depth_mask,
+            gt_depths=gt['depths']
         )
 
         gt_relative_rotations, gt_relative_translations = self.obtain_gt_relative_poses(gt['extrinsics'])
@@ -263,10 +375,12 @@ class PP3DR_loss(nn.Module):
         rotation_loss = raw_rotation_loss.masked_fill(gt_rotation_invalid_mask, 0).sum() / gt_rotation_valid_mask.sum()
         torch._assert(rotation_loss.isfinite(), f"Rotation loss invalid ({rotation_loss})")
 
-        total_loss = 20 * point_loss + 10 * translation_loss + rotation_loss
+        # total_loss = 10 * point_loss + 0.1 * normal_loss + 10 * translation_loss + rotation_loss
+        total_loss = 10 * point_loss + 0.1 * normal_loss
         return total_loss, dict(
             total_loss=total_loss,
             point_loss=point_loss,
+            normal_loss=normal_loss,
             translation_loss=translation_loss,
             rotation_loss=rotation_loss
         )

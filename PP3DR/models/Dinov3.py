@@ -26,7 +26,7 @@ def obtain_features(processor, model, image, remove_registers = True):
 
 def low_rank(features, dim = 3):
     """@Returns: (batch size, # patches, dim)"""
-    U, S, V = torch.pca_lowrank(features, dim)
+    U, S, V = torch.pca_lowrank(features.to(torch.float32), dim)
     return features @ V
 
 
@@ -34,7 +34,6 @@ def write_to_image(image, h, w, name = "image.png"):
     f_min = image.min()
     f_max = image.max()
     features = (image - f_min) / (f_max - f_min) * 255
-    print(features)
     cv2.imwrite(name, features.reshape(h, w, 3).detach().cpu().numpy().astype(np.uint8))
 
 
