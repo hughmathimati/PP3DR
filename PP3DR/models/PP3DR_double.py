@@ -21,7 +21,6 @@ from xformers.ops import SwiGLU
 from timm.layers import DropPath
 
 
-@torch.compile()
 class LayerScale(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -30,9 +29,8 @@ class LayerScale(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.scale * x
 
-@torch.compile()
 class GlobalBlock(nn.Module):
-    def __init__(self, dim, num_heads, ffn_ratio, drop_path = 0):
+    def __init__(self, dim, num_heads, ffn_ratio, drop_path=0, first_block=False):
         super().__init__()
         self.layer_norm_1 = nn.LayerNorm(dim)
         self.TTT = GlobalLaCT(dim, num_heads)
@@ -41,6 +39,8 @@ class GlobalBlock(nn.Module):
         self.ffn = SwiGLU(in_features = dim, hidden_features = dim * ffn_ratio)
         self.layer_scale_2 = LayerScale(dim)
         self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+        self.input_proj = nn.Identity() if first_block else nn.Linear(2 * dim, dim)
+        self.first_block = first_block
 
     def forward(self, x: torch.Tensor, rope3d, L) -> torch.Tensor:
         """
@@ -54,6 +54,7 @@ class GlobalBlock(nn.Module):
         -------
         [B (L X) dim]
         """
+        x = self.input_proj(x)
         # First addition needs a rearrange, since x gets rearranged in the TTT.
         x = rearrange(x, "(B L) X dim -> B (L X) dim", L = L) + self.drop_path(
             self.layer_scale_1(self.TTT(self.layer_norm_1(x), rope3d, L))
@@ -61,9 +62,8 @@ class GlobalBlock(nn.Module):
         x = x + self.drop_path(self.layer_scale_2(self.ffn(self.layer_norm_2(x))))
         return x
 
-# @torch.compile()
 class LocalBlock(nn.Module):
-    def __init__(self, dim, num_heads, ffn_ratio, drop_path = 0):
+    def __init__(self, dim, num_heads, ffn_ratio, drop_path=0, first_block=False):
         super().__init__()
         self.layer_norm_1 = nn.LayerNorm(dim)
         self.TTT = LocalLaCT(dim, num_heads)
@@ -72,8 +72,17 @@ class LocalBlock(nn.Module):
         self.ffn = SwiGLU(in_features = dim, hidden_features = dim * ffn_ratio)
         self.layer_scale_2 = LayerScale(dim)
         self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+        self.input_proj = nn.Identity() if first_block else nn.Linear(2 * dim, dim)
+        self.first_block = first_block
 
     def forward(self, x: torch.Tensor, rope, L) -> torch.Tensor:
+        """
+        Because of the way we decided to perform out concatenation, x actually has shape (B * L, X, 2 * dim).
+        So I don't have to rewrite my LaCT blocks, I'm just going to reshape it back.
+        """
+        x = self.input_proj(x)
+        if not self.first_block:
+            x = rearrange(x, "(B L) X dim -> B (L X) dim", L = L)
         # First addition needs a rearrange, since x gets rearranged in the TTT.
         x = rearrange(x, "B (L X) dim -> (B L) X dim", L = L) + self.drop_path(
             self.layer_scale_1(self.TTT(self.layer_norm_1(x), rope, L))
@@ -81,7 +90,6 @@ class LocalBlock(nn.Module):
         x = x + self.drop_path(self.layer_scale_2(self.ffn(self.layer_norm_2(x))))
         return x
 
-@torch.compile()
 class PointHead(nn.Module):
     def __init__(
             self,
@@ -147,7 +155,6 @@ class PointHead(nn.Module):
         # x.shape == (B, L, HW, 3)
         return x
 
-@torch.compile()
 class PoseHead(nn.Module):
     """
     Predict the relative camera pose per frame via the register (special) tokens.
@@ -211,14 +218,19 @@ class PoseHead(nn.Module):
         return x
 
 
-@torch.compile()
-class PP3DR(nn.Module):
+# @torch.compile()
+class PP3DR_double(nn.Module):
+    """
+    The first global block and local block will be run in sequence. This is because I don't want to just duplicate the
+    last dimension of the ViTTT output.
+    Local and global blocks are run in parallel and share results across each layer.
+    """
     def __init__(
             self,
             dim: int = 1280,
             num_heads: int = 20,
             encoder_blocks: int = 12, # Pi3 is 36 ViT blocks
-            decoder_blocks: int = 36, # Pi3 is 36 decoder blocks.
+            decoder_blocks: int = 18, # Blocks EACH. decoder_blocks=18 means 18 local and 18 global.
             ffn_ratio: int = 4,
             num_registers: int = 5,
             start_checkpointing = 6, # How many blocks EACH to checkpoint (total # is twice as many).
@@ -227,23 +239,22 @@ class PP3DR(nn.Module):
             ViTTT_drop_rates = None
     ):
         super().__init__()
-        assert decoder_blocks % 2 == 0, f"Number of decoder blocks ({decoder_blocks}) must be even for alternating global and frame-wise attention"
-        self.blocks_each = decoder_blocks // 2
         self.start_checkpointing = start_checkpointing
-
-        # General decoder
         self.dim = dim
+        self.decoder_blocks = decoder_blocks
+        # Since our local and global blocks are being run in parallel, we're actually going to use the same drop rates
+        # for blocks at the same level.
         drop_rates = [
             x.item() for x in
             (torch.linspace(0, 0.1, decoder_blocks) if PP3DR_drop_rates is None else PP3DR_drop_rates)
         ]
         self.global_blocks = nn.ModuleList([
-            GlobalBlock(dim, num_heads, ffn_ratio, drop_rates[2 * i])
-            for i in range(self.blocks_each)
+            GlobalBlock(dim, num_heads, ffn_ratio, drop_rates[i], i == 0)
+            for i in range(self.decoder_blocks)
         ])
         self.local_blocks = nn.ModuleList([
-            LocalBlock(dim, num_heads, ffn_ratio, drop_rates[2 * i + 1])
-            for i in range(self.blocks_each)
+            LocalBlock(dim, num_heads, ffn_ratio, drop_rates[i], i == 0)
+            for i in range(self.decoder_blocks)
         ])
 
         # We don't store num_registers here. It gets stored in the decoder heads.
@@ -313,38 +324,33 @@ class PP3DR(nn.Module):
         # x.shape == (B * L, num_registers + HW // 256, dim)
 
         """
-        We will now perform alternating-attention, starting with global attention and ending with frame-wise attention.
-        
         The RoPE coordinates have been pre-calculated and are provided by the dataloader. This is because they're
         dependent on the dimensions of the raw images.
         
         rope2d has shape (B * L, HW, head_dim), and rope3d has shape (B, L, HW, head_dim).
         """
         rope2d, rope3d = self.rope2d(rope_x, rope_y), self.rope3d(rope_x, rope_y)
-        for i in range(self.blocks_each - 1):
+        # First global/local blocks will be run in sequence.
+        if self.training and self.start_checkpointing == 0:
+            # Global attention: absorb frame-length into patch-length dimension.
+            a = checkpoint(self.global_blocks[0], x, rope3d, L, use_reentrant=False)
+            # Local attention: absorb frame-length into batch dimension. Sequence length is now patch-length.
+            b = checkpoint(self.local_blocks[0], a, rope2d, L, use_reentrant=False)
+        else:
+            a = self.global_blocks[0](x, rope3d, L)
+            b = self.local_blocks[0](a, rope2d, L)
+        x = torch.cat([a.view(B * L, -1, self.dim), b], dim=-1)
+        # x.shape == (B * L, num_registers + HW // 256, 2 * dim)
+        for i in range(1, self.decoder_blocks):
             if self.training and i >= self.start_checkpointing:
                 # Global attention: absorb frame-length into patch-length dimension.
-                x = checkpoint(self.global_blocks[i], x, rope3d, L, use_reentrant = False)
+                a = checkpoint(self.global_blocks[i], x, rope3d, L, use_reentrant=False)
                 # Local attention: absorb frame-length into batch dimension. Sequence length is now patch-length.
-                x = checkpoint(self.local_blocks[i], x, rope2d, L, use_reentrant = False)
+                b = checkpoint(self.local_blocks[i], x, rope2d, L, use_reentrant=False)
             else:
-                x = self.global_blocks[i](x, rope3d, L)
-                x = self.local_blocks[i](x, rope2d, L)
-        # Save one block from each of the last two layers
-        last_index = self.blocks_each - 1
-        if self.training and self.start_checkpointing == self.blocks_each:
-            x = checkpoint(self.global_blocks[last_index], x, rope3d, L, use_reentrant = False)
-            x = torch.cat([
-                x.view(B * L, -1, self.dim),
-                checkpoint(self.local_blocks[last_index], x, rope2d, L, use_reentrant=False)
-            ], dim=-1)
-        else:
-            x = self.global_blocks[last_index](x, rope3d, L)
-            x = torch.cat([
-                x.view(B * L, -1, self.dim),
-                self.local_blocks[last_index](x, rope2d, L)
-            ], dim=-1)
-        # x.shape == (B * L, num_registers + HW // 256, 2 * dim)
+                a = self.global_blocks[i](x, rope3d, L)
+                b = self.local_blocks[i](x, rope2d, L)
+            x = torch.cat([a.view(B * L, -1, self.dim), b], dim=-1)
 
         # Step 2: Per-task decoders
         points = self.point_decoder(x, rope2d, rope3d, L, H, W)

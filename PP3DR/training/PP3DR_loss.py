@@ -375,8 +375,8 @@ class PP3DR_loss(nn.Module):
         rotation_loss = raw_rotation_loss.masked_fill(gt_rotation_invalid_mask, 0).sum() / gt_rotation_valid_mask.sum()
         torch._assert(rotation_loss.isfinite(), f"Rotation loss invalid ({rotation_loss})")
 
-        # total_loss = 10 * point_loss + 0.1 * normal_loss + 10 * translation_loss + rotation_loss
-        total_loss = 10 * point_loss + 0.1 * normal_loss
+        total_loss = 10 * point_loss + 0.1 * normal_loss + 10 * translation_loss + rotation_loss
+        # total_loss = 10 * point_loss + 0.1 * normal_loss
         return total_loss, dict(
             total_loss=total_loss,
             point_loss=point_loss,
@@ -384,3 +384,23 @@ class PP3DR_loss(nn.Module):
             translation_loss=translation_loss,
             rotation_loss=rotation_loss
         )
+
+"""
+L1 or Huber loss for rotation loss:
+# Calculate the trace (Inner product of the two matrices)
+trace = (pred['relative_camera_rotations'] * gt_relative_rotations).sum(dim=(-2, -1)) # (B, L - 1)
+
+# 1. Convert to float32 to protect the clamp from bfloat16 rounding
+cosine = ((trace - 1.0) / 2.0).to(torch.float32)
+
+# 2. Safely clamp strictly inside the valid domain to prevent the acos(-Inf) gradient explosion
+cosine = torch.clamp(cosine, min=-1.0 + 1e-6, max=1.0 - 1e-6)
+
+# 3. Calculate the exact angular error in radians, then cast back to network precision
+rot_ang_err = torch.acos(cosine).to(trace.dtype)
+
+# 4. Mask and average (Added the 1e-6 safety net to the denominator!)
+rotation_loss = rot_ang_err.masked_fill(gt_rotation_invalid_mask, 0.0).sum() / (gt_rotation_valid_mask.sum() + 1e-6)
+
+torch._assert(rotation_loss.isfinite(), f"Rotation loss invalid ({rotation_loss})")
+"""

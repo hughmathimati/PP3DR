@@ -1,7 +1,7 @@
 name = "sanity"
 import transformers.optimization
 from models.PP3DR import PP3DR
-from models.PP3DR_Dino import PP3DR_Dino
+from models.PP3DR_double import PP3DR_double
 from PP3DR_loss import PP3DR_loss
 from adapted_pi3_loss import Adapted_Pi3_loss
 from models.Dinov3 import load_dinov3, obtain_features
@@ -77,7 +77,7 @@ def prepare_dataloaders():
     train_dataloader = DataLoader(
         ConcatDataset(constructed),
         # Batch size of 6 sequences, each with 10 images (60 images total)
-        batch_size=6,
+        batch_size=5,
         shuffle=False,
         num_workers=8,
         pin_memory=True,
@@ -88,8 +88,8 @@ def prepare_dataloaders():
 
 # "/vulcanscratch/hughma/PP3DR/no-scale/PP3DR.pth"
 def initialize(epochs, pretrained_path=None):
-    PP3DR_model = PP3DR()
-    # PP3DR_model = PP3DR_Dino()
+    # PP3DR_model = PP3DR(start_checkpointing=0)
+    PP3DR_model = PP3DR_double(start_checkpointing=0)
     if pretrained_path is not None:
         PP3DR_model.load_state_dict(torch.load(pretrained_path, weights_only=True, map_location="cpu"))
         print("Loaded pretrained weights from", pretrained_path)
