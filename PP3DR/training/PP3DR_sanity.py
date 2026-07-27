@@ -1,10 +1,8 @@
-name = "sanity"
+name = "depth-focal-sanity"
 import transformers.optimization
-from models.PP3DR import PP3DR
+from models.PP3DR_depth_focal import PP3DR
 from models.PP3DR_double import PP3DR_double
-from PP3DR_loss import PP3DR_loss
-from adapted_pi3_loss import Adapted_Pi3_loss
-from models.Dinov3 import load_dinov3, obtain_features
+from PP3DR_depth_focal_loss import PP3DR_loss
 
 from datasets.nrgbd_dataset import nrgbd_dataset
 from datasets.dtu_dataset import dtu_dataset
@@ -76,8 +74,8 @@ def prepare_dataloaders():
 
     train_dataloader = DataLoader(
         ConcatDataset(constructed),
-        # Batch size of 6 sequences, each with 10 images (60 images total)
-        batch_size=5,
+        # Batch size of 5 for H200s, 2 for A6000s
+        batch_size=2,
         shuffle=False,
         num_workers=8,
         pin_memory=True,
@@ -86,10 +84,11 @@ def prepare_dataloaders():
 
     return train_dataloader
 
-# "/vulcanscratch/hughma/PP3DR/no-scale/PP3DR.pth"
 def initialize(epochs, pretrained_path=None):
-    # PP3DR_model = PP3DR(start_checkpointing=0)
-    PP3DR_model = PP3DR_double(start_checkpointing=0)
+    if name == "depth-focal-sanity":
+        PP3DR_model = PP3DR(start_checkpointing=2)
+    elif name == "depth-focal-double-sanity":
+        PP3DR_model = PP3DR_double(start_checkpointing=2)
     if pretrained_path is not None:
         PP3DR_model.load_state_dict(torch.load(pretrained_path, weights_only=True, map_location="cpu"))
         print("Loaded pretrained weights from", pretrained_path)
@@ -118,7 +117,7 @@ def initialize(epochs, pretrained_path=None):
     accelerator.register_for_checkpointing(state)
     return state, PP3DR_model, AdamW, Muon
 
-
+# TODO: double needs special param groups.
 def get_pp3dr_param_groups(model: nn.Module, adamw_lr: float = 1e-5, muon_lr: float = 5e-3,
                            weight_decay: float = 0.04, layer_decay: float = 0.95,
                            num_layers: int = 36):

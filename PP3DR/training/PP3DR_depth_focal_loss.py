@@ -128,6 +128,15 @@ class PP3DR_loss(PP3DR_loss):
             point_loss.isfinite(),
             f"Point loss invalid ({point_loss})\ttotal_point_loss = {total_point_loss}"
         )
+        """
+        Normal direction loss
+        """
+        normal_loss = self.normal_loss(
+            points=pred_points,
+            gt_points=gt_points,
+            mask=gt_valid_depth_mask,
+            gt_depths=gt['depths']
+        )
 
         gt_relative_rotations, gt_relative_translations = self.obtain_gt_relative_poses(gt['extrinsics'])
         """
@@ -174,10 +183,12 @@ class PP3DR_loss(PP3DR_loss):
         rotation_loss = raw_rotation_loss.masked_fill(gt_rotation_invalid_mask, 0).sum() / gt_rotation_valid_mask.sum()
         torch._assert(rotation_loss.isfinite(), f"Rotation loss invalid ({rotation_loss})")
 
-        total_loss = 20 * point_loss + 10 * translation_loss + rotation_loss
+        total_loss = 10 * point_loss + 0.1 * normal_loss + 10 * translation_loss + rotation_loss
+        # total_loss = 10 * point_loss + 0.1 * normal_loss
         return total_loss, dict(
             total_loss=total_loss,
             point_loss=point_loss,
+            normal_loss=normal_loss,
             translation_loss=translation_loss,
             rotation_loss=rotation_loss
         )
