@@ -75,7 +75,6 @@ class PP3DR_loss(nn.Module):
         # self.normal_loss = normal_loss
         # self.translation_loss = translation_loss
         # self.rotation_loss = rotation_loss
-        pass
 
     def calculate_scale(self, pred_pts, gt_pts, weights):
         """
@@ -195,7 +194,56 @@ class PP3DR_loss(nn.Module):
 
         return torch.stack((X, Y, Z), dim=-1) # (B, N, H, W, 3)
 
+    def initialize(self, pred, gt):
+        gt['depths'], gt['extrinsics'], gt['intrinsics'] = gt['depths'].cuda(), gt['extrinsics'].cuda(), gt['intrinsics'].cuda()
+        B = pred['log_depths'].shape[0]
+
+        gt_valid_depth_mask = torch.isfinite(gt['depths']) & (gt['depths'] != 0)
+        gt_invalid_depth_mask = ~gt_valid_depth_mask
+
+        # First, normalise the MEDIAN ground-truth depth to 1.
+        # Calculate the median over only valid elements by filling all invalid with NaN and using torch.nanmedian().
+        median_depths = torch.nanmedian(
+            gt['depths'].masked_fill(gt_invalid_depth_mask, float('nan')).flatten(1),
+            dim=-1
+        )[0]  # (B)
+        torch._assert(
+            median_depths.isnan().sum() == 0,
+            f"{median_depths.isnan().sum()} batch's gt depths are completely invalid."
+        )
+
+        gt['depths'] = gt['depths'] / median_depths.view(B, 1, 1, 1)
+        # Sanitize GT depths before they touch the predictions by setting all invalid values to the median depth, 1.
+        gt['depths'] = gt['depths'].masked_fill(gt_invalid_depth_mask, 1)
+        weights = 2 / (1 + gt['depths'])  # multiplied by 2 so the median weight is 1
+        # Multiply weights by gt_valid_depth_mask to zero the weights of any points with invalid gt depths.
+        weights = weights.masked_fill(gt_invalid_depth_mask, 0)
+
+        pred_points, gt_points = self.obtain_pred_3D_points(pred), self.obtain_gt_3D_points(gt)
+        if self.scale:
+            scale = self.calculate_scale(pred_points, gt_points, weights)  # (B, 1)
+        else:
+            scale = torch.tensor([1], device="cuda").expand(B)
+
+        return pred_points, gt_points, scale, weights, median_depths, gt_valid_depth_mask
+
+    def point_loss(self, pred_points, gt_points, scale, weights, gt_valid_depth_mask):
+        """
+        Weighted Huber loss for 3D point coordinates (per-frame, in camera coordinates)
+        """
+        B, L, H, W = pred_points.shape[:4]
+        total_point_loss = F.huber_loss(
+            (pred_points * scale.view(B, 1, 1, 1, 1)),
+            gt_points,
+            reduction='none'
+        ) * weights.view(B, L, H, W, 1)  # Broadcasts against all 3 coordinates of each point.
+        # We shouldn't have to masked_fill() total_point_loss here, as pred and gt should all be valid by this point.
+        return total_point_loss.sum() / (gt_valid_depth_mask.sum() * 3)  # *3 for x, y, and z
+
     def normal_loss(self, points, gt_points, mask, gt_depths):
+        """
+        Normal direction loss (Huber Loss on the angle difference)
+        """
         not_edge = ~depth_edge(gt_depths, rtol=0.03)
         mask = mask & not_edge
 
@@ -243,6 +291,83 @@ class PP3DR_loss(nn.Module):
         # Added + 1e-6 to prevent division by zero if an entire patch/batch is masked out!
         return loss.sum() / (mask.sum() * 4 + 1e-6)
 
+    def gradient_matching_loss(self, pred_depth, gt_depth, valid_mask):
+        """
+        Encourages the spatial gradients (pixel-to-pixel step sizes) of the prediction to match the ground truth.
+
+        Parameters:
+        - pred_depth: (B, L, H, W)
+        - gt_depth: (B, L, H, W)
+        - valid_mask: (B, L, H, W) boolean mask
+        """
+
+        # 1. Calculate the spatial gradients (differences) in the Y direction (Vertical)
+        pred_dy = pred_depth[..., 1:, :] - pred_depth[..., :-1, :]
+        gt_dy = gt_depth[..., 1:, :] - gt_depth[..., :-1, :]
+
+        # 2. Calculate the spatial gradients in the X direction (Horizontal)
+        pred_dx = pred_depth[..., :, 1:] - pred_depth[..., :, :-1]
+        gt_dx = gt_depth[..., :, 1:] - gt_depth[..., :, :-1]
+
+        # 3. Create valid masks for the gradients.
+        # A gradient is only valid if BOTH adjacent pixels are valid.
+        mask_dy = valid_mask[..., 1:, :] & valid_mask[..., :-1, :]
+        mask_dx = valid_mask[..., :, 1:] & valid_mask[..., :, :-1]
+
+        # 4. Calculate the L1 loss between the gradients
+        # We use L1 instead of MSE to heavily penalize sharp boundary cliffs (mosaic artifacts)
+        loss_dy = F.huber_loss(pred_dy[mask_dy], gt_dy[mask_dy], reduction='mean')
+        loss_dx = F.huber_loss(pred_dx[mask_dx], gt_dx[mask_dx], reduction='mean')
+
+        # Optional: You can also weight these by the distance from edges, but standard L1
+        # usually smooths out the 16x16 grid effectively.
+        return loss_dy + loss_dx
+
+    def translation_loss(self, pred, gt_relative_translations, scale, median_depths):
+        """
+        Huber loss for relative camera translation.
+        """
+        B = scale.shape[0]
+        # If any of the 3 coordinates for a GT camera translation are invalid, we want to ignore that entire translation.
+        gt_valid_translation_mask = gt_relative_translations.isfinite().all(dim=-1, keepdim=True)  # (B, L - 1, 1)
+        gt_invalid_translation_mask = ~gt_valid_translation_mask
+        gt_relative_translations = gt_relative_translations.masked_fill(gt_invalid_translation_mask, 0)
+        total_translation_loss = F.huber_loss(
+            scale.view(B, 1, 1) * pred['relative_camera_translations'],
+            gt_relative_translations / median_depths.view(B, 1, 1),
+            reduction='none'
+        )
+        total_translation_loss = total_translation_loss.masked_fill(gt_invalid_translation_mask, 0)
+        return total_translation_loss.sum() / ((gt_valid_translation_mask).sum() * 3)  # *3 for x, y, and z
+
+    def rotation_loss(self, pred, gt_relative_rotations):
+        """
+        Huber Loss on the angle for relative camera rotation
+        cos = (Tr(R_1^TR_2) - 1)/2. Since Tr(R_1^TR_2) is equal to the inner product of R_1 and R_2, our loss is:
+        Huber( arccos( (<R_1, R_2> - 1) / 2 ) )
+        """
+        B, Lm1 = gt_relative_rotations.shape[:2] # Lm1 = L - 1
+        # (B, L - 1)
+        gt_rotation_valid_mask = (
+                gt_relative_rotations.isfinite().all(dim=-1).all(dim=-1)
+                & (gt_relative_rotations.flatten(start_dim=2).abs().max(dim=-1).values <= 1.05)
+        )
+        gt_rotation_invalid_mask = ~gt_rotation_valid_mask
+        identity_matrix = torch.eye(
+            3,
+            device=gt_relative_rotations.device,
+            dtype=gt_relative_rotations.dtype
+        ).view(1, 1, 3, 3)
+        gt_relative_rotations = torch.where(
+            gt_rotation_valid_mask.view(B, Lm1, 1, 1),
+            gt_relative_rotations,
+            identity_matrix
+        )
+        trace = (pred['relative_camera_rotations'] * gt_relative_rotations).sum(dim=(-2, -1))  # (B, L - 1)
+        cosine = torch.clamp(((trace - 1.0) / 2.0).to(torch.float32), min=-1.0 + 1e-6, max=1.0 - 1e-6)
+        raw_rotation_loss = F.huber_loss(torch.acos(cosine).to(trace.dtype), torch.zeros_like(cosine, device="cuda"))
+        return raw_rotation_loss.masked_fill(gt_rotation_invalid_mask, 0).sum() / gt_rotation_valid_mask.sum()
+
     def forward(self, pred, gt):
         """
         Parameters
@@ -267,62 +392,29 @@ class PP3DR_loss(nn.Module):
         A single scalar, representing the loss.
         """
         # First of all, check the model predictions for infs and nans.
+        # torch._assert(
+        #     (~pred['XY_rays'].isfinite()).sum() + (~pred['log_depths'].isfinite()).sum()
+        #     + (~pred['relative_camera_translations'].isfinite()).sum()
+        #     + (~pred['relative_camera_rotations'].isfinite()).sum() == 0,
+        #     f"Pred has invalid values. XY_rays: {(~pred['XY_rays'].isfinite()).sum()}, "
+        #     f"log_depths: {(~pred['log_depths'].isfinite()).sum()}, "
+        #     f"relative_camera_translations: {(~pred['relative_camera_translations'].isfinite()).sum()}, "
+        #     f"relative_camera_rotations: {(~pred['relative_camera_rotations'].isfinite()).sum()}"
+        # )
+        invalid_dict = {k: (~v.isfinite()).sum() for k, v in pred.items()}
         torch._assert(
-            (~pred['XY_rays'].isfinite()).sum() + (~pred['log_depths'].isfinite()).sum()
-            + (~pred['relative_camera_translations'].isfinite()).sum()
-            + (~pred['relative_camera_rotations'].isfinite()).sum() == 0,
-            f"Pred has invalid values. XY_rays: {(~pred['XY_rays'].isfinite()).sum()}, "
-            f"log_depths: {(~pred['log_depths'].isfinite()).sum()}, "
-            f"relative_camera_translations: {(~pred['relative_camera_translations'].isfinite()).sum()}, "
-            f"relative_camera_rotations: {(~pred['relative_camera_rotations'].isfinite()).sum()}"
+            sum(invalid_dict.values()) == 0,
+            "Pred has invalid values:" + "".join([f"\n{k}: {v}" for k, v in invalid_dict.items()])
         )
 
-        B, L, H, W = pred['log_depths'].shape
+        pred_points, gt_points, scale, weights, median_depths, gt_valid_depth_mask = self.initialize(pred, gt)
 
-        gt_valid_depth_mask = torch.isfinite(gt['depths']) & (gt['depths'] != 0)
-        gt_invalid_depth_mask = ~gt_valid_depth_mask
+        point_loss = self.point_loss(pred_points, gt_points, scale, weights, gt_valid_depth_mask)
+        # torch._assert(
+        #     point_loss.isfinite(),
+        #     f"Point loss invalid ({point_loss})\ttotal_point_loss = {total_point_loss}"
+        # )
 
-        # First, normalise the MEDIAN ground-truth depth to 1.
-        # Calculate the median over only valid elements by filling all invalid with NaN and using torch.nanmedian().
-        median_depths = torch.nanmedian(
-            gt['depths'].masked_fill(gt_invalid_depth_mask, float('nan')).flatten(1),
-            dim=-1
-        )[0] # (B)
-        torch._assert(
-            median_depths.isnan().sum() == 0,
-            f"{median_depths.isnan().sum()} batch's gt depths are completely invalid."
-        )
-
-        gt['depths'] = gt['depths'] / median_depths.view(B, 1, 1, 1)
-        # Sanitize GT depths before they touch the predictions by setting all invalid values to the median depth, 1.
-        gt['depths'] = gt['depths'].masked_fill(gt_invalid_depth_mask, 1)
-        weights = 2 / (1 + gt['depths']) # multiplied by 2 so the median weight is 1
-        # Multiply weights by gt_valid_depth_mask to zero the weights of any points with invalid gt depths.
-        weights = weights.masked_fill(gt_invalid_depth_mask, 0)
-
-        pred_points, gt_points = self.obtain_pred_3D_points(pred), self.obtain_gt_3D_points(gt)
-        if self.scale:
-            scale = self.calculate_scale(pred_points, gt_points, weights) # (B, 1)
-        else:
-            scale = torch.tensor([1], device = "cuda").expand(B)
-
-        """
-        Weighted Huber loss for 3D point coordinates (per-frame, in camera coordinates)
-        """
-        total_point_loss = F.huber_loss(
-            (pred_points * scale.view(B, 1, 1, 1, 1)),
-            gt_points,
-            reduction='none'
-        ) * weights.view(B, L, H, W, 1) # Broadcasts against all 3 coordinates of each point.
-        # We shouldn't have to masked_fill() total_point_loss here, as pred and gt should all be valid by this point.
-        point_loss = total_point_loss.sum() / (gt_valid_depth_mask.sum() * 3) # *3 for x, y, and z
-        torch._assert(
-            point_loss.isfinite(),
-            f"Point loss invalid ({point_loss})\ttotal_point_loss = {total_point_loss}"
-        )
-        """
-        Normal direction loss
-        """
         normal_loss = self.normal_loss(
             points=pred_points,
             gt_points=gt_points,
@@ -330,76 +422,23 @@ class PP3DR_loss(nn.Module):
             gt_depths=gt['depths']
         )
 
+        gradient_matching_loss = self.gradient_matching_loss(torch.exp(pred['log_depths']), gt['depths'], gt_valid_depth_mask)
+
         gt_relative_rotations, gt_relative_translations = self.obtain_gt_relative_poses(gt['extrinsics'])
-        """
-        Huber loss for relative camera translation.
-        """
-        # If any of the 3 coordinates for a GT camera translation are invalid, we want to ignore that entire translation.
-        gt_valid_translation_mask = gt_relative_translations.isfinite().all(dim=-1, keepdim=True) # (B, L - 1, 1)
-        gt_invalid_translation_mask = ~gt_valid_translation_mask
-        gt_relative_translations = gt_relative_translations.masked_fill(gt_invalid_translation_mask, 0)
-        total_translation_loss = F.huber_loss(
-            scale.view(B, 1, 1) * pred['relative_camera_translations'],
-            gt_relative_translations / median_depths.view(B, 1, 1),
-            reduction='none'
-        )
-        total_translation_loss = total_translation_loss.masked_fill(gt_invalid_translation_mask, 0)
-        translation_loss = total_translation_loss.sum() / ((gt_valid_translation_mask).sum() * 3) # *3 for x, y, and z
+
+        translation_loss = self.translation_loss(pred, gt_relative_translations, scale, median_depths)
         torch._assert(translation_loss.isfinite(), f"Translation loss invalid ({translation_loss})")
 
-        """
-        Huber Loss on the angle for relative camera rotation
-        cos = (Tr(R_1^TR_2) - 1)/2. Since Tr(R_1^TR_2) is equal to the inner product of R_1 and R_2, our loss is:
-        Huber( arccos( (<R_1, R_2> - 1) / 2 ) )
-        """
-        # (B, L - 1)
-        gt_rotation_valid_mask = (
-                gt_relative_rotations.isfinite().all(dim=-1).all(dim=-1)
-                                  & (gt_relative_rotations.flatten(start_dim=2).abs().max(dim=-1).values <= 1.05)
-        )
-        gt_rotation_invalid_mask = ~gt_rotation_valid_mask
-        identity_matrix = torch.eye(
-            3,
-            device=gt_relative_rotations.device,
-            dtype=gt_relative_rotations.dtype
-        ).view(1, 1, 3, 3)
-        gt_relative_rotations = torch.where(
-            gt_rotation_valid_mask.view(B, L - 1, 1, 1),
-            gt_relative_rotations,
-            identity_matrix
-        )
-        trace = (pred['relative_camera_rotations'] * gt_relative_rotations).sum(dim=(-2, -1)) # (B, L - 1)
-        cosine = torch.clamp(((trace - 1.0) / 2.0).to(torch.float32), min=-1.0 + 1e-6, max=1.0 - 1e-6)
-        raw_rotation_loss = F.huber_loss(torch.acos(cosine).to(trace.dtype), torch.zeros_like(cosine, device="cuda"))
-        rotation_loss = raw_rotation_loss.masked_fill(gt_rotation_invalid_mask, 0).sum() / gt_rotation_valid_mask.sum()
+        rotation_loss = self.rotation_loss(pred, gt_relative_rotations)
         torch._assert(rotation_loss.isfinite(), f"Rotation loss invalid ({rotation_loss})")
 
-        total_loss = 10 * point_loss + 0.1 * normal_loss + 10 * translation_loss + rotation_loss
+        total_loss = point_loss + 10 * gradient_matching_loss + 0.1 * normal_loss + translation_loss + rotation_loss
         # total_loss = 10 * point_loss + 0.1 * normal_loss
         return total_loss, dict(
             total_loss=total_loss,
             point_loss=point_loss,
             normal_loss=normal_loss,
+            gradient_matching_loss=gradient_matching_loss,
             translation_loss=translation_loss,
             rotation_loss=rotation_loss
         )
-
-"""
-L1 or Huber loss for rotation loss:
-# Calculate the trace (Inner product of the two matrices)
-trace = (pred['relative_camera_rotations'] * gt_relative_rotations).sum(dim=(-2, -1)) # (B, L - 1)
-
-# 1. Convert to float32 to protect the clamp from bfloat16 rounding
-cosine = ((trace - 1.0) / 2.0).to(torch.float32)
-
-# 2. Safely clamp strictly inside the valid domain to prevent the acos(-Inf) gradient explosion
-cosine = torch.clamp(cosine, min=-1.0 + 1e-6, max=1.0 - 1e-6)
-
-# 3. Calculate the exact angular error in radians, then cast back to network precision
-rot_ang_err = torch.acos(cosine).to(trace.dtype)
-
-# 4. Mask and average (Added the 1e-6 safety net to the denominator!)
-rotation_loss = rot_ang_err.masked_fill(gt_rotation_invalid_mask, 0.0).sum() / (gt_rotation_valid_mask.sum() + 1e-6)
-
-torch._assert(rotation_loss.isfinite(), f"Rotation loss invalid ({rotation_loss})")
-"""

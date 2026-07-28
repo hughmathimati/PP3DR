@@ -17,7 +17,6 @@ import accelerate
 from accelerate import Accelerator, ProfileKwargs, DataLoaderConfiguration
 from accelerate.utils import ProjectConfiguration, DistributedDataParallelKwargs
 from torch.utils.data import ConcatDataset, DataLoader
-import wandb
 import os
 
 class State:
@@ -55,6 +54,7 @@ class Basetrainer:
                  checkpoint_every = 10,
                  batch_size = 5,
                  gradient_accumulation_steps=8,
+                 start_checkpointing=6,
                  train_datasets = [
                      dynamic_replica_dataset, flying_things_3d_dataset, nrgbd_dataset, dtu_dataset, eth3d_dataset
                  ],
@@ -87,7 +87,7 @@ class Basetrainer:
         # ProcessPoolExecutor -> Cannot re-initialize CUDA in forked subprocess.
         with ThreadPoolExecutor() as executor:
             a = executor.submit(self.prepare_dataloaders, train_datasets, val_dataset, batch_size)
-            b = executor.submit(self.initialize, model, pretrained_path)
+            b = executor.submit(self.initialize, model, pretrained_path, start_checkpointing)
 
             self.metric = loss(scale=False)
 
@@ -187,8 +187,8 @@ class Basetrainer:
 
         return train_dataloader, val_dataloader
 
-    def initialize(self, model, pretrained_path):
-        PP3DR_model = model()
+    def initialize(self, model, pretrained_path, start_checkpointing):
+        PP3DR_model = model(start_checkpointing=start_checkpointing)
         if pretrained_path is not None:
             PP3DR_model.load_state_dict(torch.load(pretrained_path, weights_only=True, map_location="cpu"))
             print("Loaded pretrained weights from", pretrained_path)
@@ -312,7 +312,7 @@ class Basetrainer:
                 # Accelerate automatically handles autocast and automatically moves the batch's tensors to the right GPU.
                 pred = self.PP3DR_model(batch['images'], batch['rope_x'], batch['rope_y'])
                 loss, loss_dict = self.metric(pred, batch)
-                self.state.train_losses[state.epoch - 1] += loss.detach()
+                self.state.train_losses[self.state.epoch - 1] += loss.detach()
                 with torch.autocast(device_type=self.accelerator.device.type, enabled=False):
                     self.AdamW.zero_grad()
                     self.Muon.zero_grad()
@@ -335,14 +335,21 @@ class Basetrainer:
 
         Average validation loss per epoch getes logged. This notably differs from the training logging behaviour.
         """
-        sum_loss_dict = dict(total_loss=0, point_loss=0, translation_loss=0, rotation_loss=0, normal_loss=0)
+        sum_loss_dict = dict(
+            total_loss=0,
+            point_loss=0,
+            normal_loss=0,
+            gradient_matching_loss=0,
+            translation_loss=0,
+            rotation_loss=0,
+        )
         len_dataloader = len(dataloader)
         for batch in tqdm(iterator, desc=f"Validation {name}", disable=not self.accelerator.is_local_main_process,
                           total=len_dataloader):
             # Accelerate automatically handles autocast.
             pred = self.PP3DR_model(batch['images'], batch['rope_x'], batch['rope_y'])
             loss, loss_dict = self.metric(pred, batch)
-            self.state.val_losses[state.epoch - 1] += loss.detach()
+            self.state.val_losses[self.state.epoch - 1] += loss.detach()
             for k, v in loss_dict.items():
                 sum_loss_dict[k] += v.item()
 

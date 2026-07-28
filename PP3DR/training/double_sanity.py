@@ -103,7 +103,7 @@ class DoubleSanity(Basetrainer):
             self.train_on_dataset("Combined train set", self.train_iter, self.train_dataloader)
 
         if self.state.epoch != self.epochs:
-            self.train_iter = iter(train_dataloader)
+            self.train_iter = iter(self.train_dataloader)
 
         self.state.epoch += 1
 
@@ -116,5 +116,6 @@ if __name__ == "__main__":
         checkpoint_every=500,
         batch_size=2,
         gradient_accumulation_steps=2,
+        start_checkpointing=2,
         train_datasets=[nrgbd_dataset],
     )
