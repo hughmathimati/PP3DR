@@ -87,6 +87,7 @@ class PP3DR_loss(PP3DR_loss):
         )
 
         B, L, H, W = pred['log_depths'].shape
+        gt['depths'] = gt['depths'].cuda()
 
         gt_valid_depth_mask = torch.isfinite(gt['depths']) & (gt['depths'] != 0)
         gt_invalid_depth_mask = ~gt_valid_depth_mask
@@ -117,6 +118,7 @@ class PP3DR_loss(PP3DR_loss):
         """
         Weighted Huber loss for 3D point coordinates (per-frame, in camera coordinates)
         """
+        print(pred_points.device, scale.device, gt_points.device, weights.device) # DEBUG
         total_point_loss = F.huber_loss(
             (pred_points * scale.view(B, 1, 1, 1, 1)),
             gt_points,

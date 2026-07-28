@@ -348,9 +348,9 @@ class PP3DR_loss(nn.Module):
         torch._assert(translation_loss.isfinite(), f"Translation loss invalid ({translation_loss})")
 
         """
-        Cosine similarity loss for relative camera rotation
+        Huber Loss on the angle for relative camera rotation
         cos = (Tr(R_1^TR_2) - 1)/2. Since Tr(R_1^TR_2) is equal to the inner product of R_1 and R_2, our loss is:
-        (3 - <R_1, R_2>)/2
+        Huber( arccos( (<R_1, R_2> - 1) / 2 ) )
         """
         # (B, L - 1)
         gt_rotation_valid_mask = (
@@ -369,9 +369,8 @@ class PP3DR_loss(nn.Module):
             identity_matrix
         )
         trace = (pred['relative_camera_rotations'] * gt_relative_rotations).sum(dim=(-2, -1)) # (B, L - 1)
-        # assert (~trace.isfinite()).sum() == 0, f"trace has {(~trace.isfinite()).sum()} invalid elements"
-
-        raw_rotation_loss = torch.clamp((3 - trace) / 2, min = 0)
+        cosine = torch.clamp(((trace - 1.0) / 2.0).to(torch.float32), min=-1.0 + 1e-6, max=1.0 - 1e-6)
+        raw_rotation_loss = F.huber_loss(torch.acos(cosine).to(trace.dtype), torch.zeros_like(cosine, device="cuda"))
         rotation_loss = raw_rotation_loss.masked_fill(gt_rotation_invalid_mask, 0).sum() / gt_rotation_valid_mask.sum()
         torch._assert(rotation_loss.isfinite(), f"Rotation loss invalid ({rotation_loss})")
 
