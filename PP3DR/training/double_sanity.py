@@ -112,6 +112,7 @@ if __name__ == "__main__":
         model=PP3DR_double,
         loss=PP3DR_loss,
         name="depth-focal-double-sanity",
+        checkpoint="/vulcanscratch/hughma/PP3DR/depth-focal-double-sanity/epoch 500",
         epochs=1000,
         checkpoint_every=500,
         batch_size=2,

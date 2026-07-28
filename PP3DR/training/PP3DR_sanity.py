@@ -28,7 +28,8 @@ if __name__ == "__main__":
     DoubleSanity(
         model=PP3DR,
         loss=PP3DR_loss,
-        name="depth-focal-sanity",
+        name="new-loss-params-sanity",
+        checkpoint="/vulcanscratch/hughma/PP3DR/new-loss-params-sanity/epoch 1000",
         epochs=1000,
         checkpoint_every=500,
         batch_size=2,

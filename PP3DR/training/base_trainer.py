@@ -78,6 +78,8 @@ class Basetrainer:
         if self.accelerator.is_local_main_process:
             self.accelerator.init_trackers(project_name="PP3DR")
         torch.cuda.set_device(self.accelerator.device)
+        if self.accelerator.is_local_main_process:
+            print("\033[95m" + f"Train job: {name}" + "\033[0m")
 
         self.name = name
         self.pretrained_path = pretrained_path
@@ -118,8 +120,8 @@ class Basetrainer:
                 print(f"Loaded checkpoint from {checkpoint}")
             # For some reason, accelerate seems to load the `state` tensors on the cpu. I don't know why this is, but I'll
             # just move them back.
-            self.state.train_losses = state.train_losses.to(self.accelerator.device, non_blocking=True)
-            self.state.val_losses = state.val_losses.to(self.accelerator.device, non_blocking=True)
+            self.state.train_losses = self.state.train_losses.to(self.accelerator.device, non_blocking=True)
+            self.state.val_losses = self.state.val_losses.to(self.accelerator.device, non_blocking=True)
         else:
             accelerate.utils.set_seed(42)
             if self.accelerator.is_local_main_process:
@@ -142,15 +144,15 @@ class Basetrainer:
         # End of training loop; write losses to file
         if self.accelerator.is_local_main_process:
             print("Training done.")
-        self.accelerator.reduce(state.train_losses, "sum")
-        self.accelerator.reduce(state.val_losses, "sum")
+        self.accelerator.reduce(self.state.train_losses, "sum")
+        self.accelerator.reduce(self.state.val_losses, "sum")
 
         if self.accelerator.is_local_main_process:
             with open(f"/vulcanscratch/hughma/PP3DR/{name}/train_losses.pkl", "wb") as f:
-                pickle.dump(state.train_losses.numpy(force=True), f)
+                pickle.dump(self.state.train_losses.numpy(force=True), f)
             print("Saved train_losses")
             with open(f"/vulcanscratch/hughma/PP3DR/{name}/val_losses.pkl", "wb") as f:
-                pickle.dump(state.val_losses.numpy(force=True), f)
+                pickle.dump(self.state.val_losses.numpy(force=True), f)
             print("Saved val_losses")
             torch.save(PP3DR_model.state_dict(), f"/vulcanscratch/hughma/PP3DR/{name}/PP3DR.pth")
             print("Saved model")
@@ -356,7 +358,7 @@ class Basetrainer:
         # Log to Tensorboard once per epoch
         if self.accelerator.is_local_main_process:
             loss_dict = {f"val/{key}": value / len_dataloader for key, value in sum_loss_dict.items()}
-            self.accelerator.log(loss_dict, step=global_step)
+            self.accelerator.log(loss_dict, step=self.global_step)
             self.global_step += 1
 
     def per_epoch(self):
