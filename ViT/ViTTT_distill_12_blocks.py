@@ -102,8 +102,9 @@ def train_on_dataset(name, iterator, dataloader):
 
 def val_on_dataset(name, iterator, dataloader):
     global global_step
+    len_dataloader = len(dataloader)
     for batch in tqdm(
-            iterator, desc=f"Validation {name}", disable=not accelerator.is_local_main_process, total=len(dataloader), mininterval = 1
+            iterator, desc=f"Validation {name}", disable=not accelerator.is_local_main_process, total=len_dataloader, mininterval = 1
     ):
         # Accelerate automatically handles autocast.
         # torch.no_grad() is included inside obtain_features().
@@ -257,6 +258,29 @@ def prepare_dataloaders():
     return train_dataloader, val_dataloader
 
 
+# @torch.compile()
+# class ViTTT_Loss(nn.Module):
+#     """
+#     Huber angle loss.
+#     """
+#     def __init__(self):
+#         super().__init__()
+#         # default dim is 1, so we actually do have to explicitly pass this parameter.
+#         self.sim = nn.CosineSimilarity(dim=-1)
+#
+#     def forward(self, pred, gt):
+#         # Ignore the register tokens. pca_lowrank() to lower dino output to ViTTT dim.
+#         return F.huber_loss(
+#             torch.acos(
+#                 torch.clamp(
+#                     self.sim(pred, gt),
+#                     min=1e-5,
+#                     max=1 - 1e-5
+#                 )
+#             ),
+#             torch.zeros(*pred.shape[:2], device=accelerator.device)
+#         ).mean()
+
 @torch.compile()
 class ViTTT_Loss(nn.Module):
     """
@@ -268,17 +292,7 @@ class ViTTT_Loss(nn.Module):
         self.sim = nn.CosineSimilarity(dim=-1)
 
     def forward(self, pred, gt):
-        # Ignore the register tokens. pca_lowrank() to lower dino output to ViTTT dim.
-        return F.huber_loss(
-            torch.acos(
-                torch.clamp(
-                    self.sim(pred, gt),
-                    min=1e-5,
-                    max=1 - 1e-5
-                )
-            ),
-            torch.zeros(*pred.shape[:2], device=accelerator.device)
-        ).mean()
+        return 1 - self.sim(pred, gt).mean()
 
 
 if __name__ == "__main__":

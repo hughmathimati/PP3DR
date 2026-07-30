@@ -360,8 +360,7 @@ class PP3DR_loss(nn.Module):
             identity_matrix
         )
         trace = (pred['relative_camera_rotations'] * gt_relative_rotations).sum(dim=(-2, -1))  # (B, L - 1)
-        cosine = torch.clamp(((trace - 1.0) / 2.0).to(torch.float32), min=-1.0 + 1e-6, max=1.0 - 1e-6)
-        raw_rotation_loss = F.huber_loss(torch.acos(cosine).to(trace.dtype), torch.zeros_like(cosine, device="cuda"))
+        raw_rotation_loss = torch.clamp((3 - trace) / 2, min=0)
         return raw_rotation_loss.masked_fill(gt_rotation_invalid_mask, 0).sum() / gt_rotation_valid_mask.sum()
 
     def forward(self, pred, gt):
