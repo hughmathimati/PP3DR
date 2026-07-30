@@ -55,26 +55,22 @@ def depth_edge(depth: torch.Tensor, rtol: float = 0.03) -> torch.Tensor:
 @torch.compile()
 class PP3DR_loss(nn.Module):
     """
-    Current losses are:
-     - Huber loss for 3D coordinates per frame
-     - Huber loss for camera translation
-     - Cosine similarity loss for camera rotation
-    We're going to solve for a universal scale factor before we do all this. The scale factor will be averaged across
-    all depths for each frame in a given sequence. Thus, our scale will have shape (B,).
+     - point_loss: Huber loss for 3D coordinates per frame
+     - gradient_matching_loss: Huber loss for spatial depth gradients per frame
+     - normal_loss: Huber loss on surface-normal angle differences
+     - translation_loss: Huber loss for camera translation
+     - rotation_loss: Cosine similarity loss for camera rotation
+    The median_depth gets incorporated into the GT depths inside self.initialize(), so point_loss and
+    gradient_matching_loss implicitly incorporate it automatically.
+    The translation_loss needs median_depth to be explicitly incorporated when normalizing its translations.
     """
     def __init__(self,
         scale = False,
-        # point_loss = True,
-        # normal_loss = True,
-        # translation_loss = True,
-        # rotation_loss = True,
+        median_depth = 10,
     ):
         super().__init__()
         self.scale = scale
-        # self.point_loss = point_loss
-        # self.normal_loss = normal_loss
-        # self.translation_loss = translation_loss
-        # self.rotation_loss = rotation_loss
+        self.median_depth = median_depth
 
     def calculate_scale(self, pred_pts, gt_pts, weights):
         """
@@ -196,7 +192,7 @@ class PP3DR_loss(nn.Module):
 
     def initialize(self, pred, gt):
         gt['depths'], gt['extrinsics'], gt['intrinsics'] = gt['depths'].cuda(), gt['extrinsics'].cuda(), gt['intrinsics'].cuda()
-        B = pred['log_depths'].shape[0]
+        B = gt['depths'].shape[0]
 
         gt_valid_depth_mask = torch.isfinite(gt['depths']) & (gt['depths'] != 0)
         gt_invalid_depth_mask = ~gt_valid_depth_mask
@@ -212,10 +208,10 @@ class PP3DR_loss(nn.Module):
             f"{median_depths.isnan().sum()} batch's gt depths are completely invalid."
         )
 
-        gt['depths'] = gt['depths'] / median_depths.view(B, 1, 1, 1)
+        gt['depths'] = self.median_depth * gt['depths'] / median_depths.view(B, 1, 1, 1)
         # Sanitize GT depths before they touch the predictions by setting all invalid values to the median depth, 1.
         gt['depths'] = gt['depths'].masked_fill(gt_invalid_depth_mask, 1)
-        weights = 2 / (1 + gt['depths'])  # multiplied by 2 so the median weight is 1
+        weights = 2 * self.median_depth / (self.median_depth + gt['depths'])  # multiplied by 2 so the median weight is 1
         # Multiply weights by gt_valid_depth_mask to zero the weights of any points with invalid gt depths.
         weights = weights.masked_fill(gt_invalid_depth_mask, 0)
 
@@ -334,7 +330,7 @@ class PP3DR_loss(nn.Module):
         gt_relative_translations = gt_relative_translations.masked_fill(gt_invalid_translation_mask, 0)
         total_translation_loss = F.huber_loss(
             scale.view(B, 1, 1) * pred['relative_camera_translations'],
-            gt_relative_translations / median_depths.view(B, 1, 1),
+            self.median_depth * gt_relative_translations / median_depths.view(B, 1, 1),
             reduction='none'
         )
         total_translation_loss = total_translation_loss.masked_fill(gt_invalid_translation_mask, 0)
@@ -401,7 +397,7 @@ class PP3DR_loss(nn.Module):
         #     f"relative_camera_translations: {(~pred['relative_camera_translations'].isfinite()).sum()}, "
         #     f"relative_camera_rotations: {(~pred['relative_camera_rotations'].isfinite()).sum()}"
         # )
-        invalid_dict = {k: (~v.isfinite()).sum() for k, v in pred.items()}
+        invalid_dict = {k: 0 if v is None else (~v.isfinite()).sum() for k, v in pred.items()}
         torch._assert(
             sum(invalid_dict.values()) == 0,
             "Pred has invalid values:" + "".join([f"\n{k}: {v}" for k, v in invalid_dict.items()])

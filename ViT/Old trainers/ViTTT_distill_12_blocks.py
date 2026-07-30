@@ -99,7 +99,7 @@ def val_on_dataset(name, iterator, dataloader):
         state.val_losses[state.epoch - 1] += metric(pred, gt).detach()
 
 
-def get_vittt_param_groups(model: nn.Module, adamw_lr: float = 1e-5, muon_lr: float = 5e-3,
+def get_vittt_param_groups(model: nn.Module, adamw_lr: float = 1e-4, muon_lr: float = 1e-3,
                            weight_decay: float = 0.04, layer_decay: float = 0.9,
                            num_layers: int = 24):
     """

@@ -35,9 +35,10 @@ class DatasetBase(torch.utils.data.Dataset):
         self.sequences = [dict(images=[], depths=[]) for _ in range(len(self.sequence_names))]
         # Start with a lower dimension for initial training and sanity-checking. You can fine-tune at a higher
         # resolution later.
+        # print("WARNING: Patch size set to 14 for Pi3 sanity.")
         self.input_dim = 512
         self.patch_size = 16  # This should be set to the patch size of your feature extractor.
-        assert self.input_dim % self.patch_size == 0, "self.input_dim must be a multiple of the patch size (16)."
+        assert self.input_dim % self.patch_size == 0, f"self.input_dim must be a multiple of the patch size ({self.patch_size})."
         # Set this to True to have __getittem__() return the raw images as well.
         # This should be False for training and only turned on for debugging/visualization purposes.
         self.raw = False

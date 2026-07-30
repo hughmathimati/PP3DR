@@ -6,7 +6,7 @@ from torch.linalg import vector_norm
 import torch.cuda.amp as amp
 from einops import rearrange
 from typing import Callable
-from PP3DR_loss import PP3DR_loss
+from training.PP3DR_loss import PP3DR_loss
 
 
 @torch.compile()

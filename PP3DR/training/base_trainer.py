@@ -39,7 +39,7 @@ class State:
         self.train_losses = state["train_losses"]
         self.val_losses = state["val_losses"]
 
-class Basetrainer:
+class BaseTrainer:
     """
     Base trainer class, so I don't have a dozen trainer scripts with mostly the same code.
     """
@@ -208,7 +208,7 @@ class Basetrainer:
 
         PP3DR_model.apply(init_vit_weights)
 
-        AdamW_params, Muon_params = self.get_pp3dr_param_groups(PP3DR_model)
+        AdamW_params, Muon_params = self.get_param_groups(PP3DR_model)
 
         AdamW = torch.optim.AdamW(AdamW_params, betas=(0.9, 0.99), foreach=True)
         Muon = torch.optim.Muon(Muon_params)
@@ -216,10 +216,10 @@ class Basetrainer:
         self.accelerator.register_for_checkpointing(state)
         return state, PP3DR_model, AdamW, Muon
 
-    def get_pp3dr_param_groups(self,
+    def get_param_groups(self,
                                model: nn.Module,
-                               adamw_lr: float = 1e-5,
-                               muon_lr: float = 5e-3,
+                               adamw_lr: float = 1e-4,
+                               muon_lr: float = 1e-3,
                                weight_decay: float = 0.04,
                                layer_decay: float = 0.95,
                                num_layers: int = 40 # 36 blocks + 4 blocks in each per-task head

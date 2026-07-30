@@ -1,10 +1,10 @@
-from base_trainer import Basetrainer
+from training.base_trainer import BaseTrainer
 from models.PP3DR_depth_focal import PP3DR
 from training.PP3DR_depth_focal_loss import PP3DR_loss
 from datasets.nrgbd_dataset import nrgbd_dataset
 import torch
 
-class DoubleSanity(Basetrainer):
+class SanityTrainer(BaseTrainer):
     def per_epoch(self):
         if self.state.epoch % self.checkpoint_every == 0:
             self.accelerator.save_state(output_dir=f"/vulcanscratch/hughma/PP3DR/{self.name}/epoch {self.state.epoch}",
@@ -25,15 +25,14 @@ class DoubleSanity(Basetrainer):
         self.state.epoch += 1
 
 if __name__ == "__main__":
-    DoubleSanity(
+    SanityTrainer(
         model=PP3DR,
         loss=PP3DR_loss,
-        name="new-loss-params-sanity",
-        checkpoint="/vulcanscratch/hughma/PP3DR/new-loss-params-sanity/epoch 1000",
+        name="TTT-depth-proj",
         epochs=1000,
         checkpoint_every=500,
-        batch_size=2,
-        gradient_accumulation_steps=2,
-        start_checkpointing=2,
+        batch_size=5,
+        gradient_accumulation_steps=1,
+        start_checkpointing=6,
         train_datasets=[nrgbd_dataset],
     )

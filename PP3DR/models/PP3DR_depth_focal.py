@@ -11,18 +11,17 @@ import torchvision.transforms.v2 as transforms
 
 # try block contains imports for calling from trainer, and except block contains imports for running this file itself
 try:
-    from .BidirectionalLaCT import GlobalLaCT, LocalLaCT
+    from .BidirectionalLaCT import GlobalLaCT, LocalLaCT, BidirectionalLaCT_output_dim
     from .pos_embed import RopePositionEmbedding, Rope3D, Rope2D
     from .ViTTT import ViTTT
 except:
-    from BidirectionalLaCT import GlobalLaCT, LocalLaCT
+    from BidirectionalLaCT import GlobalLaCT, LocalLaCT, BidirectionalLaCT_output_dim
     from pos_embed import RopePositionEmbedding, Rope3D, Rope2D
     from ViTTT import ViTTT
 from xformers.ops import SwiGLU
 from timm.layers import DropPath
 
 
-@torch.compile()
 class LayerScale(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -32,7 +31,6 @@ class LayerScale(nn.Module):
         return self.scale * x
 
 
-@torch.compile()
 class GlobalBlock(nn.Module):
     def __init__(self, dim, num_heads, ffn_ratio, drop_path=0):
         super().__init__()
@@ -64,7 +62,6 @@ class GlobalBlock(nn.Module):
         return x
 
 
-# @torch.compile()
 class LocalBlock(nn.Module):
     def __init__(self, dim, num_heads, ffn_ratio, drop_path=0):
         super().__init__()
@@ -108,9 +105,13 @@ class DepthFocalHead(nn.Module):
             [LocalBlock(hidden_dim, num_heads, ffn_ratio) for _ in range(self.blocks_each)])
 
         self.registers_layer_norm = nn.LayerNorm(hidden_dim)  # Pre-projection layer norm.
-        self.tokens_layer_norm = nn.LayerNorm(hidden_dim)  # Pre-projection layer norm.
+        self.pre_depth_proj_layer_norm = nn.LayerNorm(hidden_dim) # Pre-projection layer norm.
+        self.post_depth_proj_layer_norm = nn.LayerNorm(256) # Post-projection layer norm.
         self.focal_proj = nn.Linear(num_registers * hidden_dim, 4)  # fx, fy, cx, cy
-        self.depths_proj = nn.Linear(hidden_dim, 256)
+
+        # rope2d (and rope3d) are made for a head-dimension of 1280 / 20 = 64. However, with only 16 heads, the rope-
+        # dimension is actually 1280 / 16 - 80. We'll solve this by simply not aqpplying RoPE to the last 16 dimensions.
+        self.depth_proj = BidirectionalLaCT_output_dim(dim=hidden_dim, num_heads=16, v_dim=256)
         self.num_registers = num_registers
         self.num_blocks = blocks
 
@@ -118,6 +119,9 @@ class DepthFocalHead(nn.Module):
         """
         Input to the model consists of the outputs of the last global block AND the last local block, concatenated
         along the last dimension. Thus, the input dimension is 2 * 1280.
+
+        The depths are obtained by a down-projection via TTT block (1280 to 256). The 5 register tokens per frame are
+        kept for the TTT block and discarded afterward, before passing the result into a layer norm.
 
         Parameters
         ----------
@@ -137,24 +141,29 @@ class DepthFocalHead(nn.Module):
                 x = self.global_blocks[i](x, rope3d, L)
                 x = self.local_blocks[i](x, rope2d, L)
 
-        x = rearrange(x, "(B L) X dim -> B L X dim", L=L)  # (B, L, num_registers + HW // 256, dim)
-        registers = self.registers_layer_norm(x[:, :, :self.num_registers, :])  # (B, L, num_registers, dim)
-        tokens = self.tokens_layer_norm(x[:, :, self.num_registers:, :])  # (B, L, HW // 256, dim)
-        # (B, L, num_registers * dim) -> (B, L, 4) -> 4 x (B, L)
-        fx, fy, cx, cy = self.focal_proj(registers.flatten(start_dim=2)).unbind(-1)
+        x = rearrange(x, "(B L) X dim -> B L X dim", L = L)
+        registers = self.registers_layer_norm(x[:, :, :self.num_registers, :]) # (B, L, num_registers, dim)
+        # (B * L, num_registers * dim) -> (B, L, 4) -> 4 x (B, L)
+        fx, fy, cx, cy = self.focal_proj(registers.flatten(start_dim=-2)).unbind(-1)
         # fx and fy will be passed into softplus to ensure they're always positive.
         fx, fy = F.softplus(fx), F.softplus(fy)
         # cx and cy will actually be the residuals to the image center point.
         cx, cy = cx + W / 2, cy + H / 2
 
+        sin, cos = rope2d # shape (B * L, HW, 64)
+        # Padding with 16 zeroes on the left to a head-dim of 80.
+        sin, cos = F.pad(sin, (16, 0)), F.pad(cos, (16, 0)) # (B * L, HW, 80)
+        # Passing rope2d because the down-projection is a local operation.
+        # (B, L, self.num_registers + HW // 256, 256)
+        down_proj = self.depth_proj(self.pre_depth_proj_layer_norm(x), (sin, cos), L)
         # We must take into account that each token represents the 16x16 patch at that location.
         # Naively rearranging leads to each 16x16 patch being mapped to a contiguous line of 256 pixels.
         log_depths = rearrange(
-            self.depths_proj(tokens),  # (B, L, HW // 256, 256)
+            self.post_depth_proj_layer_norm(down_proj[:, :, self.num_registers:, :]), # (B, L, HW // 256, 256)
             "B L (h_p w_p) (p1 p2) -> B L (h_p p1) (w_p p2)",
             h_p=H // 16, w_p=W // 16, p1=16, p2=16
         )
-        # depths has shape (B, L, HW). fx, fy, cx, and cy have shape (B, L).
+        # depths has shape (B, L, H, W). fx, fy, cx, and cy have shape (B, L).
         return log_depths, fx, fy, cx, cy
 
 
@@ -259,6 +268,8 @@ class PP3DR(nn.Module):
             LocalBlock(dim, num_heads, ffn_ratio, drop_rates[2 * i + 1])
             for i in range(self.blocks_each)
         ])
+        # The first layer norm of the first block comes immediately after ViTTT's final layer norm.
+        self.global_blocks[0].layer_norm_1 = nn.Identity()
 
         # We don't store num_registers here. It gets stored in the decoder heads.
         self.rope2d = Rope2D(embed_dim=dim, num_heads=num_heads, device="cuda")

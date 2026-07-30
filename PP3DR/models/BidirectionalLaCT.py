@@ -192,6 +192,7 @@ class BidirectionalLaCT(torch.nn.Module):
             self,
             dim: int,
             num_heads: int,
+            num_registers: int = 5,
             inter_multi: float = 1, # Hidden dimension = head dimension * inter_multi.
             use_o_norm: bool = True,  # recommended to be True
             qk_l2_norm: bool = True,  # recommended to be True
@@ -201,7 +202,9 @@ class BidirectionalLaCT(torch.nn.Module):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
+        assert dim % num_heads == 0, f"{dim} % {num_heads} = {dim % num_heads}"
         self.head_dim = dim // num_heads
+        self.num_registers = num_registers
         self.inter_multi = inter_multi
         self.use_o_norm = use_o_norm
         self.qk_l2_norm = qk_l2_norm
@@ -215,9 +218,7 @@ class BidirectionalLaCT(torch.nn.Module):
 
         self.w0 = nn.Parameter(torch.randn(self.num_heads, d_h, d_in) / math.sqrt(d_in))
         self.w1 = nn.Parameter(torch.randn(self.num_heads, d_out, d_h) / math.sqrt(d_h))
-        self.w2 = nn.Parameter(
-            torch.randn(self.num_heads, d_h, d_in) / math.sqrt(d_in)
-        )
+        self.w2 = nn.Parameter(torch.randn(self.num_heads, d_h, d_in) / math.sqrt(d_in))
 
         self.use_muon = use_muon
 
@@ -270,49 +271,7 @@ class BidirectionalLaCT(torch.nn.Module):
         return output
 
 
-class GlobalLaCT(torch.nn.Module):
-    def __init__(
-            self,
-            dim: int,
-            num_heads: int,
-            num_registers: int = 5,
-            inter_multi: float = 1, # Hidden dimension = head dimension * inter_multi.
-            use_o_norm: bool = True,  # recommended to be True
-            qk_l2_norm: bool = True,  # recommended to be True
-            use_muon: bool = True,  # if your seq len > head_dim * 2, recommended to be True
-            layer_norm: Callable[..., nn.Module] = nn.LayerNorm,
-    ):
-        super().__init__()
-        self.dim = dim
-        assert dim % num_heads == 0
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.num_registers = num_registers
-        self.inter_multi = inter_multi
-        self.use_o_norm = use_o_norm
-        self.qk_l2_norm = qk_l2_norm
-
-        self.to_qkv = nn.Linear(dim, 3 * dim, bias=False)
-        self.o_proj = nn.Linear(dim, dim, bias=False)
-
-        # create initial fast weights
-        d_in, d_out = self.head_dim, self.head_dim
-        d_h = int(self.head_dim * self.inter_multi)
-
-        self.w0 = nn.Parameter(torch.randn(self.num_heads, d_h, d_in) / math.sqrt(d_in))
-        self.w1 = nn.Parameter(torch.randn(self.num_heads, d_out, d_h) / math.sqrt(d_h))
-        self.w2 = nn.Parameter(torch.randn(self.num_heads, d_h, d_in) / math.sqrt(d_in))
-
-        self.use_muon = use_muon
-
-        self.use_o_norm = use_o_norm
-        if self.use_o_norm:
-            self.o_norm = nn.RMSNorm(self.head_dim, eps=1e-5, elementwise_affine=True)
-        else:
-            self.o_norm = nn.Identity()
-
-        self.layer_norm = layer_norm(dim, bias=False) # New
-
+class GlobalLaCT(BidirectionalLaCT):
     def forward(self, x: torch.Tensor, rope3d, L) -> torch.Tensor:
         """
         GlobalBlock forward.
@@ -384,50 +343,7 @@ class GlobalLaCT(torch.nn.Module):
         return output # Output shape: (B, (L X), dim)
 
 
-class LocalLaCT(torch.nn.Module):
-    def __init__(
-            self,
-            dim: int,
-            num_heads: int,
-            num_registers: int = 5,
-            inter_multi: float = 1, # Hidden dimension = head dimension * inter_multi.
-            use_o_norm: bool = True,  # recommended to be True
-            qk_l2_norm: bool = True,  # recommended to be True
-            use_muon: bool = True,  # if your seq len > head_dim * 2, recommended to be True
-            layer_norm: Callable[..., nn.Module] = nn.LayerNorm,
-    ):
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.num_registers = num_registers
-        self.inter_multi = inter_multi
-        self.use_o_norm = use_o_norm
-        self.qk_l2_norm = qk_l2_norm
-
-        self.to_qkv = nn.Linear(dim, 3 * dim, bias=False)
-        self.o_proj = nn.Linear(dim, dim, bias=False)
-
-        # create initial fast weights
-        d_in, d_out = self.head_dim, self.head_dim
-        d_h = int(self.head_dim * self.inter_multi)
-
-        self.w0 = nn.Parameter(torch.randn(self.num_heads, d_h, d_in) / math.sqrt(d_in))
-        self.w1 = nn.Parameter(torch.randn(self.num_heads, d_out, d_h) / math.sqrt(d_h))
-        self.w2 = nn.Parameter(
-            torch.randn(self.num_heads, d_h, d_in) / math.sqrt(d_in)
-        )
-
-        self.use_muon = use_muon
-
-        self.use_o_norm = use_o_norm
-        if self.use_o_norm:
-            self.o_norm = nn.RMSNorm(self.head_dim, eps=1e-5, elementwise_affine=True)
-        else:
-            self.o_norm = nn.Identity()
-
-        self.layer_norm = layer_norm(dim, bias=False) # New
-
+class LocalLaCT(BidirectionalLaCT):
     def forward(self, x: torch.Tensor, rope2d, L) -> torch.Tensor:
         """
         LocalBlock forward.
@@ -478,6 +394,114 @@ class LocalLaCT(torch.nn.Module):
         output = self.o_proj(output)
         return output # Output shape: ((B L), X, dim)
 
+
+class BidirectionalLaCT_output_dim(torch.nn.Module):
+    def __init__(
+            self,
+            dim: int,
+            num_heads: int,
+            v_dim: int,  # NEW: Optional separate dimension for Values
+            num_registers: int = 5,
+            inter_multi: float = 1,  # Hidden dimension = head dimension * inter_multi.
+            use_o_norm: bool = True,  # recommended to be True
+            qk_l2_norm: bool = True,  # recommended to be True
+            use_muon: bool = True,  # if your seq len > head_dim * 2, recommended to be True
+            layer_norm: Callable[..., nn.Module] = nn.LayerNorm,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.v_dim = v_dim
+        self.num_registers = num_registers
+
+        assert dim % num_heads == 0, f"{dim} % {num_heads} = {dim % num_heads}"
+        assert self.v_dim % num_heads == 0, f"{self.v_dim} % {num_heads} = {self.v_dim % num_heads}"
+
+        self.head_dim = dim // num_heads
+        self.v_head_dim = self.v_dim // num_heads  # The per-head dimension for Values
+
+        self.inter_multi = inter_multi
+        self.use_o_norm = use_o_norm
+        self.qk_l2_norm = qk_l2_norm
+
+        # 1. Expand the linear projection to account for the custom V dimension
+        self.to_qkv = nn.Linear(dim, 2 * dim + self.v_dim, bias=False)
+
+        # 2. Output projection maps the aggregated V-dim back down to the model's base dim
+        self.o_proj = nn.Linear(self.v_dim, self.v_dim, bias=False)
+
+        # 3. Create initial fast weights.
+        # The Fast Weight MLP explicitly maps from K space (d_in) to V space (d_out)
+        d_in = self.head_dim
+        d_out = self.v_head_dim
+        d_h = int(self.head_dim * self.inter_multi)
+
+        self.w0 = nn.Parameter(torch.randn(self.num_heads, d_h, d_in) / math.sqrt(d_in))
+        self.w1 = nn.Parameter(torch.randn(self.num_heads, d_out, d_h) / math.sqrt(d_h))
+        self.w2 = nn.Parameter(torch.randn(self.num_heads, d_h, d_in) / math.sqrt(d_in))
+
+        self.use_muon = use_muon
+
+        self.use_o_norm = use_o_norm
+        if self.use_o_norm:
+            # Output normalization targets the new V head dimension
+            self.o_norm = nn.RMSNorm(self.v_head_dim, eps=1e-5, elementwise_affine=True)
+        else:
+            self.o_norm = nn.Identity()
+
+        self.layer_norm = layer_norm(dim, bias=False)
+
+    def forward(self, x: torch.Tensor, rope2d, L) -> torch.Tensor:
+        """
+        LocalBlock forward.
+        Input shape: (B, L, X, dim)
+        rope2d shape: 2 x (B * L, HW, hd)
+        Output shape: (B, L, X, dim)
+        rope2d: (B * L, HW, head_dim)
+        """
+        # Reshape x before doing anything else
+        x = x.flatten(start_dim=0, end_dim=1) # (B * L, X, dim)
+        BL, X = x.shape[:2]
+        x = self.layer_norm(x)  # New
+
+        # Single fused matmul for efficiency
+        qkv = F.silu(self.to_qkv(x), inplace=True).view(BL, X, 2 * self.dim + self.v_dim)
+        qk, v = qkv.split([2 * self.dim, self.v_dim], dim=-1) # (B * L, X, 2 * self.dim) and (B * L, X, self.v_dim)
+        q, k = qk.view(BL, X, 2, self.num_heads, self.head_dim).unbind(-3) # 2 x (B * L, X, nh, hd)
+        v = v.view(BL, X, self.num_heads, self.v_head_dim) # (B * L, X, nh, vhd)
+
+        if self.qk_l2_norm:
+            q = l2_norm(q)
+            k = l2_norm(k)
+
+        # (B * L, num_registers, nh, hd)
+        q_registers, k_registers = q[:, :self.num_registers, :, :], k[:, :self.num_registers, :, :]
+        # (B * L, HW, nh, hd)
+        q_tokens, k_tokens = q[:, self.num_registers:, :, :], k[:, self.num_registers:, :, :]
+
+        sin, cos = rope2d  # 2 x (B * L, HW, hd)
+        sin, cos = sin.unsqueeze(-2), cos.unsqueeze(-2)  # 2 x (B * L, HW, 1, hd)
+        rope_dtype = sin.dtype
+        q_tokens = rope_apply(q_tokens.to(dtype=rope_dtype), sin, cos).to(dtype=q.dtype)
+        k_tokens = rope_apply(k_tokens.to(dtype=rope_dtype), sin, cos).to(dtype=k.dtype)
+        q, k = torch.cat((q_registers, q_tokens), dim=-3), torch.cat((k_registers, k_tokens), dim=-3)
+
+        w0 = self.w0.repeat(BL, 1, 1)
+        w1 = self.w1.repeat(BL, 1, 1)
+        w2 = self.w2.repeat(BL, 1, 1)
+
+        # [b * num_heads, l, head_dim]
+        # bidirectional_lact_swiglu() expects q, k, and v to have shape (B, L, hd).
+        # In our case, that's (B L nh) X hd.
+        q = rearrange(q, "BL X nh hd -> (BL nh) X hd")
+        k = rearrange(k, "BL X nh hd -> (BL nh) X hd")
+        v = rearrange(v, "BL X nh vhd -> (BL nh) X vhd")
+        output = bidirectional_lact_swiglu(w0, w1, w2, q, k, v)
+
+        output = self.o_norm(output)
+        output = rearrange(output, "(B L nh) X vhd -> B L X (nh vhd)", L=L, nh=self.num_heads)
+        output = self.o_proj(output)
+        return output  # Output shape: (B, L, X, self.v_dim)
 
 def _test_layer():
     B, L, D, HeadDim = 4, 32768, 2048, 512
