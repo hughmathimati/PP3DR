@@ -12,11 +12,9 @@ from torch.utils.checkpoint import checkpoint
 try:
     from .BidirectionalLaCT import BidirectionalLaCT
     from .pos_embed import RopePositionEmbedding
-    from .Dinov3 import low_rank, write_to_image
 except:
     from BidirectionalLaCT import BidirectionalLaCT
     from pos_embed import RopePositionEmbedding
-    from Dinov3 import low_rank, write_to_image
 from xformers.ops import SwiGLU
 from timm.layers import DropPath
 

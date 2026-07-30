@@ -258,29 +258,6 @@ def prepare_dataloaders():
     return train_dataloader, val_dataloader
 
 
-# @torch.compile()
-# class ViTTT_Loss(nn.Module):
-#     """
-#     Huber angle loss.
-#     """
-#     def __init__(self):
-#         super().__init__()
-#         # default dim is 1, so we actually do have to explicitly pass this parameter.
-#         self.sim = nn.CosineSimilarity(dim=-1)
-#
-#     def forward(self, pred, gt):
-#         # Ignore the register tokens. pca_lowrank() to lower dino output to ViTTT dim.
-#         return F.huber_loss(
-#             torch.acos(
-#                 torch.clamp(
-#                     self.sim(pred, gt),
-#                     min=1e-5,
-#                     max=1 - 1e-5
-#                 )
-#             ),
-#             torch.zeros(*pred.shape[:2], device=accelerator.device)
-#         ).mean()
-
 @torch.compile()
 class ViTTT_Loss(nn.Module):
     """
