@@ -22,6 +22,7 @@ import os
 import threading
 import queue
 import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 import pickle
 import accelerate
@@ -32,13 +33,18 @@ from torch.utils.data import ConcatDataset, DataLoader
 accelerator = Accelerator(
     kwargs_handlers=[ProfileKwargs(activities=["cpu", "cuda"])],
     dataloader_config=DataLoaderConfiguration(non_blocking=True),
+    log_with="wandb",
+    gradient_accumulation_steps=4
     # project_config = ProjectConfiguration(
     #     project_dir = "/vulcanscratch/hughma/ViT/",
     # automatic_checkpoint_naming = True, # STRICTLY REQUIRED for total_limit to work
     # total_limit = 3
     # )
 )
-
+if accelerator.is_local_main_process:
+    accelerator.init_trackers(project_name="ViTTT")
+torch.cuda.set_device(accelerator.device)
+global_step = 0
 
 class State:
     def __init__(self, epochs):
@@ -64,29 +70,38 @@ class State:
 def train_on_dataset(name, iterator, dataloader):
     """dataloader parameter is solely for the tqdm progress bar."""
     # I'm basically just expecting python to correctly reference the non-parameter variables.
+    global global_step
     for batch in tqdm(
             iterator, desc=name, disable=not accelerator.is_local_main_process, total=len(dataloader), mininterval = 1
     ):
-        # Accelerate automatically handles autocast.
-        # torch.no_grad() is included inside obtain_features().
-        # with torch.profiler.record_function("dino_train_inference"):
-        gt = obtain_features(processor, dino, batch.to(accelerator.device, non_blocking=True))
-        # with torch.profiler.record_function("ViTTT_train_inference"):
-        pred = ViTTT_model(batch.to(accelerator.device, non_blocking=True))[:, 5:] # Discard register tokens
-        loss = metric(pred, gt)
-        state.train_losses[state.epoch - 1] += loss.detach()
-        AdamW.zero_grad()
-        Muon.zero_grad()
-        accelerator.backward(loss)
-        # Clamps the total norm of the gradients to 1.0
-        torch.nn.utils.clip_grad_norm_(ViTTT_model.parameters(), max_norm=1.0)
-        AdamW.step()
-        Muon.step()
-        AdamW_scheduler.step()
-        Muon_scheduler.step()
+        with accelerator.accumulate(ViTTT_model):
+            # Accelerate automatically handles autocast.
+            # torch.no_grad() is included inside obtain_features().
+            # with torch.profiler.record_function("dino_train_inference"):
+            gt = obtain_features(processor, dino, batch.to(accelerator.device, non_blocking=True))
+            # with torch.profiler.record_function("ViTTT_train_inference"):
+            pred = ViTTT_model(batch.to(accelerator.device, non_blocking=True))[:, 5:] # Discard register tokens
+            loss = metric(pred, gt)
+            detached = loss.detach()
+            state.train_losses[state.epoch - 1] += detached
+            AdamW.zero_grad()
+            Muon.zero_grad()
+            accelerator.backward(loss)
+            # Clamps the total norm of the gradients to 1.0
+            torch.nn.utils.clip_grad_norm_(ViTTT_model.parameters(), max_norm=1.0)
+            AdamW.step()
+            Muon.step()
+            AdamW_scheduler.step()
+            Muon_scheduler.step()
+
+        # Log to WandB once per batch
+        if accelerator.is_local_main_process:
+            accelerator.log({"Train loss": detached}, step=global_step)
+            global_step += 1
 
 
 def val_on_dataset(name, iterator, dataloader):
+    global global_step
     for batch in tqdm(
             iterator, desc=f"Validation {name}", disable=not accelerator.is_local_main_process, total=len(dataloader), mininterval = 1
     ):
@@ -97,6 +112,11 @@ def val_on_dataset(name, iterator, dataloader):
         # with torch.profiler.record_function("ViTTT_val_inference"):
         pred = ViTTT_model(batch.to(accelerator.device, non_blocking=True))[:, 5:] # Discard register tokens
         state.val_losses[state.epoch - 1] += metric(pred, gt).detach()
+
+    # Log to WandB once per epoch
+    if accelerator.is_local_main_process:
+        accelerator.log({f"Val loss": state.val_losses[state.epoch - 1] / len_dataloader}, step=global_step)
+        global_step += 1
 
 
 def get_vittt_param_groups(model: nn.Module, adamw_lr: float = 1e-4, muon_lr: float = 1e-3,
@@ -196,41 +216,69 @@ def initialize(epochs, pretrained_path = None):
 
 
 def prepare_dataloaders():
+    constructed = []
+    train_datasets = [
+        nrgbd_dataset,
+        flying_things_3d_dataset,
+        dynamic_replica_dataset,
+        mega_depth_dataset,
+        object_net_dataset,
+        eth3d_dataset,
+        from_games_dataset,
+        open_images_dataset,
+        youtube_vis_dataset
+    ]
+    with ThreadPoolExecutor() as executor:
+        tasks = [executor.submit(dataset) for dataset in train_datasets]
+
+        # Concurrently load Sintel while we're waiting.
+        val_dataloader = DataLoader(
+            sintel_dataset(),
+            batch_size=16,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True,
+            persistent_workers=True,
+        )
+
+        for completed in as_completed(tasks):
+            constructed.append(completed.result())
+
     train_dataloader = DataLoader(
-        ConcatDataset([
-            nrgbd_dataset(),
-            flying_things_3d_dataset(),
-            dynamic_replica_dataset(),
-            mega_depth_dataset(),
-            object_net_dataset(),
-            eth3d_dataset(),
-            from_games_dataset(),
-            open_images_dataset(),
-            youtube_vis_dataset()
-        ]),
-        batch_size=128, # is 128 any better than 64?
+        ConcatDataset(constructed),
+        # Batch size of 6 sequences, each with 10 images (60 images total)
+        batch_size=128,
         shuffle=True,  # Critical: Shuffles across all domains!
         num_workers=16,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=True,
     )
-
-    # 1024 x 436
-    val_dataloader = DataLoader(sintel_dataset(), batch_size=16, shuffle=False, num_workers=4,
-                                                 persistent_workers=True, pin_memory=True)
 
     return train_dataloader, val_dataloader
 
 
 @torch.compile()
-class CosineLoss(nn.Module):
+class ViTTT_Loss(nn.Module):
+    """
+    Huber angle loss.
+    """
     def __init__(self):
         super().__init__()
-        self.sim = nn.CosineSimilarity(
-            dim=-1)  # default dim is 1, so we actually do have to explicitly pass this parameter.
+        # default dim is 1, so we actually do have to explicitly pass this parameter.
+        self.sim = nn.CosineSimilarity(dim=-1)
 
     def forward(self, pred, gt):
         # Ignore the register tokens. pca_lowrank() to lower dino output to ViTTT dim.
-        return 1 - self.sim(pred, gt).mean()
+        return F.huber_loss(
+            torch.acos(
+                torch.clamp(
+                    self.sim(pred, gt),
+                    min=1e-5,
+                    max=1 - 1e-5
+                )
+            ),
+            torch.zeros(*pred.shape[:2], device=accelerator.device)
+        ).mean()
 
 
 if __name__ == "__main__":
@@ -250,7 +298,7 @@ if __name__ == "__main__":
     # ProcessPoolExecutor -> Cannot re-initialize CUDA in forked subprocess.
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = [executor.submit(job) for job in jobs]
-        metric = CosineLoss()
+        metric = ViTTT_Loss()
         # futures.as_completed returns futures in the order they complete, not their original order.
         for future in concurrent.futures.as_completed(futures):
             match futures.index(future):

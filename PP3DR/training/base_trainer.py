@@ -72,7 +72,7 @@ class BaseTrainer:
         self.accelerator = Accelerator(
             # kwargs_handlers=[ProfileKwargs(activities=["cpu", "cuda"])],
             dataloader_config=DataLoaderConfiguration(non_blocking=True),
-            log_with="wandb", project_dir="/vulcanscratch/hughma/PP3DR/tensorboard",
+            log_with="wandb",
             gradient_accumulation_steps=gradient_accumulation_steps
         )
         if self.accelerator.is_local_main_process:
@@ -218,8 +218,8 @@ class BaseTrainer:
 
     def get_param_groups(self,
                                model: nn.Module,
-                               adamw_lr: float = 1e-4,
-                               muon_lr: float = 1e-3,
+                               adamw_lr: float = 1e-5,
+                               muon_lr: float = 1e-4, # NOTE: I'm experimenting by replacing 1e-3, 1e-4 with 1e-4, 1e-5
                                weight_decay: float = 0.04,
                                layer_decay: float = 0.95,
                                num_layers: int = 40 # 36 blocks + 4 blocks in each per-task head

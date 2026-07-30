@@ -28,7 +28,7 @@ if __name__ == "__main__":
     SanityTrainer(
         model=PP3DR,
         loss=PP3DR_loss,
-        name="TTT-depth-proj",
+        name="1e-4_1e-5",
         epochs=1000,
         checkpoint_every=500,
         batch_size=5,

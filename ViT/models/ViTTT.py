@@ -68,6 +68,8 @@ class ViTTT(nn.Module):
         self.class_and_registers = nn.Parameter(torch.randn(num_registers, dim) * 0.02)
         self.final_layer_norm = nn.LayerNorm(dim)
         self.start_checkpointing = start_checkpointing
+        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
     def patch_embed(self, x):
         # B, 3, H, W -> B, dim, H // 16, W // 16 -> B, HW // 256, dim
@@ -86,6 +88,7 @@ class ViTTT(nn.Module):
         # We'll handle shapes not divisible by 16 during data processing, as DINO also doesn't handle this.
         # assert len(x.shape) == 4, f"x.shape should have length 4, but is instead {x.shape}"
         B, C, H, W = x.shape
+        x = (x - self.mean) / self.std
         x = self.patch_embed(x)
         rope = self.rope(H // 16, W // 16)
         """

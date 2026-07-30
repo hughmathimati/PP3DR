@@ -66,7 +66,7 @@ class PP3DR_loss(nn.Module):
     """
     def __init__(self,
         scale = False,
-        median_depth = 10,
+        median_depth = 1,
     ):
         super().__init__()
         self.scale = scale
