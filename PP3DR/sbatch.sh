@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=sanity
-#SBATCH --output=sanity-%j.out
+#SBATCH --job-name=LLS-2g
+#SBATCH --output=LLS-2g-%j.out
 #SBATCH --partition=vulcan-ampere
 #SBATCH --ntasks 1
 #SBATCH --cpus-per-task=64
@@ -8,7 +8,7 @@
 #SBATCH --gres=gpu:h200-sxm:4
 #SBATCH --account=vulcan-jbhuang
 #SBATCH --qos=vulcan-high-h200
-#SBATCH --time=3:00:00
+#SBATCH --time=36:00:00
 
 #set -x
 
@@ -20,4 +20,4 @@ cd /vulcanscratch/hughma/PP3DR/
 module load gcc
 module load cuda
 export PYTORCH_ALLOC_CONF=expandable_segments:True
-accelerate launch training/PP3DR_sanity.py # Don't forget you need to `accelerate launch`, not just `python`!!!
+accelerate launch training/PP3DR_trainer.py # Don't forget you need to `accelerate launch`, not just `python`!!!

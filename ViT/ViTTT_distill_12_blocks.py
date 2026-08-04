@@ -1,4 +1,4 @@
-name = "12_blocks"
+name = "huber-norm"
 import transformers.optimization
 from models.ViTTT import ViTTT
 from models.Dinov3 import load_dinov3, obtain_features
@@ -120,7 +120,7 @@ def val_on_dataset(name, iterator, dataloader):
         global_step += 1
 
 
-def get_vittt_param_groups(model: nn.Module, adamw_lr: float = 1e-4, muon_lr: float = 1e-3,
+def get_vittt_param_groups(model: nn.Module, adamw_lr: float = 2e-4, muon_lr: float = 2e-3,
                            weight_decay: float = 0.04, layer_decay: float = 0.9,
                            num_layers: int = 24):
     """
@@ -269,7 +269,17 @@ class ViTTT_Loss(nn.Module):
         self.sim = nn.CosineSimilarity(dim=-1)
 
     def forward(self, pred, gt):
-        return 1 - self.sim(pred, gt).mean()
+        # Ignore the register tokens. pca_lowrank() to lower dino output to ViTTT dim.
+        return F.huber_loss(
+            torch.acos(
+                torch.clamp(
+                    self.sim(pred, gt),
+                    min=1e-5,
+                    max=1 - 1e-5
+                )
+            ),
+            torch.zeros(*pred.shape[:2], device=accelerator.device)
+        ).mean()
 
 
 if __name__ == "__main__":

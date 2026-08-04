@@ -4,7 +4,7 @@
 #SBATCH --partition=vulcan-ampere
 #SBATCH --ntasks 1
 #SBATCH --cpus-per-task=64
-#SBATCH --mem=256gb
+#SBATCH --mem=512gb
 #SBATCH --gres=gpu:h200-sxm:4
 #SBATCH --account=vulcan-jbhuang
 #SBATCH --qos=vulcan-high-h200

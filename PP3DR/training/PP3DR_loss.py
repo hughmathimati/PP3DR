@@ -10,10 +10,12 @@ import math
 
 
 def _smooth(err: torch.Tensor, beta: float = 0.0) -> torch.Tensor:
-    if beta == 0:
-        return err
-    else:
-        return torch.where(err < beta, 0.5 * err.square() / beta, err - 0.5 * beta)
+    # if beta == 0:
+    #     return err
+    # else:
+    #     return torch.where(err < beta, 0.5 * err.square() / beta, err - 0.5 * beta)
+    # NOTE: I'm experimenting with L1 + MSE.
+    return err**2
 
 
 def angle_diff_vec3(v1: torch.Tensor, v2: torch.Tensor, eps: float = 1e-8):
@@ -66,7 +68,7 @@ class PP3DR_loss(nn.Module):
     """
     def __init__(self,
         scale = False,
-        median_depth = 1,
+        median_depth = 10,
     ):
         super().__init__()
         self.scale = scale
@@ -228,11 +230,12 @@ class PP3DR_loss(nn.Module):
         Weighted Huber loss for 3D point coordinates (per-frame, in camera coordinates)
         """
         B, L, H, W = pred_points.shape[:4]
-        total_point_loss = F.huber_loss(
+        total_point_loss = F.l1_loss(
             (pred_points * scale.view(B, 1, 1, 1, 1)),
             gt_points,
             reduction='none'
         ) * weights.view(B, L, H, W, 1)  # Broadcasts against all 3 coordinates of each point.
+        # total_point_loss = ((pred_points * scale.view(B, 1, 1, 1, 1) - gt_points)**2 * weights.view(B, L, H, W, 1))
         # We shouldn't have to masked_fill() total_point_loss here, as pred and gt should all be valid by this point.
         return total_point_loss.sum() / (gt_valid_depth_mask.sum() * 3)  # *3 for x, y, and z
 
@@ -310,14 +313,21 @@ class PP3DR_loss(nn.Module):
         mask_dy = valid_mask[..., 1:, :] & valid_mask[..., :-1, :]
         mask_dx = valid_mask[..., :, 1:] & valid_mask[..., :, :-1]
 
-        # 4. Calculate the L1 loss between the gradients
-        # We use L1 instead of MSE to heavily penalize sharp boundary cliffs (mosaic artifacts)
-        loss_dy = F.huber_loss(pred_dy[mask_dy], gt_dy[mask_dy], reduction='mean')
-        loss_dx = F.huber_loss(pred_dx[mask_dx], gt_dx[mask_dx], reduction='mean')
+        loss_dy = F.l1_loss(pred_dy[mask_dy], gt_dy[mask_dy], reduction='mean')
+        loss_dx = F.l1_loss(pred_dx[mask_dx], gt_dx[mask_dx], reduction='mean')
+        loss_dy = loss_dy + F.mse_loss(pred_dy[mask_dy], gt_dy[mask_dy])
+        loss_dx = loss_dx + F.mse_loss(pred_dx[mask_dx], gt_dx[mask_dx])
 
         # Optional: You can also weight these by the distance from edges, but standard L1
         # usually smooths out the 16x16 grid effectively.
         return loss_dy + loss_dx
+
+    def depth_loss(self, pred_depth, gt_depth, valid_mask):
+        """
+        L1 loss on raw depths.
+        """
+        return F.l1_loss(pred_depth[valid_mask], gt_depth[valid_mask], reduction='mean') + F.mse_loss(pred_depth[valid_mask], gt_depth[valid_mask], reduction='mean')
+        # return F.mse_loss(pred_depth[valid_mask], gt_depth[valid_mask], reduction='mean')
 
     def translation_loss(self, pred, gt_relative_translations, scale, median_depths):
         """
@@ -386,16 +396,6 @@ class PP3DR_loss(nn.Module):
         -------
         A single scalar, representing the loss.
         """
-        # First of all, check the model predictions for infs and nans.
-        # torch._assert(
-        #     (~pred['XY_rays'].isfinite()).sum() + (~pred['log_depths'].isfinite()).sum()
-        #     + (~pred['relative_camera_translations'].isfinite()).sum()
-        #     + (~pred['relative_camera_rotations'].isfinite()).sum() == 0,
-        #     f"Pred has invalid values. XY_rays: {(~pred['XY_rays'].isfinite()).sum()}, "
-        #     f"log_depths: {(~pred['log_depths'].isfinite()).sum()}, "
-        #     f"relative_camera_translations: {(~pred['relative_camera_translations'].isfinite()).sum()}, "
-        #     f"relative_camera_rotations: {(~pred['relative_camera_rotations'].isfinite()).sum()}"
-        # )
         invalid_dict = {k: 0 if v is None else (~v.isfinite()).sum() for k, v in pred.items()}
         torch._assert(
             sum(invalid_dict.values()) == 0,
@@ -409,6 +409,8 @@ class PP3DR_loss(nn.Module):
         #     point_loss.isfinite(),
         #     f"Point loss invalid ({point_loss})\ttotal_point_loss = {total_point_loss}"
         # )
+        gt_log_depths = torch.log(gt['depths'])
+        depth_loss = self.depth_loss(pred['log_depths'], gt_log_depths, gt_valid_depth_mask)
 
         normal_loss = self.normal_loss(
             points=pred_points,
@@ -417,7 +419,7 @@ class PP3DR_loss(nn.Module):
             gt_depths=gt['depths']
         )
 
-        gradient_matching_loss = self.gradient_matching_loss(torch.exp(pred['log_depths']), gt['depths'], gt_valid_depth_mask)
+        gradient_matching_loss = self.gradient_matching_loss(pred['log_depths'], gt_log_depths, gt_valid_depth_mask)
 
         gt_relative_rotations, gt_relative_translations = self.obtain_gt_relative_poses(gt['extrinsics'])
 
@@ -427,11 +429,12 @@ class PP3DR_loss(nn.Module):
         rotation_loss = self.rotation_loss(pred, gt_relative_rotations)
         torch._assert(rotation_loss.isfinite(), f"Rotation loss invalid ({rotation_loss})")
 
-        total_loss = point_loss + 10 * gradient_matching_loss + 0.1 * normal_loss + translation_loss + rotation_loss
-        # total_loss = 10 * point_loss + 0.1 * normal_loss
+        # point_loss, gradient_matching_loss, and translation_loss are all huber. depth_loss is L1.
+        total_loss = point_loss + depth_loss + gradient_matching_loss + normal_loss + translation_loss + rotation_loss
         return total_loss, dict(
             total_loss=total_loss,
             point_loss=point_loss,
+            depth_loss=depth_loss,
             normal_loss=normal_loss,
             gradient_matching_loss=gradient_matching_loss,
             translation_loss=translation_loss,

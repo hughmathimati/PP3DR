@@ -1,8 +1,13 @@
 from training.base_trainer import BaseTrainer
-from models.PP3DR_depth_focal import PP3DR
+from models.PP3DR import PP3DR
+from models.post_proj_res_conv import post_proj_res_conv
 from training.PP3DR_depth_focal_loss import PP3DR_loss
 from datasets.nrgbd_dataset import nrgbd_dataset
-import torch
+from datasets.dtu_dataset import dtu_dataset
+from datasets.dynamic_replica_dataset import dynamic_replica_dataset
+from datasets.eth3d_dataset import eth3d_dataset
+from datasets.flying_things_3d_dataset import flying_things_3d_dataset
+from datasets.sintel_dataset import sintel_dataset
 
 class SanityTrainer(BaseTrainer):
     def per_epoch(self):
@@ -16,8 +21,7 @@ class SanityTrainer(BaseTrainer):
             print(f"Epoch {self.state.epoch}/{self.epochs}:")
 
         self.PP3DR_model.train()
-        with torch.profiler.record_function("training"):
-            self.train_on_dataset("Combined train set", self.train_iter, self.train_dataloader)
+        self.train_on_dataset("Combined train set", self.train_iter, self.train_dataloader)
 
         if self.state.epoch != self.epochs:
             self.train_iter = iter(self.train_dataloader)
@@ -28,11 +32,12 @@ if __name__ == "__main__":
     SanityTrainer(
         model=PP3DR,
         loss=PP3DR_loss,
-        name="1e-4_1e-5",
+        name="LDD-Sn-1000-finetune",
         epochs=1000,
-        checkpoint_every=500,
-        batch_size=5,
+        pretrained_path="/vulcanscratch/hughma/PP3DR/LLL-1000-finetune/PP3DR.pth",
+        checkpoint_every=1000, # MUST checkpoint before saving files. Also just good practice.
+        freeze_feature_extractor=False,
+        use_muon=False,
         gradient_accumulation_steps=1,
-        start_checkpointing=6,
         train_datasets=[nrgbd_dataset],
     )

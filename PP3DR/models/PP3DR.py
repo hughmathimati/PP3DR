@@ -91,6 +91,7 @@ class DepthFocalHead(nn.Module):
     ):
         super().__init__()
         assert blocks % 2 == 0, f"Number of decoder blocks ({blocks}) must be even for alternating global and frame-wise attention"
+        self.blocks = blocks
         self.blocks_each = blocks // 2
         self.input_proj = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
         self.hidden_dim = hidden_dim
@@ -103,9 +104,8 @@ class DepthFocalHead(nn.Module):
         self.registers_layer_norm = nn.LayerNorm(hidden_dim)  # Pre-projection layer norm.
         self.tokens_layer_norm = nn.LayerNorm(hidden_dim)  # Pre-projection layer norm.
         self.focal_proj = nn.Linear(num_registers * hidden_dim, 4)  # fx, fy, cx, cy
-        self.depths_proj = nn.Linear(hidden_dim, 256)
+        self.depths_proj = SwiGLU(in_features=hidden_dim, hidden_features=hidden_dim, out_features=256)
         self.num_registers = num_registers
-        self.num_blocks = blocks
 
     def forward(self, x: torch.Tensor, rope2d, rope3d, L, H, W) -> torch.Tensor:
         """
@@ -231,12 +231,16 @@ class PP3DR(nn.Module):
             start_checkpointing=6,  # How many blocks EACH to checkpoint (total # is twice as many).
             freeze_feature_extractor=True,
             PP3DR_drop_rates=None,
-            ViTTT_drop_rates=None
+            ViTTT_drop_rates=None,
+            point_head_class=DepthFocalHead,
+            pose_head_class=PoseHead
     ):
         super().__init__()
         assert decoder_blocks % 2 == 0, f"Number of decoder blocks ({decoder_blocks}) must be even for alternating global and frame-wise attention"
+        self.decoder_blocks = decoder_blocks
         self.blocks_each = decoder_blocks // 2
-        self.start_checkpointing = start_checkpointing
+        # If we're unfreezing ViTTT, we'll be checkpointing its first 6 blocks rather than our first 6 blocks.
+        self.start_checkpointing = start_checkpointing if freeze_feature_extractor else 0
 
         # General decoder
         self.dim = dim
@@ -252,8 +256,6 @@ class PP3DR(nn.Module):
             LocalBlock(dim, num_heads, ffn_ratio, drop_rates[2 * i + 1])
             for i in range(self.blocks_each)
         ])
-        # The first layer norm of the first block comes immediately after ViTTT's final layer norm.
-        self.global_blocks[0].layer_norm_1 = nn.Identity()
 
         # We don't store num_registers here. It gets stored in the decoder heads.
         self.rope2d = Rope2D(embed_dim=dim, num_heads=num_heads, device="cuda")
@@ -272,16 +274,13 @@ class PP3DR(nn.Module):
         self.num_registers = num_registers
 
         # Per-task decoders
-        """
-        The point decoder will predict a depth-normalised XY ray direction (X/Z and Y/Z), along with log depth.
-        """
-        self.depth_focal_decoder = DepthFocalHead()
+        self.point_head = point_head_class()
         """
         The camera decoder will predict the relative SE3 transformation to the next frame.
         We are parameterizing our camera with three scalars for the translation and six scalars for the rotation.
         Details of how the rotation prediction works are in the forward() method.
         """
-        self.pose_decoder = PoseHead()
+        self.pose_head = pose_head_class()
 
     def train(self, mode=True):
         super().train(mode)
@@ -356,9 +355,9 @@ class PP3DR(nn.Module):
         # x.shape == (B * L, num_registers + HW // 256, 2 * dim)
 
         # Step 2: Per-task decoders
-        log_depths, fx, fy, cx, cy = self.depth_focal_decoder(x, rope2d, rope3d, L, H, W)
+        log_depths, fx, fy, cx, cy = self.point_head(x, rope2d, rope3d, L, H, W)
         # We're predicting the relative pose from this frame to the next one, which is why our sequence length is L - 1.
-        poses = self.pose_decoder(x, rope2d, rope3d, L)[:, :-1]  # (B, L - 1, 9)
+        poses = self.pose_head(x, rope2d, rope3d, L)[:, :-1]  # (B, L - 1, 9)
 
         # Get the rotation matrix by orthogonalizing the first two 3D vectors, then taking the cross product for the third.
         # We're going to construct the actual columns as rows of the current matrix, then take the transpose at the end.
