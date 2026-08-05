@@ -1,6 +1,5 @@
 from training.base_trainer import BaseTrainer
 from models.PP3DR import PP3DR
-from models.post_proj_res_conv import post_proj_res_conv
 from training.PP3DR_depth_focal_loss import PP3DR_loss
 from datasets.nrgbd_dataset import nrgbd_dataset
 from datasets.dtu_dataset import dtu_dataset
@@ -32,12 +31,13 @@ if __name__ == "__main__":
     SanityTrainer(
         model=PP3DR,
         loss=PP3DR_loss,
-        name="LDD-Sn-1000-finetune",
-        epochs=1000,
-        pretrained_path="/vulcanscratch/hughma/PP3DR/LLL-1000-finetune/PP3DR.pth",
-        checkpoint_every=1000, # MUST checkpoint before saving files. Also just good practice.
-        freeze_feature_extractor=False,
+        name="LDD-INR-swiglu-only",
+        epochs=500,
+        # pretrained_path="/vulcanscratch/hughma/PP3DR/LLL-1000-finetune/PP3DR.pth",
+        checkpoint_every=500, # MUST checkpoint before saving files. Also just good practice.
+        # freeze_feature_extractor=False,
         use_muon=False,
         gradient_accumulation_steps=1,
+        start_checkpointing=4,
         train_datasets=[nrgbd_dataset],
     )
