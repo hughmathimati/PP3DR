@@ -59,7 +59,7 @@ class ViTTT(nn.Module):
             # batch size every time I change freeze_feature_extractor.
             # Once I start doing long-sequence-length finetuning, I will almost certainly decrease this to maximize the
             # sequence length I can pass in.
-            start_checkpointing = 8,
+            start_checkpointing = 6,
             drop_rates = None
     ):
         super().__init__()

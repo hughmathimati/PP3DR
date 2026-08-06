@@ -51,7 +51,7 @@ class BaseTrainer:
                  loss,
                  name="checkpoints",
                  epochs=50,
-                 checkpoint_every=10,
+                 checkpoint_every=20,
                  pretrained_path=None,
                  checkpoint=None,
                  strict=True,

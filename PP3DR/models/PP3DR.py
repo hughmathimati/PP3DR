@@ -78,48 +78,6 @@ class LocalBlock(nn.Module):
         return x
 
 
-class FactorizedSwiGLUINR(nn.Module):
-    def __init__(self, token_dim, hidden_dim, out_dim, grid_dim=2):
-        super().__init__()
-
-        # 1. Factorize the Gate Projection
-        self.gate_token = nn.Linear(token_dim, hidden_dim, bias=True)
-        self.gate_grid = nn.Linear(grid_dim, hidden_dim, bias=False)  # Bias in token is enough
-
-        # 2. Factorize the Value Projection
-        self.val_token = nn.Linear(token_dim, hidden_dim, bias=True)
-        self.val_grid = nn.Linear(grid_dim, hidden_dim, bias=False)
-
-        # 3. Final Output Projection
-        self.out_proj = nn.Linear(hidden_dim, out_dim)
-
-    def forward(self, tokens, grid):
-        """
-        tokens: (B, L, Patches, 1280)
-        grid: (256, 2)
-        """
-
-        # --- COMPUTE THE GATE ---
-        # Project isolated components
-        gate_t = self.gate_token(tokens)  # (B, L, Patches, hidden_dim)
-        gate_g = self.gate_grid(grid)  # (256, hidden_dim)
-
-        # Broadcast Addition: Fuses them into (B, L, Patches, 256, hidden_dim)
-        gate = gate_t.unsqueeze(-2) + gate_g.view(1, 1, 1, 256, -1)
-
-        # --- COMPUTE THE VALUE ---
-        val_t = self.val_token(tokens)
-        val_g = self.val_grid(grid)
-        val = val_t.unsqueeze(-2) + val_g.view(1, 1, 1, 256, -1)
-
-        # --- SWIGLU FUSION ---
-        hidden = F.silu(gate) * val
-
-        # --- FINAL OUTPUT ---
-        # Shape: (B, L, Patches, 256, out_dim)
-        return self.out_proj(hidden)
-
-
 @torch.compile()
 class DepthFocalHead(nn.Module):
     def __init__(
@@ -146,14 +104,10 @@ class DepthFocalHead(nn.Module):
         self.registers_layer_norm = nn.LayerNorm(hidden_dim)  # Pre-projection layer norm.
         self.tokens_layer_norm = nn.LayerNorm(hidden_dim)  # Pre-projection layer norm.
         self.focal_proj = nn.Linear(num_registers * hidden_dim, 4)  # fx, fy, cx, cy
-        # self.grid_proj = nn.Linear(2, 256)
+        self.grid_proj = nn.Linear(2, 256)
         # self.tokens_proj = nn.Linear(hidden_dim, 256)
-        # self.depths_proj = SwiGLU(in_features=256, hidden_features=256, out_features=1)
-        # self.depths_proj = nn.Sequential(
-        #     nn.GELU(),
-        #     nn.Linear(256, 1)
-        # )
-        self.depth_proj = FactorizedSwiGLUINR(hidden_dim, 256, 1)
+        self.tokens_proj = SwiGLU(in_features=hidden_dim, hidden_features=hidden_dim, out_features=256)
+        self.depths_proj = SwiGLU(in_features=256, hidden_features=256, out_features=1)
 
         self.num_registers = num_registers
         self.register_buffer("local_grid", self.generate_local_grid(16))
@@ -200,9 +154,8 @@ class DepthFocalHead(nn.Module):
 
         tokens = self.tokens_layer_norm(x[:, :, self.num_registers:, :])  # (B, L, HW // 256, dim)
         # self.tokens_proj(tokens) is (B, L, HW // 256, 256). self.grid_proj(self.local_grid) is (256, 256).
-        # hidden = self.tokens_proj(tokens).unsqueeze(-2) + self.grid_proj(self.local_grid).view(1, 1, 1, 256, 256)
-        # log_depths = self.depths_proj(hidden) # (B, L, HW // 256, 256, 1)
-        log_depths = self.depth_proj(tokens, self.local_grid) # (B, L, HW // 256, 256, 1)
+        hidden = self.tokens_proj(tokens).unsqueeze(-2) + self.grid_proj(self.local_grid).view(1, 1, 1, 256, 256)
+        log_depths = self.depths_proj(F.silu(hidden)) # (B, L, HW // 256, 256, 1)
         # We must take into account that each token represents the 16x16 patch at that location.
         # Naively rearranging leads to each 16x16 patch being mapped to a contiguous line of 256 pixels.
         log_depths = rearrange(
