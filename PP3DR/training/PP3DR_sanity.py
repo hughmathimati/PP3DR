@@ -1,6 +1,6 @@
 from training.base_trainer import BaseTrainer
 from models.PP3DR import PP3DR
-from models.PP3DR_full_swiglu import FullSwiGLU
+from models.mixed_head import PP3DR_mixed_head
 from training.PP3DR_depth_focal_loss import PP3DR_loss
 from datasets.nrgbd_dataset import nrgbd_dataset
 from datasets.dtu_dataset import dtu_dataset
@@ -30,16 +30,14 @@ class SanityTrainer(BaseTrainer):
 
 if __name__ == "__main__":
     SanityTrainer(
-        model=PP3DR,
-        # model=FullSwiGLU,
+        model=PP3DR_mixed_head,
         loss=PP3DR_loss,
-        name="LDD-INR-DS-1000-finetune",
+        name="LDD-1000-mixed-2-8",
         epochs=1000,
-        pretrained_path="/vulcanscratch/hughma/PP3DR/LDD-INR-DS-1000/PP3DR.pth",
         checkpoint_every=1000, # MUST checkpoint before saving files. Also just good practice.
-        freeze_feature_extractor=False,
+        # pretrained_path="/vulcanscratch/hughma/PP3DR/LDD-1000-new-upscale-ls/PP3DR.pth",
+        # freeze_feature_extractor=False,
         use_muon=False,
         gradient_accumulation_steps=1,
-        # start_checkpointing=3, # 3 for DS and 5 for FS
         train_datasets=[nrgbd_dataset],
     )

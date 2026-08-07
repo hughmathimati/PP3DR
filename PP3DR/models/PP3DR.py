@@ -16,7 +16,6 @@ from xformers.ops import SwiGLU
 from timm.layers import DropPath
 
 
-@torch.compile()
 class LayerScale(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -26,7 +25,6 @@ class LayerScale(nn.Module):
         return self.scale * x
 
 
-@torch.compile()
 class GlobalBlock(nn.Module):
     def __init__(self, dim, num_heads, ffn_ratio, drop_path=0):
         super().__init__()
@@ -78,7 +76,63 @@ class LocalBlock(nn.Module):
         return x
 
 
-@torch.compile()
+class PointwiseSwiGLU(nn.Module):
+    """
+    Mathematically identical to a standard Linear SwiGLU, but uses
+    1x1 Convolutions so it can operate directly on (B, C, H, W) spatial maps.
+    """
+    def __init__(self, in_features, hidden_features, out_features):
+        super().__init__()
+        self.gate_proj = nn.Conv2d(in_features, hidden_features, kernel_size=1)
+        self.val_proj = nn.Conv2d(in_features, hidden_features, kernel_size=1)
+        self.out_proj = nn.Conv2d(hidden_features, out_features, kernel_size=1)
+
+    def forward(self, x):
+        gate = self.gate_proj(x)
+        val = self.val_proj(x)
+        hidden = F.silu(gate) * val
+        return self.out_proj(hidden)
+
+
+class UpscaleBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, upscale_dim):
+        super().__init__()
+        self.upscale_dim = upscale_dim
+        self.initial_proj = PointwiseSwiGLU(in_features=in_channels, hidden_features=in_channels, out_features=out_channels)
+        self.residual = nn.ConvTranspose2d(in_channels=in_channels, out_channels=out_channels, kernel_size=upscale_dim, stride=upscale_dim)
+        self.residual_ls = LayerScale([out_channels, 1, 1])  # Along the channel dimension
+
+    def forward(self, x):
+        upscaled = F.interpolate(
+            self.initial_proj(x),
+            scale_factor=self.upscale_dim,
+            mode='bilinear',
+            align_corners=False
+        )
+        return upscaled + self.residual_ls(self.residual(x))
+
+
+class DepthProj(nn.Module):
+    def __init__(self, dim=1280, hidden_dim=16):
+        super().__init__()
+        self.initial_proj = PointwiseSwiGLU(in_features=dim, hidden_features=dim, out_features=hidden_dim)
+        self.residual = nn.ConvTranspose2d(in_channels=1280, out_channels=hidden_dim, kernel_size=16, stride=16)
+        self.residual_ls = LayerScale([hidden_dim, 1, 1]) # Along the channel dimension
+        self.final_proj = PointwiseSwiGLU(in_features=hidden_dim, hidden_features=hidden_dim, out_features=1)
+
+    def forward(self, x):
+        # (B, L, H // 16, W // 16, dim) -> (B, L, H // 16, W // 16, hidden_dim) -> (B, L, H, W, hidden_dim)
+        B = x.shape[0]
+        x = rearrange(x, "B L H_p W_p dim -> (B L) dim H_p W_p")
+        upscaled = F.interpolate(
+            self.initial_proj(x),
+            scale_factor=16,
+            mode='bilinear',
+            align_corners=False
+        )
+        x = upscaled + self.residual_ls(self.residual(x))
+        return rearrange(self.final_proj(x), "(B L) C H W -> B L H W C", B=B) # (B, L, H, W, 1)
+
 class DepthFocalHead(nn.Module):
     def __init__(
             self,
@@ -104,21 +158,8 @@ class DepthFocalHead(nn.Module):
         self.registers_layer_norm = nn.LayerNorm(hidden_dim)  # Pre-projection layer norm.
         self.tokens_layer_norm = nn.LayerNorm(hidden_dim)  # Pre-projection layer norm.
         self.focal_proj = nn.Linear(num_registers * hidden_dim, 4)  # fx, fy, cx, cy
-        self.grid_proj = nn.Linear(2, 256)
-        # self.tokens_proj = nn.Linear(hidden_dim, 256)
-        self.tokens_proj = SwiGLU(in_features=hidden_dim, hidden_features=hidden_dim, out_features=256)
-        self.depths_proj = SwiGLU(in_features=256, hidden_features=256, out_features=1)
-
+        self.depth_proj = DepthProj(dim=hidden_dim)
         self.num_registers = num_registers
-        self.register_buffer("local_grid", self.generate_local_grid(16))
-
-    def generate_local_grid(self, patch_size):
-        # Generates a grid from -1.0 to 1.0 for the 16x16 patch
-        coords = torch.linspace(-1.0, 1.0, steps=patch_size)
-        y, x = torch.meshgrid(coords, coords, indexing='ij')
-        # Shape: (256, 2)
-        grid = torch.stack([x, y], dim=-1)#.reshape(-1, 2)
-        return grid
 
     def forward(self, x: torch.Tensor, rope2d, rope3d, L, H, W) -> torch.Tensor:
         """
@@ -144,6 +185,7 @@ class DepthFocalHead(nn.Module):
                 x = self.local_blocks[i](x, rope2d, L)
 
         x = rearrange(x, "(B L) X dim -> B L X dim", L=L)  # (B, L, num_registers + HW // 256, dim)
+        B = x.shape[0]
         registers = self.registers_layer_norm(x[:, :, :self.num_registers, :])  # (B, L, num_registers, dim)
         # (B, L, num_registers * dim) -> (B, L, 4) -> 4 x (B, L)
         fx, fy, cx, cy = self.focal_proj(registers.flatten(start_dim=2)).unbind(-1)
@@ -153,21 +195,12 @@ class DepthFocalHead(nn.Module):
         cx, cy = cx + W / 2, cy + H / 2
 
         tokens = self.tokens_layer_norm(x[:, :, self.num_registers:, :])  # (B, L, HW // 256, dim)
-        # self.tokens_proj(tokens) is (B, L, HW // 256, 256). self.grid_proj(self.local_grid) is (256, 256).
-        hidden = self.tokens_proj(tokens).unsqueeze(-2) + self.grid_proj(self.local_grid).view(1, 1, 1, 256, 256)
-        log_depths = self.depths_proj(F.silu(hidden)) # (B, L, HW // 256, 256, 1)
-        # We must take into account that each token represents the 16x16 patch at that location.
-        # Naively rearranging leads to each 16x16 patch being mapped to a contiguous line of 256 pixels.
-        log_depths = rearrange(
-            log_depths.squeeze(-1), # (B, L, HW // 256, 256)
-            "B L (h_p w_p) (p1 p2) -> B L (h_p p1) (w_p p2)",
-            h_p=H // 16, w_p=W // 16, p1=16, p2=16
-        )
+        log_depths = self.depth_proj(tokens.view(B, L, H // 16, W // 16, self.hidden_dim))
+        
         # log_depths has shape (B, L, HW). fx, fy, cx, and cy have shape (B, L).
-        return log_depths, fx, fy, cx, cy
+        return log_depths.squeeze(-1), fx, fy, cx, cy
 
 
-@torch.compile()
 class PoseHead(nn.Module):
     """
     Predict the relative camera pose per frame via the register (special) tokens.
