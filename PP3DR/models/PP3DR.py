@@ -113,24 +113,21 @@ class UpscaleBlock(nn.Module):
 
 
 class DepthProj(nn.Module):
-    def __init__(self, dim=1280, hidden_dim=16):
+    def __init__(self, dim=1280):
         super().__init__()
-        self.initial_proj = PointwiseSwiGLU(in_features=dim, hidden_features=dim, out_features=hidden_dim)
-        self.residual = nn.ConvTranspose2d(in_channels=1280, out_channels=hidden_dim, kernel_size=16, stride=16)
-        self.residual_ls = LayerScale([hidden_dim, 1, 1]) # Along the channel dimension
-        self.final_proj = PointwiseSwiGLU(in_features=hidden_dim, hidden_features=hidden_dim, out_features=1)
+        self.proj = nn.Sequential(
+            UpscaleBlock(dim, dim // 8, 4), # 1280 -> 160
+            nn.SiLU(),
+            UpscaleBlock(dim // 8, dim // 64, 4),
+            nn.SiLU()
+        )
+        self.final_proj = PointwiseSwiGLU(in_features=dim // 64, hidden_features=dim // 64, out_features=1)
 
     def forward(self, x):
         # (B, L, H // 16, W // 16, dim) -> (B, L, H // 16, W // 16, hidden_dim) -> (B, L, H, W, hidden_dim)
         B = x.shape[0]
         x = rearrange(x, "B L H_p W_p dim -> (B L) dim H_p W_p")
-        upscaled = F.interpolate(
-            self.initial_proj(x),
-            scale_factor=16,
-            mode='bilinear',
-            align_corners=False
-        )
-        x = upscaled + self.residual_ls(self.residual(x))
+        x = self.proj(x)
         return rearrange(self.final_proj(x), "(B L) C H W -> B L H W C", B=B) # (B, L, H, W, 1)
 
 class DepthFocalHead(nn.Module):

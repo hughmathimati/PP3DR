@@ -30,13 +30,13 @@ class SanityTrainer(BaseTrainer):
 
 if __name__ == "__main__":
     SanityTrainer(
-        model=PP3DR_mixed_head,
+        model=PP3DR,
         loss=PP3DR_loss,
-        name="LDD-1000-mixed-2-8",
+        name="finetune-double-upscale",
         epochs=1000,
         checkpoint_every=1000, # MUST checkpoint before saving files. Also just good practice.
-        # pretrained_path="/vulcanscratch/hughma/PP3DR/LDD-1000-new-upscale-ls/PP3DR.pth",
-        # freeze_feature_extractor=False,
+        pretrained_path="/vulcanscratch/hughma/PP3DR/LDD-1000-double-upscale/PP3DR.pth",
+        freeze_feature_extractor=False,
         use_muon=False,
         gradient_accumulation_steps=1,
         train_datasets=[nrgbd_dataset],
