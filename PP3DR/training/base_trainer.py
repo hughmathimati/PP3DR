@@ -1,10 +1,13 @@
 import transformers.optimization
 
+from datasets.dynamic_replica_dataset import dynamic_replica_dataset
+from datasets.dynamic_replica_val_dataset import dynamic_replica_val_dataset
+from datasets.dynamic_replica_test_dataset import dynamic_replica_test_dataset
+from datasets.flying_things_3d_dataset import flying_things_3d_dataset
+from datasets.flying_things_3d_test_dataset import flying_things_3d_test_dataset
 from datasets.nrgbd_dataset import nrgbd_dataset
 from datasets.dtu_dataset import dtu_dataset
-from datasets.dynamic_replica_dataset import dynamic_replica_dataset
 from datasets.eth3d_dataset import eth3d_dataset
-from datasets.flying_things_3d_dataset import flying_things_3d_dataset
 from datasets.sintel_dataset import sintel_dataset
 from datasets.nrgbd_dataset import nrgbd_dataset
 
@@ -18,6 +21,7 @@ from accelerate import Accelerator, ProfileKwargs, DataLoaderConfiguration
 from accelerate.utils import ProjectConfiguration, DistributedDataParallelKwargs
 from torch.utils.data import ConcatDataset, DataLoader
 import os
+import math
 
 
 class State:
@@ -56,12 +60,14 @@ class BaseTrainer:
                  checkpoint=None,
                  strict=True,
                  freeze_feature_extractor=True,
-                 use_muon=True,
+                 use_muon=False, # In my limited testing, Muon underperforms AdamW.
                  batch_size=6,
                  gradient_accumulation_steps=8,
                  start_checkpointing=6,
                  train_datasets=[
-                     dynamic_replica_dataset, flying_things_3d_dataset, nrgbd_dataset, dtu_dataset, eth3d_dataset
+                     dynamic_replica_dataset, dynamic_replica_val_dataset, dynamic_replica_test_dataset,
+                     flying_things_3d_dataset, flying_things_3d_test_dataset,
+                     nrgbd_dataset, dtu_dataset, eth3d_dataset
                  ],
                  val_dataset=sintel_dataset,
                  ):
@@ -113,7 +119,7 @@ class BaseTrainer:
             self.state, PP3DR_model, AdamW, Muon = b.result()
 
         self.train_dataloader, self.val_dataloader = self.accelerator.prepare(train_dataloader, val_dataloader)
-        total_training_steps = len(train_dataloader) * epochs
+        total_training_steps = math.ceil(len(self.train_dataloader) / gradient_accumulation_steps) * epochs
 
         AdamW_scheduler = transformers.optimization.get_cosine_schedule_with_warmup(
             AdamW,
@@ -143,7 +149,7 @@ class BaseTrainer:
             if self.accelerator.is_local_main_process:
                 print("Starting from scratch, with seed 42.")
 
-        self.train_iter = iter(train_dataloader)
+        self.train_iter = iter(self.train_dataloader)
 
         # Training loop
         # global_step exists for the sole purpose of tensorboard.

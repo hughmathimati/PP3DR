@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=LLS-2g
-#SBATCH --output=LLS-2g-%j.out
+#SBATCH --job-name=double-upscale-finetune
+#SBATCH --output=double-upscale-finetune-%j.out
 #SBATCH --partition=vulcan-ampere
 #SBATCH --ntasks 1
-#SBATCH --cpus-per-task=64
+#SBATCH --cpus-per-task=48
 #SBATCH --mem=512gb
-#SBATCH --gres=gpu:h200-sxm:4
+#SBATCH --gres=gpu:h200-sxm:3
 #SBATCH --account=vulcan-jbhuang
 #SBATCH --qos=vulcan-high-h200
 #SBATCH --time=36:00:00
