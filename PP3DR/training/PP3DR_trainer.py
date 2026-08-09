@@ -1,6 +1,6 @@
 from training.base_trainer import BaseTrainer
 from models.PP3DR import PP3DR
-from training.PP3DR_depth_focal_loss import PP3DR_loss
+from training.PP3DR_loss import PP3DR_loss
 
 if __name__ == "__main__":
     BaseTrainer(

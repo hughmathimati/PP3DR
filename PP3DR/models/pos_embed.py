@@ -200,7 +200,8 @@ class Rope2D(nn.Module):
 
         # Prepare angles and sin/cos
         coords = coords.view(B * L, HW, 2)
-        angles = 2 * math.pi * coords.unsqueeze(-1) / self.periods.view(1, 1, 1, -1)  # (B * L, HW, 2, D//4)
+        # We DO NOT multiply by 2pi here. The original RoPE does because they're working with normalised coordinates.
+        angles = coords.unsqueeze(-1) / self.periods.view(1, 1, 1, -1)  # (B * L, HW, 2, D//4)
         angles = angles.flatten(2, 3)  # (B * L, HW, D//2)
         # Explicitly tile the last dimension only (1x on B * L, 1x on HW, 2x on D_head)
         angles = angles.tile(1, 1, 2)  # (B * L, HW, D)
@@ -311,7 +312,7 @@ class Rope3D(nn.Module):
         # periods in case we ever wanted to make their bases different. Rope2D just has a 1 there, because the x and
         # y-coordinates use the same base period.
         # (B, LHW, 3, self.rope_dim)
-        angles_scaled = (2 * math.pi * coords.unsqueeze(-1)) / self.periods.view(1, 1, 3, self.rope_dim)
+        angles_scaled = coords.unsqueeze(-1) / self.periods.view(1, 1, 3, self.rope_dim)
         angles_scaled = angles_scaled.flatten(2, 3)  # (B, LHW, 3 * self.rope_dim) = (B, LHW, self.D_head // 2)
         angles = torch.zeros(B, L * HW, self.D_head // 2, **dd)
         angles[:, :, self.remainder_per_half:] = angles_scaled

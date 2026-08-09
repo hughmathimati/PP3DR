@@ -149,7 +149,7 @@ class PP3DR_loss(nn.Module):
 
         return relative_rotations, relative_translations
 
-    def obtain_pred_3D_points(self, pred):
+    def obtain_pred_3D_points(self, pred, gt):
         """
         Parameters
         ----------
@@ -157,13 +157,23 @@ class PP3DR_loss(nn.Module):
 
         Returns
         -------
-        (B, L, H, W, 3) of 3D-coordinates for each pixel's point, in the given frame's 3D coordinate system, UNSCALED.
-        We won't scale yet, because we need the initial points to calculate the scale itself.
+        (B, L, H, W, 3) of world-frame 3D-coordinates, unprojected from pred, unscaled.
         """
         B, L, H, W = pred['log_depths'].shape
-        depths = torch.exp(pred['log_depths']).unsqueeze(-1)
-        xy = pred['XY_rays'] * depths
-        return torch.cat((xy, depths), dim = -1)
+        device = pred['log_depths'].device
+        y, x = torch.meshgrid(
+            torch.arange(H, device=device) + 0.5,
+            torch.arange(W, device=device) + 0.5,
+            indexing='ij'
+        )  # (H, W)
+        y, x = y.view(1, 1, H, W), x.view(1, 1, H, W)
+        Z = torch.exp(pred['log_depths'])  # (B, L, H, W)
+        fx, fy = pred['fx'].view(B, L, 1, 1), pred['fy'].view(B, L, 1, 1)
+        cx, cy = gt['intrinsics'][..., 0, 2].view(B, L, 1, 1), gt['intrinsics'][..., 1, 2].view(B, L, 1, 1)
+        X = (x - cx) * Z / fx  # (B, L, H, W)
+        Y = (y - cy) * Z / fy  # (B, L, H, W)
+
+        return torch.stack((X, Y, Z), dim=-1)  # (B, N, H, W, 3)
 
     def obtain_gt_3D_points(self, gt):
         """
@@ -217,7 +227,11 @@ class PP3DR_loss(nn.Module):
         # Multiply weights by gt_valid_depth_mask to zero the weights of any points with invalid gt depths.
         weights = weights.masked_fill(gt_invalid_depth_mask, 0)
 
-        pred_points, gt_points = self.obtain_pred_3D_points(pred), self.obtain_gt_3D_points(gt)
+        # gt is passed to obtain_pred_3D_points() to receive the gt cx and cy.
+        # cx and cy are already implicitly passed to the model via the rope_x and rope_y coordinates.
+        # Bear in mind that, for in-the-wild prediction, we will simply assume the principal point is at the center of
+        # the image.
+        pred_points, gt_points = self.obtain_pred_3D_points(pred, gt), self.obtain_gt_3D_points(gt)
         if self.scale:
             scale = self.calculate_scale(pred_points, gt_points, weights)  # (B, 1)
         else:

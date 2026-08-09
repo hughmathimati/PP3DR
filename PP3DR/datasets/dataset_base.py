@@ -41,15 +41,15 @@ class DatasetBase(torch.utils.data.Dataset):
         assert self.input_dim % self.patch_size == 0, f"self.input_dim must be a multiple of the patch size ({self.patch_size})."
         # Set this to True to have __getittem__() return the raw images as well.
         # This should be False for training and only turned on for debugging/visualization purposes.
-        self.raw = True;print("WARNING: Don't forget to turn off raw!")
+        self.raw = False
 
         # Create the base grid coordinates for RoPE (doing this once and saving it prevents recomputation later)
         grid_size = self.input_dim // self.patch_size
         # Create a grid of pixel coordinates for the center of each patch
         # Shape of y_grid and x_grid: (grid_size, grid_size)
         self.y_grid, self.x_grid = torch.meshgrid(
-            torch.arange(grid_size) * self.patch_size + (self.patch_size / 2.0),
-            torch.arange(grid_size) * self.patch_size + (self.patch_size / 2.0),
+            torch.arange(grid_size, dtype=torch.float32) + 0.5,
+            torch.arange(grid_size, dtype=torch.float32) + 0.5,
             indexing='ij'
         )
 
@@ -243,13 +243,11 @@ class DatasetBase(torch.utils.data.Dataset):
 
         # Vectorized Center Shift!
         # Centers the RoPE coordinates perfectly on the camera's true optical axis
-        rope_x = x_flat - cx
-        rope_y = y_flat - cy
+        rope_x = x_flat - cx / self.patch_size
+        rope_y = y_flat - cy / self.patch_size
 
-        # At the end, we divide the RoPE coordinates by the patch size.
-        # This isn't strictly necessary but helps keep our RoPE coordinates within a reasonable range with respect to
-        # our base RoPE period.
-        return final_images, final_depths, new_intrinsics, rope_x / self.patch_size, rope_y / self.patch_size
+        # rope_x and rope_y are in patch coordinates (pixel coordinates divided by the patch size).
+        return final_images, final_depths, new_intrinsics, rope_x, rope_y
 
     def __getitem__(self, index):
         """

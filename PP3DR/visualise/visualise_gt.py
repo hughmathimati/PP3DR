@@ -158,10 +158,12 @@ if __name__ == "__main__":
     from datasets.interior_net_dataset import interior_net_dataset as dataset
     dataset = dataset()
     first = dataset[0]
-    first['images'] = first['raw_images']
-    first['depths'] = first['raw_depths']
-    first['intrinsics'] = first['raw_intrinsics']
-
+    """
+    NOTE:
+    Because you modified the camera intrinsics inside input_helper(), you DO NOT need to use the raw images/depths here!
+    By design, the modified intrinsics will allow you to view the reconstructed scene perfectly fine!
+    If this wasn't the case, your model would be training on pure garbage!
+    """
     # Change scale
     scale = 1
     print(first['extrinsics'].shape)
