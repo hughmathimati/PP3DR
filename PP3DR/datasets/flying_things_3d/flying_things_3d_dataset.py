@@ -6,10 +6,7 @@ import numpy as np
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
 import re
-try:
-    from .dataset_base import DatasetBase
-except:
-    from dataset_base import DatasetBase
+from datasets.dataset_base import DatasetBase
 
 def readPFM(file):
     file = open(file, 'rb')
@@ -57,11 +54,20 @@ class flying_things_3d_dataset(DatasetBase):
     540x960
     """
     def __init__(self,
+                 cache_path="/vulcanscratch/hughma/PP3DR/datasets/flying_things_3d/flying_things_3d_dataset_cache.pth",
                  images_dir = "/fs/vulcan-datasets/FlyingThings3D/frames_cleanpass/TRAIN",
                  disparities_dir = "/fs/vulcan-datasets/FlyingThings3D/disparity/TRAIN",
                  extrinsics_dir = "/vulcanscratch/hughma/data/FlyingThings3D/camera_data/TRAIN"
     ):
         super().__init__("/fs/vulcan-datasets/FlyingThings3D/frames_cleanpass/TRAIN")
+        if os.path.exists(cache_path):
+            cache = torch.load(cache_path)
+            self.sequences = cache['sequences'],
+            self.intrinsics = cache['intrinsics']
+            self.sequence_length = len(self.sequences)
+            print(f"Loaded dataset from {cache_path}.")
+            return
+
         self.images_dir = images_dir
         self.disparities_dir = disparities_dir
         self.extrinsics_dir = extrinsics_dir
@@ -76,6 +82,9 @@ class flying_things_3d_dataset(DatasetBase):
             ], dtype=torch.float32).unsqueeze(0).expand(self.sequence_length, -1, -1)
             for future in futures:
                 self.sequences += future.result() # Append.
+
+        torch.save({'sequences': self.sequences, 'intrinsics': self.intrinsics}, cache_path)
+        print(f"Saved to {cache_path}")
 
     def init_helper(self, scene):
         my_sequences = []

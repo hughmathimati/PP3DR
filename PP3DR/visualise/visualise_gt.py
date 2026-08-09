@@ -155,9 +155,12 @@ if __name__ == "__main__":
     # from datasets.dynamic_replica_dataset import dynamic_replica_dataset as dataset
     # from datasets.eth3d_dataset import eth3d_dataset as dataset
     # from datasets.flying_things_3d_dataset import flying_things_3d_dataset as dataset
-    from datasets.sintel_dataset import sintel_dataset as dataset
+    from datasets.interior_net_dataset import interior_net_dataset as dataset
     dataset = dataset()
     first = dataset[0]
+    first['images'] = first['raw_images']
+    first['depths'] = first['raw_depths']
+    first['intrinsics'] = first['raw_intrinsics']
 
     # Change scale
     scale = 1

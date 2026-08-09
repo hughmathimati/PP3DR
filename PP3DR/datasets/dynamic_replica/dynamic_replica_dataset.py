@@ -9,10 +9,7 @@ import cv2
 import gzip
 import json
 from functools import partial
-try:
-    from .dataset_base import DatasetBase
-except:
-    from dataset_base import DatasetBase
+from datasets.dataset_base import DatasetBase
 
 class dynamic_replica_dataset(DatasetBase):
     """
@@ -20,26 +17,41 @@ class dynamic_replica_dataset(DatasetBase):
     1280 x 720
     """
     # The shortest sequence only has 20 images.
-    def __init__(self, dir="/fs/vulcan-datasets/dynamic_replica/train"):
+    def __init__(
+            self,
+            cache_path="/vulcanscratch/hughma/PP3DR/datasets/dynamic_replica/dynamic_replica_dataset_cache.pth",
+            dir="/fs/vulcan-datasets/dynamic_replica/train",
+            annotations_file_name="frame_annotations_train.jgz"
+    ):
+        super().__init__(dir)
+        if os.path.exists(cache_path):
+            self.sequences = torch.load(cache_path)
+            self.sequence_length = len(self.sequences)
+            print(f"Loaded dataset from {cache_path}.")
+            return
+
+        print("{cache_path} not found. Initialising dataset from scratch...")
         with ThreadPoolExecutor() as executor:
             # Extracting the camera matrices requires self.sequence_names to be filled. However, reading the jgz file
             # does not. So we'll do that first.
-            a = executor.submit(self.load_jgz, os.path.join(dir, "frame_annotations_train.jgz"))
+            a = executor.submit(self.load_jgz, os.path.join(dir, annotations_file_name))
 
-            super().__init__(dir)
             # Filter out the right-camera sequences (and the jgz file) ahead of time.
             # We need to do this since extract_sequence_cameras relies on self.sequence_names.index().
             # It will happen concurrently with self.load_jgz().
             valid_indices = [
                 i for i, name in enumerate(self.sequence_names)
-                if name != "frame_annotations_train.jgz" and not name.endswith("right")
+                if name != annotations_file_name and not name.endswith("right")
             ]
             self.sequence_names = [self.sequence_names[i] for i in valid_indices]
             self.sequences = [self.sequences[i] for i in valid_indices]
             self.name_to_idx = {name: i for i, name in enumerate(self.sequence_names)}
             for sequence in self.sequences:
-                sequence['extrinsics'] = torch.empty(300, 3, 4)
-                sequence['intrinsics'] = torch.zeros(300, 3, 3)
+                # It's okay for these to be longer than the image sequence length, because when we actually sample the
+                # frame indices, we're only sampling from valid image indices.
+                # The train sequence lengths seem to be at most 300, but the test ones seem to go up to 901.
+                sequence['extrinsics'] = torch.empty(901, 3, 4)
+                sequence['intrinsics'] = torch.zeros(901, 3, 3)
 
             # Now that self.sequence_names is filled, we can submit self.extract_sequence_cameras().
             b = executor.submit(self.extract_sequence_cameras, a.result())
@@ -57,6 +69,9 @@ class dynamic_replica_dataset(DatasetBase):
 
             # Make sure we don't proceed until b is done running.
             b.result()
+
+        torch.save(self.sequences, cache_path)
+        print(f"Saved to {cache_path}")
 
     def load_jgz(self, path):
         with gzip.open(path, 'rt', encoding='utf-8') as f:

@@ -13,4 +13,8 @@ from datasets.dynamic_replica_dataset import dynamic_replica_dataset
 class dynamic_replica_test_dataset(dynamic_replica_dataset):
     # The shortest sequence only has 20 images.
     def __init__(self):
-        super().__init__(dir="/fs/vulcan-datasets/dynamic_replica/test")
+        super().__init__(
+            cache_path="/vulcanscratch/hughma/PP3DR/datasets/dynamic_replica/dynamic_replica_test_dataset_cache.pth",
+            dir="/fs/vulcan-datasets/dynamic_replica/test",
+            annotations_file_name="frame_annotations_test.jgz"
+        )

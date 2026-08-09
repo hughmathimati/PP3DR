@@ -41,7 +41,7 @@ class DatasetBase(torch.utils.data.Dataset):
         assert self.input_dim % self.patch_size == 0, f"self.input_dim must be a multiple of the patch size ({self.patch_size})."
         # Set this to True to have __getittem__() return the raw images as well.
         # This should be False for training and only turned on for debugging/visualization purposes.
-        self.raw = False
+        self.raw = True;print("WARNING: Don't forget to turn off raw!")
 
         # Create the base grid coordinates for RoPE (doing this once and saving it prevents recomputation later)
         grid_size = self.input_dim // self.patch_size

@@ -6,8 +6,8 @@ if __name__ == "__main__":
     BaseTrainer(
         PP3DR,
         PP3DR_loss,
-        name="double-upscale-finetune",
-        pretrained_path="/vulcanscratch/hughma/PP3DR/double-upscale/PP3DR.pth",
-        freeze_feature_extractor=False,
+        name="dino",
+        # pretrained_path="/vulcanscratch/hughma/PP3DR/double-upscale/PP3DR.pth",
+        # freeze_feature_extractor=False,
         use_muon=False,
     )

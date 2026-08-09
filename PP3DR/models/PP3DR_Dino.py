@@ -10,7 +10,7 @@ class PP3DR_Dino(PP3DR):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.processor, self.dino = load_dinov3()
-        self.dino = self.dino.to("cuda").eval()
+        self.dino = self.dino.eval()
         for parameter in self.dino.parameters():
             parameter.requires_grad = False
 

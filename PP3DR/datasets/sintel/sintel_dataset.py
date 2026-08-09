@@ -4,14 +4,8 @@ import torchvision
 import os
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
-try:
-    from .dataset_base import DatasetBase
-except:
-    from dataset_base import DatasetBase
-try:
-    from .sintel_io import depth_read, cam_read
-except:
-    from sintel_io import depth_read, cam_read
+from datasets.dataset_base import DatasetBase
+from datasets.sintel.sintel_io import depth_read, cam_read
 
 
 class sintel_dataset(DatasetBase):
