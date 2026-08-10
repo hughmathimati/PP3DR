@@ -23,16 +23,21 @@ class DatasetBase(torch.utils.data.Dataset):
 
     def __init__(self, dir):
         """
-        Must create self.sequences, a list where each sequence corresponds to a dict with at least the following elements:
-            {
-                'images': Paths to the images for this sequence.
-                'depths': Paths to the depths for this sequence.
-            }
+        MUST have:
+        self.starts: Tensor containing the start index for each sequence
+        self.lengths: Tensor containing the lengths of each sequence
+
+        Default helper functions expect:
+        self.images: Numpy array of all string paths to images
+        self.depths: Numpy array of all string paths to depths
+        self.extrinsics: Tensor containing all extrinsic matrices
+        self.intrinsics: Tensor containing all intrinsic matrices
         """
         super().__init__()
+        # This is the number of frames we'd like to sample from each sequence. If this is more than the number of frames
+        # in the sequence, we will oversample.
         self.sequence_length = 10
         self.sequence_names = os.listdir(dir)
-        self.sequences = [dict(images=[], depths=[]) for _ in range(len(self.sequence_names))]
         # Start with a lower dimension for initial training and sanity-checking. You can fine-tune at a higher
         # resolution later.
         # print("WARNING: Patch size set to 14 for Pi3 sanity.")
@@ -54,7 +59,7 @@ class DatasetBase(torch.utils.data.Dataset):
         )
 
     def __len__(self):
-        return len(self.sequences)
+        return len(self.starts)
 
     def images_helper(self, sequence_index, frame_indices):
         """
@@ -70,13 +75,11 @@ class DatasetBase(torch.utils.data.Dataset):
         return torch.stack(
             [
                 transforms.functional.to_dtype(
-                    torchvision.io.decode_image(
-                        self.sequences[sequence_index]['images'][i]
-                    ),
+                    torchvision.io.decode_image(self.images[i]),
                     torch.float32,
                     scale=True
                 )[:3]  # I'm including this here for the RGBA datasets.
-                for i in frame_indices
+                for i in self.starts[sequence_index] + frame_indices
             ]
         )
 
@@ -95,13 +98,11 @@ class DatasetBase(torch.utils.data.Dataset):
         return torch.cat(
             [
                 transforms.functional.to_dtype(
-                    torchvision.io.decode_image(
-                        self.sequences[sequence_index]['depths'][i]
-                    ),
+                    torchvision.io.decode_image(self.depths[i]),
                     torch.float32
                     # DON'T scale the depth.
                 )
-                for i in frame_indices
+                for i in self.starts[sequence_index] + frame_indices
             ]
         )
 
@@ -119,7 +120,7 @@ class DatasetBase(torch.utils.data.Dataset):
         -------
         (L, 3, 4) tensor of the 3x4 camera extrinsic matrices for this randomly-sampled sequence.
         """
-        return self.sequences[sequence_index]['extrinsics'][frame_indices]
+        return self.extrinsics[self.starts[sequence_index] + frame_indices]
 
     def intrinsics_helper(self, sequence_index, frame_indices):
         """
@@ -134,7 +135,7 @@ class DatasetBase(torch.utils.data.Dataset):
         -------
         (L, 3, 3) tensor of the 3x3 camera intrinsic matrix for this randomly-sampled sequence.
         """
-        return self.sequences[sequence_index]['intrinsics'][frame_indices]
+        return self.intrinsics[self.starts[sequence_index] + frame_indices]
 
     def input_helper(self, raw_images, raw_depths, raw_intrinsics):
         """
@@ -271,8 +272,7 @@ class DatasetBase(torch.utils.data.Dataset):
             "raw_intrinsics": The actual raw 3x3 camera intrinsics constituting the sequence (L, 3, 3)
         }
         """
-        true_length = len(self.sequences[index]['images'])
-
+        true_length = self.lengths[index].item()
         assert true_length > 0, f"{type(self).__name__}, sequence {index} has 0 images!"
 
         window_size = 10 * self.sequence_length
@@ -332,63 +332,3 @@ if __name__ == "__main__":
     print(c)
     print(d)
     print(e)
-
-# This was the old input_helper function I wrote. I'm keeping it here just so it gets saved in the next commit, and then
-# I'm deleting it.
-# def input_helper(self, raw_images, raw_depths):
-#     """
-#     Images get centered replicate padding with bilinear interpolation.
-#
-#     Depths are padded the same as images but with zeros, and nearest-neighbor interpolation.
-#
-#     Parameters
-#     ----------
-#     images: The raw images (L, 3, H, W)
-#     depths: The raw depths (L, H, W)
-#
-#     Returns
-#     -------
-#     The resized, padded inputs to the model (L, 3, self.input_dim, self.input_dim)
-#     The resized, padded depths to the model (L, self.input_dim, self.input_dim)
-#     """
-#     L, H, W = raw_depths.shape
-#     if W >= H:
-#         resized_W = self.input_dim
-#         resized_H = round(H * resized_W / W)
-#         resized_images = transforms.functional.resize(raw_images,
-#                                                       [resized_H, resized_W])  # Bilinear interpolation by default
-#         # Depth has to use nearest-neighbor interpolation
-#         resized_depths = transforms.functional.resize(raw_depths, [resized_H, resized_W],
-#                                                       transforms.functional.InterpolationMode.NEAREST)
-#         # This is the total # pixels we need to pad vertically to make H a multiple of 16.
-#         # (new_H + 15) // 16 rounds up, making 16 * ((new_H + 15) // 16) the next-highest multiple of 16.
-#         padded_H = 16 * ((resized_H + 15) // 16)
-#         padding = padded_H - resized_H
-#         top_padding, bottom_padding = padding // 2, (padding + 1) // 2
-#         # Left, top, right, bottom. If padding is odd, one side must arbitrarily be rounded up.
-#         # Because our patch size is 16, we'll have at most 7 rows on the top and 8 rows on the bottom (16 - 1 = 15).
-#         padded_images = transforms.functional.pad(resized_images, [0, top_padding, 0, bottom_padding],
-#                                                   padding_mode="edge")
-#         # We finish with zero-padding at the bottom to make it 512x512.
-#         remaining = self.input_dim - padded_H
-#         return (
-#             transforms.functional.pad(padded_images, [0, 0, 0, remaining], fill=0),
-#             # padded_depths doubles as our valid-mask.
-#             transforms.functional.pad(resized_depths, [0, top_padding, 0, bottom_padding + remaining], fill=0)
-#         )
-#     else:
-#         # See comments above.
-#         resized_H = self.input_dim
-#         resized_W = round(W * resized_H / H)
-#         resized = transforms.functional.resize(raw_images, [resized_H, resized_W])
-#         resized_depths = transforms.functional.resize(raw_depths, [resized_H, resized_W],
-#                                                       transforms.functional.InterpolationMode.NEAREST)
-#         padded_W = 16 * ((resized_W + 15) // 16)
-#         padding = padded_W - resized_W
-#         left_padding, right_padding = padding // 2, (padding + 1) // 2
-#         padded = transforms.functional.pad(resized, [left_padding, 0, right_padding, 0], padding_mode="edge")
-#         remaining = self.input_dim - padded_W
-#         return (
-#             transforms.functional.pad(padded, [0, 0, remaining, 0], fill=0),
-#             transforms.functional.pad(resized_depths, [left_padding, 0, right_padding + remaining, 0], fill=0)
-#         )

@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=dino
-#SBATCH --output=dino-%j.out
+#SBATCH --job-name=interior_rope_focal
+#SBATCH --output=interior_rope_focal-%j.out
 #SBATCH --partition=vulcan-ampere
 #SBATCH --ntasks 1
 #SBATCH --cpus-per-task=64

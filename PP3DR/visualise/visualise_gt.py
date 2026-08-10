@@ -107,7 +107,7 @@ def visualize_gt_sequence(gt, port=8080):
                 f"/point_clouds/frame_{i:04d}",
                 points=pts_world,
                 colors=colors_flat,
-                point_size=0.005  # Adjust this scale based on your dataset!
+                point_size=0.05  # Adjust this scale based on your dataset!
             )
 
         # Read toggle states
@@ -155,9 +155,9 @@ if __name__ == "__main__":
     # from datasets.dynamic_replica_dataset import dynamic_replica_dataset as dataset
     # from datasets.eth3d_dataset import eth3d_dataset as dataset
     # from datasets.flying_things_3d_dataset import flying_things_3d_dataset as dataset
-    from datasets.interior_net_dataset import interior_net_dataset as dataset
+    from datasets.sintel.sintel_dataset import sintel_dataset as dataset
     dataset = dataset()
-    first = dataset[0]
+    first = dataset[7]
     """
     NOTE:
     Because you modified the camera intrinsics inside input_helper(), you DO NOT need to use the raw images/depths here!
@@ -165,7 +165,7 @@ if __name__ == "__main__":
     If this wasn't the case, your model would be training on pure garbage!
     """
     # Change scale
-    scale = 1
+    scale = 2
     print(first['extrinsics'].shape)
     for extrinsic in first['extrinsics']:
         extrinsic[:, 3] *= scale

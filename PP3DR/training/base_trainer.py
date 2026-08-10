@@ -1,16 +1,16 @@
-import transformers.optimization
-
-from datasets.dynamic_replica_dataset import dynamic_replica_dataset
-from datasets.dynamic_replica_val_dataset import dynamic_replica_val_dataset
-from datasets.dynamic_replica_test_dataset import dynamic_replica_test_dataset
-from datasets.flying_things_3d_dataset import flying_things_3d_dataset
-from datasets.flying_things_3d_test_dataset import flying_things_3d_test_dataset
+from datasets.dynamic_replica.dynamic_replica_dataset import dynamic_replica_dataset
+from datasets.dynamic_replica.dynamic_replica_val_dataset import dynamic_replica_val_dataset
+from datasets.dynamic_replica.dynamic_replica_test_dataset import dynamic_replica_test_dataset
+from datasets.flying_things_3d.flying_things_3d_dataset import flying_things_3d_dataset
+from datasets.flying_things_3d.flying_things_3d_test_dataset import flying_things_3d_test_dataset
+from datasets.interior_net_dataset import interior_net_dataset
 from datasets.nrgbd_dataset import nrgbd_dataset
 from datasets.dtu_dataset import dtu_dataset
 from datasets.eth3d_dataset import eth3d_dataset
-from datasets.sintel_dataset import sintel_dataset
+from datasets.sintel.sintel_dataset import sintel_dataset
 from datasets.nrgbd_dataset import nrgbd_dataset
 
+import transformers.optimization
 import torch
 from torch import nn
 from tqdm import tqdm, trange
@@ -22,6 +22,35 @@ from accelerate.utils import ProjectConfiguration, DistributedDataParallelKwargs
 from torch.utils.data import ConcatDataset, DataLoader
 import os
 import math
+from torch.utils.data import default_collate
+
+def debug_collate(batch):
+    """
+    A drop-in replacement for PyTorch's default_collate.
+    If a shape mismatch or View trap triggers a crash, this will intercept it
+    and print a highly readable summary of the batch shapes so you can find the culprit!
+    """
+    try:
+        return default_collate(batch)
+    except Exception as e:
+        print("\n" + "=" * 60)
+        print("CRASH: BATCH SHAPE MISMATCH OR VIEW DETECTED!")
+        print("=" * 60)
+
+        for i, item in enumerate(batch):
+            print(f"\n--- Batch Item {i} ---")
+            for key, val in item.items():
+                if isinstance(val, torch.Tensor):
+                    # We also print .is_contiguous() because Views (Trap 1)
+                    # are often flagged as non-contiguous memory blocks!
+                    print(f"{key}: shape {list(val.shape)} | dtype: {val.dtype} | contiguous: {val.is_contiguous()}")
+                else:
+                    print(f"{key}: {type(val)}")
+
+        print("=" * 60 + "\n")
+
+        # Re-raise the error so the script still halts safely
+        raise e
 
 
 class State:
@@ -54,16 +83,16 @@ class BaseTrainer:
                  model,
                  loss,
                  name="checkpoints",
-                 epochs=50,
-                 checkpoint_every=20,
+                 epochs=40,
+                 checkpoint_every=15,
                  pretrained_path=None,
                  checkpoint=None,
                  strict=True,
                  freeze_feature_extractor=True,
                  use_muon=False, # In my limited testing, Muon underperforms AdamW.
-                 batch_size=6,
+                 batch_size=4,
                  gradient_accumulation_steps=8,
-                 start_checkpointing=6,
+                 start_checkpointing=10,
                  train_datasets=[
                      dynamic_replica_dataset, dynamic_replica_val_dataset, dynamic_replica_test_dataset,
                      flying_things_3d_dataset, flying_things_3d_test_dataset,
@@ -204,9 +233,10 @@ class BaseTrainer:
             # Batch size of 6 sequences, each with 10 images (60 images total)
             batch_size=batch_size,
             shuffle=True,  # Critical: Shuffles across all domains!
-            num_workers=8,
+            num_workers=4, # Temporarily decreased to 4 until I refactor the datasets
             pin_memory=True,
             persistent_workers=True,
+            collate_fn=debug_collate # DEBUG
         )
 
         return train_dataloader, val_dataloader

@@ -6,8 +6,7 @@ if __name__ == "__main__":
     BaseTrainer(
         PP3DR,
         PP3DR_loss,
-        name="dino",
+        name="interior_rope_focal",
         # pretrained_path="/vulcanscratch/hughma/PP3DR/double-upscale/PP3DR.pth",
         # freeze_feature_extractor=False,
-        use_muon=False,
     )

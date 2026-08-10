@@ -90,7 +90,7 @@ class PP3DR_loss(nn.Module):
         pred = pred_pts.detach().flatten(1, -2) # New shape: (B, NHW, 3)
         gt = gt_pts.flatten(1, -2)  # New shape: (B, NHW, 3)
         # Repeat (reallocate), because we're going to perform manual per-coordinate masking later.
-        weights = weights.flatten(1).unsqueeze(-1).repeat(1, 1, 3)  # New shape: (B, NHW, 3)
+        weights = weights.flatten(1).unsqueeze(-1).expand(-1, -1, 3)  # New shape: (B, NHW, 3)
 
         # Force the weights of any near-zero coordinates to zero, so we don't end up dividing by them.
         valid_mask = pred.abs() > 1e-8
@@ -168,10 +168,10 @@ class PP3DR_loss(nn.Module):
         )  # (H, W)
         y, x = y.view(1, 1, H, W), x.view(1, 1, H, W)
         Z = torch.exp(pred['log_depths'])  # (B, L, H, W)
-        fx, fy = pred['fx'].view(B, L, 1, 1), pred['fy'].view(B, L, 1, 1)
+        focal_length = pred['focal_length'].view(B, 1, 1, 1).expand(-1, L, -1, -1)
         cx, cy = gt['intrinsics'][..., 0, 2].view(B, L, 1, 1), gt['intrinsics'][..., 1, 2].view(B, L, 1, 1)
-        X = (x - cx) * Z / fx  # (B, L, H, W)
-        Y = (y - cy) * Z / fy  # (B, L, H, W)
+        X = (x - cx) * Z / focal_length  # (B, L, H, W)
+        Y = (y - cy) * Z / focal_length  # (B, L, H, W)
 
         return torch.stack((X, Y, Z), dim=-1)  # (B, N, H, W, 3)
 
@@ -329,8 +329,8 @@ class PP3DR_loss(nn.Module):
 
         loss_dy = F.l1_loss(pred_dy[mask_dy], gt_dy[mask_dy], reduction='mean')
         loss_dx = F.l1_loss(pred_dx[mask_dx], gt_dx[mask_dx], reduction='mean')
-        loss_dy = loss_dy + F.mse_loss(pred_dy[mask_dy], gt_dy[mask_dy])
-        loss_dx = loss_dx + F.mse_loss(pred_dx[mask_dx], gt_dx[mask_dx])
+        # loss_dy = loss_dy + F.mse_loss(pred_dy[mask_dy], gt_dy[mask_dy])
+        # loss_dx = loss_dx + F.mse_loss(pred_dx[mask_dx], gt_dx[mask_dx])
 
         # Optional: You can also weight these by the distance from edges, but standard L1
         # usually smooths out the 16x16 grid effectively.
@@ -340,7 +340,7 @@ class PP3DR_loss(nn.Module):
         """
         L1 loss on raw depths.
         """
-        return F.l1_loss(pred_depth[valid_mask], gt_depth[valid_mask], reduction='mean') + F.mse_loss(pred_depth[valid_mask], gt_depth[valid_mask], reduction='mean')
+        return F.l1_loss(pred_depth[valid_mask], gt_depth[valid_mask], reduction='mean')
         # return F.mse_loss(pred_depth[valid_mask], gt_depth[valid_mask], reduction='mean')
 
     def translation_loss(self, pred, gt_relative_translations, scale, median_depths):
@@ -392,8 +392,8 @@ class PP3DR_loss(nn.Module):
         Parameters
         ----------
         pred: {
-            "XY_rays": (B, L, H, W, 2)
             "log_depths": (B, L, H, W)
+            "focal_length": (B,)
             "relative_camera_translations": (B, L - 1, 3)
             "relative_camera_rotations": (B, L - 1, 3, 3)
         }
@@ -403,8 +403,8 @@ class PP3DR_loss(nn.Module):
             "extrinsics": (B, L, 3, 4)
             "intrinsics": (B, L, 3, 3)
         }
-        The `gt` parameter is just exactly what we receive from the DataLoader. Both `pred` and `gt` are already on the
-        correct GPU.
+        The `gt` parameter is just exactly what we receive from the DataLoader. `pred`is already on the
+        correct GPU, but `gt` may not be.
 
         Returns
         -------
@@ -443,7 +443,9 @@ class PP3DR_loss(nn.Module):
         rotation_loss = self.rotation_loss(pred, gt_relative_rotations)
         torch._assert(rotation_loss.isfinite(), f"Rotation loss invalid ({rotation_loss})")
 
-        # point_loss, gradient_matching_loss, and translation_loss are all huber. depth_loss is L1.
+        # point_loss, gradient_matching_loss, and depth_loss are all L1. Translation loss is Huber, and rotation loss
+        # is Cosine Similarity. The magnitude of gradient_matching_loss is much smaller than the other two L1 losses,
+        # but the gradient is the same, thanks to L1 loss.
         total_loss = point_loss + depth_loss + gradient_matching_loss + normal_loss + translation_loss + rotation_loss
         return total_loss, dict(
             total_loss=total_loss,

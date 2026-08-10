@@ -30,7 +30,7 @@ class dynamic_replica_dataset(DatasetBase):
             print(f"Loaded dataset from {cache_path}.")
             return
 
-        print("{cache_path} not found. Initialising dataset from scratch...")
+        print(f"{cache_path} not found. Initialising Dynamic Replica dataset from scratch...")
         with ThreadPoolExecutor() as executor:
             # Extracting the camera matrices requires self.sequence_names to be filled. However, reading the jgz file
             # does not. So we'll do that first.

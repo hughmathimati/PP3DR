@@ -16,8 +16,19 @@ class dtu_dataset(DatasetBase):
     W2C extrinsics with OpenCV coordinate convention.
     """
     # The shortest sequence only has 20 images.
-    def __init__(self, dir="/vulcanscratch/hughma/data/dtu/"):
+    def __init__(
+            self,
+            cache_path="/vulcanscratch/hughma/PP3DR/datasets/dtu_dataset_cache.pth",
+            dir="/vulcanscratch/hughma/data/dtu/"
+    ):
         super().__init__(dir)
+        if os.path.exists(cache_path):
+            self.sequences = torch.load(cache_path)
+            self.sequence_length = len(self.sequences)
+            print(f"Loaded dataset from {cache_path}.")
+            return
+
+        print(f"{cache_path} not found. Initialising DTU dataset from scratch...")
         for sequence in self.sequences:
             sequence['cams'] = []
         for i, sequence in tqdm(enumerate(self.sequence_names), desc="Precomputing DTU image file paths"):
@@ -32,6 +43,9 @@ class dtu_dataset(DatasetBase):
                 self.sequences[i]['depths'].append(os.path.join(depth_dir, depth))
             for cam in os.listdir(cams_dir):
                 self.sequences[i]['cams'].append(os.path.join(cams_dir, cam))
+
+        torch.save(self.sequences, cache_path)
+        print(f"Saved to {cache_path}")
 
     def depths_helper(self, sequence_index, frame_indices):
         """

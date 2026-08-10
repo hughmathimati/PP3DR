@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 import cv2
 import gzip
 import json
-from datasets.dynamic_replica_dataset import dynamic_replica_dataset
+from datasets.dynamic_replica.dynamic_replica_dataset import dynamic_replica_dataset
 
 class dynamic_replica_test_dataset(dynamic_replica_dataset):
     # The shortest sequence only has 20 images.

@@ -130,6 +130,7 @@ class DepthProj(nn.Module):
         x = self.proj(x)
         return rearrange(self.final_proj(x), "(B L) C H W -> B L H W C", B=B) # (B, L, H, W, 1)
 
+
 class DepthFocalHead(nn.Module):
     def __init__(
             self,
@@ -154,7 +155,8 @@ class DepthFocalHead(nn.Module):
 
         self.registers_layer_norm = nn.LayerNorm(hidden_dim)  # Pre-projection layer norm.
         self.tokens_layer_norm = nn.LayerNorm(hidden_dim)  # Pre-projection layer norm.
-        self.focal_proj = nn.Linear(num_registers * hidden_dim, 4)  # fx, fy, cx, cy
+        # We will predict a single unified focal length per sequence by predicting one per frame and taking the mean.
+        self.focal_proj = nn.Linear(num_registers * hidden_dim, 1)
         self.depth_proj = DepthProj(dim=hidden_dim)
         self.num_registers = num_registers
 
@@ -184,18 +186,16 @@ class DepthFocalHead(nn.Module):
         x = rearrange(x, "(B L) X dim -> B L X dim", L=L)  # (B, L, num_registers + HW // 256, dim)
         B = x.shape[0]
         registers = self.registers_layer_norm(x[:, :, :self.num_registers, :])  # (B, L, num_registers, dim)
-        # (B, L, num_registers * dim) -> (B, L, 4) -> 4 x (B, L)
-        fx, fy, cx, cy = self.focal_proj(registers.flatten(start_dim=2)).unbind(-1)
-        # fx and fy will be passed into softplus to ensure they're always positive.
-        fx, fy = F.softplus(fx), F.softplus(fy)
-        # cx and cy will actually be the residuals to the image center point.
-        cx, cy = cx + W / 2, cy + H / 2
+        # (B, L, num_registers * dim) -> (B, L, 1) -> (B, L) -> (B,)
+        f_mult = self.focal_proj(registers.flatten(start_dim=2)).squeeze(-1).mean(dim=-1)
+        f_mult = F.softplus(f_mult)
+        focal_length = f_mult * max(H, W)
 
         tokens = self.tokens_layer_norm(x[:, :, self.num_registers:, :])  # (B, L, HW // 256, dim)
         log_depths = self.depth_proj(tokens.view(B, L, H // 16, W // 16, self.hidden_dim))
         
         # log_depths has shape (B, L, HW). fx, fy, cx, and cy have shape (B, L).
-        return log_depths.squeeze(-1), fx, fy, cx, cy
+        return log_depths.squeeze(-1), focal_length
 
 
 class PoseHead(nn.Module):
@@ -351,13 +351,13 @@ class PP3DR(nn.Module):
 
         Returns
         -------
-        "XY_ray": Normalized XY ray direction for each pixel's point
+        "log_depth": Log depth for each pixel's point (B, L, H, W)
 
-        "log_depth": Log depth for each pixel's point
+        "focal_length": Unified focal length per sequence (B,)
 
-        "relative_camera_translation": (x, y, z) translation between this camera pose and the next one
+        "relative_camera_translation": (x, y, z) translation between this camera pose and the next one (B, L - 1, 3)
 
-        "relative_camera_rotation": quaternion rotation between this camera pose and the next one
+        "relative_camera_rotation": 3x3 rotation matrix between this camera pose and the next one (B, L - 1, 3, 3)
         """
         B, L, C, H, W = x.shape
 
@@ -401,7 +401,7 @@ class PP3DR(nn.Module):
         # x.shape == (B * L, num_registers + HW // 256, 2 * dim)
 
         # Step 2: Per-task decoders
-        log_depths, fx, fy, cx, cy = self.point_head(x, rope2d, rope3d, L, H, W)
+        log_depths, focal_length = self.point_head(x, rope2d, rope3d, L, H, W)
         # We're predicting the relative pose from this frame to the next one, which is why our sequence length is L - 1.
         poses = self.pose_head(x, rope2d, rope3d, L)[:, :-1]  # (B, L - 1, 9)
 
@@ -417,10 +417,7 @@ class PP3DR(nn.Module):
         return {
             # e^-80 to e^80 is safely within the range of bfloat16.
             "log_depths": torch.clamp(log_depths, min=-80, max=80),
-            "fx": fx,
-            "fy": fy,
-            "cx": cx,
-            "cy": cy,
+            "focal_length": focal_length,
             "relative_camera_translations": poses[:, :, :3],  # (B, L - 1, 3) -> 3 scalars, (x, y, z)
             "relative_camera_rotations": torch.stack([a, b, c], dim=-1)  # (B, L - 1, 3, 3)
         }

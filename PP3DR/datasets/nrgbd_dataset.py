@@ -19,8 +19,19 @@ class nrgbd_dataset(DatasetBase):
     C2W extrinsics with OpenGL coordinate convention.
     """
 
-    def __init__(self, dir="/vulcanscratch/hughma/data/nrgbd/"):
+    def __init__(
+            self,
+            cache_path="/vulcanscratch/hughma/PP3DR/datasets/nrgbd_dataset_cache.pth",
+            dir="/vulcanscratch/hughma/data/nrgbd/"
+    ):
         super().__init__(dir)
+        if os.path.exists(cache_path):
+            self.sequences = torch.load(cache_path)
+            self.sequence_length = len(self.sequences)
+            print(f"Loaded dataset from {cache_path}.")
+            return
+
+        print(f"{cache_path} not found. Initialising NRGBD dataset from scratch...")
         for i, sequence in tqdm(enumerate(self.sequence_names), desc="Precomputing NRGBD image file paths"):
             sequence_dir = os.path.join(dir, sequence)
             image_dir = os.path.join(sequence_dir, "images")
@@ -35,6 +46,9 @@ class nrgbd_dataset(DatasetBase):
 
             self.sequences[i]['poses'] = os.path.join(dir, sequence, "poses.txt")
             self.sequences[i]['focal'] = os.path.join(dir, sequence, "focal.txt")
+
+        torch.save(self.sequences, cache_path)
+        print(f"Saved to {cache_path}")
 
     def depths_helper(self, sequence_index, frame_indices):
         return super().depths_helper(sequence_index, frame_indices) / 1000

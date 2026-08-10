@@ -53,8 +53,8 @@ class ViTTT(nn.Module):
             blocks = 12, # DINOv3 H+ has 32 layers.
             ffn_ratio = 4,
             num_registers = 5,
-            # In the ViTTT code found in the ViTTT folder, the default value for start_checkpointing is 6.
-            # The reason it's increased to 10 here is so the non-checkpointed blocks take up around the same VRAM whether
+            # In the ViTTT code found in the ViTTT folder, the default value for start_checkpointing is 8.
+            # The reason it's increased to 12 here is so the non-checkpointed blocks take up around the same VRAM whether
             # freeze_feature_extractor is enabled or not, so I obtain maximum VRAM usage without having to adjust the
             # batch size every time I change freeze_feature_extractor.
             # Once I start doing long-sequence-length finetuning, I will almost certainly decrease this to maximize the

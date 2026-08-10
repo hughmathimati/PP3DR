@@ -4,10 +4,10 @@ from models.mixed_head import PP3DR_mixed_head
 from training.PP3DR_loss import PP3DR_loss
 from datasets.nrgbd_dataset import nrgbd_dataset
 from datasets.dtu_dataset import dtu_dataset
-from datasets.dynamic_replica_dataset import dynamic_replica_dataset
+from datasets.dynamic_replica.dynamic_replica_dataset import dynamic_replica_dataset
 from datasets.eth3d_dataset import eth3d_dataset
-from datasets.flying_things_3d_dataset import flying_things_3d_dataset
-from datasets.sintel_dataset import sintel_dataset
+from datasets.flying_things_3d.flying_things_3d_dataset import flying_things_3d_dataset
+from datasets.sintel.sintel_dataset import sintel_dataset
 
 class SanityTrainer(BaseTrainer):
     def per_epoch(self):
