@@ -103,7 +103,7 @@ class flying_things_3d_dataset(DatasetBase):
         # 3. Process all sequences concurrently
         # Network drives have high latency but massive bandwidth.
         # 32 threads allows us to parse 32 folders at the exact same time.
-        with ThreadPoolExecutor(max_workers=32) as executor:
+        with ThreadPoolExecutor() as executor:
             results = list(tqdm(
                 executor.map(self._process_sequence, tasks),
                 total=len(tasks),

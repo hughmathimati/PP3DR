@@ -3,12 +3,14 @@ from datasets.dynamic_replica.dynamic_replica_val_dataset import dynamic_replica
 from datasets.dynamic_replica.dynamic_replica_test_dataset import dynamic_replica_test_dataset
 from datasets.flying_things_3d.flying_things_3d_dataset import flying_things_3d_dataset
 from datasets.flying_things_3d.flying_things_3d_test_dataset import flying_things_3d_test_dataset
+from datasets.rtmv.rtmv_dataset import rtmv_dataset
+from datasets.rtmv.rtmv_test_dataset import rtmv_test_dataset
 from datasets.interior_net_dataset import interior_net_dataset
 from datasets.nrgbd_dataset import nrgbd_dataset
 from datasets.dtu_dataset import dtu_dataset
 from datasets.eth3d_dataset import eth3d_dataset
-from datasets.sintel.sintel_dataset import sintel_dataset
 from datasets.nrgbd_dataset import nrgbd_dataset
+from datasets.sintel.sintel_dataset import sintel_dataset
 
 import transformers.optimization
 import torch
@@ -45,13 +47,12 @@ def debug_collate(batch):
                     # are often flagged as non-contiguous memory blocks!
                     print(f"{key}: shape {list(val.shape)} | dtype: {val.dtype} | contiguous: {val.is_contiguous()}")
                 else:
-                    print(f"{key}: {type(val)}")
+                    print(f"{key}: {val}")
 
-        print("=" * 60 + "\n")
+        print("=" * 60 + "\n", flush=True)
 
         # Re-raise the error so the script still halts safely
         raise e
-
 
 class State:
     def __init__(self, epochs, device):
@@ -83,8 +84,8 @@ class BaseTrainer:
                  model,
                  loss,
                  name="checkpoints",
-                 epochs=40,
-                 checkpoint_every=15,
+                 epochs=30,
+                 checkpoint_every=11,
                  pretrained_path=None,
                  checkpoint=None,
                  strict=True,
@@ -92,11 +93,13 @@ class BaseTrainer:
                  use_muon=False, # In my limited testing, Muon underperforms AdamW.
                  batch_size=4,
                  gradient_accumulation_steps=8,
-                 start_checkpointing=10,
+                 start_checkpointing=11, # Trying out 12 instead of 10
+                 # DEBUG: Only including RTMV datasets for debugging purposes
                  train_datasets=[
-                     dynamic_replica_dataset, dynamic_replica_val_dataset, dynamic_replica_test_dataset,
-                     flying_things_3d_dataset, flying_things_3d_test_dataset,
-                     nrgbd_dataset, dtu_dataset, eth3d_dataset
+                     # dynamic_replica_dataset, dynamic_replica_val_dataset, dynamic_replica_test_dataset,
+                     # flying_things_3d_dataset, flying_things_3d_test_dataset,
+                     rtmv_dataset, rtmv_test_dataset, # DEBUG:
+                     # interior_net_dataset, nrgbd_dataset, dtu_dataset, eth3d_dataset
                  ],
                  val_dataset=sintel_dataset,
                  ):
@@ -230,13 +233,12 @@ class BaseTrainer:
 
         train_dataloader = DataLoader(
             ConcatDataset(constructed),
-            # Batch size of 6 sequences, each with 10 images (60 images total)
             batch_size=batch_size,
-            shuffle=True,  # Critical: Shuffles across all domains!
-            num_workers=4, # Temporarily decreased to 4 until I refactor the datasets
+            shuffle=True,
+            num_workers=8,
             pin_memory=True,
             persistent_workers=True,
-            collate_fn=debug_collate # DEBUG
+            # collate_fn=debug_collate
         )
 
         return train_dataloader, val_dataloader
@@ -407,6 +409,19 @@ class BaseTrainer:
                 # Accelerate automatically handles autocast and automatically moves the batch's tensors to the right GPU.
                 pred = self.PP3DR_model(batch['images'], batch['rope_x'], batch['rope_y'])
                 loss, loss_dict = self.metric(pred, batch)
+
+                # DEBUG:
+                # TRAP 1: Catch NaN/Inf Losses
+                if not loss.isfinite():
+                    dataset_sources = set(batch.get('dataset_name', ['Unknown']))
+                    raise RuntimeError(
+                        f"\n{'=' * 60}\n"
+                        f"FATAL: POISON BATCH DETECTED!\n"
+                        f"Loss evaluated to: {loss.item()}\n"
+                        f"Datasets in this corrupted batch: {dataset_sources}\n"
+                        f"{'=' * 60}"
+                    )
+
                 self.state.train_losses[self.state.epoch - 1] += loss.detach()
                 with torch.autocast(device_type=self.accelerator.device.type, enabled=False):
                     self.AdamW.zero_grad()

@@ -146,18 +146,16 @@ def visualize_gt_sequence(gt, port=8080):
         time.sleep(1.0 / gui_fps.value)
 
 
-# ==========================================
-# Example usage with dummy data
-# ==========================================
 if __name__ == "__main__":
-    # from datasets.nrgbd_dataset import nrgbd_dataset as dataset
-    # from datasets.dtu_dataset import dtu_dataset as dataset
-    # from datasets.dynamic_replica_dataset import dynamic_replica_dataset as dataset
-    # from datasets.eth3d_dataset import eth3d_dataset as dataset
-    # from datasets.flying_things_3d_dataset import flying_things_3d_dataset as dataset
-    from datasets.sintel.sintel_dataset import sintel_dataset as dataset
+    from tqdm import tqdm
+    from datasets.interior_net_dataset import interior_net_dataset as dataset
     dataset = dataset()
-    first = dataset[7]
+    # for i in tqdm(range(0, len(dataset))):
+    #     first = dataset[i]
+    #     if first['images'].shape[1] > 1:
+    #         continue
+    # print(f"Monochrome {i}")
+    first = dataset[320]
     """
     NOTE:
     Because you modified the camera intrinsics inside input_helper(), you DO NOT need to use the raw images/depths here!
@@ -165,7 +163,7 @@ if __name__ == "__main__":
     If this wasn't the case, your model would be training on pure garbage!
     """
     # Change scale
-    scale = 2
+    scale = 10
     print(first['extrinsics'].shape)
     for extrinsic in first['extrinsics']:
         extrinsic[:, 3] *= scale

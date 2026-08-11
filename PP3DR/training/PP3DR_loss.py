@@ -95,7 +95,7 @@ class PP3DR_loss(nn.Module):
         # Force the weights of any near-zero coordinates to zero, so we don't end up dividing by them.
         valid_mask = pred.abs() > 1e-8
         weights = weights * valid_mask
-        assert weights.isnan().sum() == 0, f"{weights.isnan().sum()} NaNs in weights"
+        # assert weights.isnan().sum() == 0, f"{weights.isnan().sum()} NaNs in weights"
         ratios = gt / pred # (B, NHW, 3)
         # Fill all invalid ratios with 0.
         ratios = ratios.masked_fill(~valid_mask, 0)
@@ -119,8 +119,8 @@ class PP3DR_loss(nn.Module):
         # median_idx = torch.clamp(median_idx, max=len(sorted_ratios) - 1)
 
         # sorted_ratios has shape (B, 3LHW). median_idx has shape (B, 1).
-        assert median_idx.max() < sorted_ratios.shape[1] and median_idx.min() > 0, \
-            f"median_idx min/max = {median_idx.min().item()} / {median_idx.max().item()}\n{median_idx}"
+        # assert median_idx.max() < sorted_ratios.shape[1] and median_idx.min() > 0, \
+        #     f"median_idx min/max = {median_idx.min().item()} / {median_idx.max().item()}\n{median_idx}"
         return torch.gather(sorted_ratios, dim=1, index=median_idx) # (B, 1)
 
     def obtain_gt_relative_poses(self, extrinsics):
@@ -200,19 +200,22 @@ class PP3DR_loss(nn.Module):
         X = (x - cx) * Z / fx # (B, L, H, W)
         Y = (y - cy) * Z / fy # (B, L, H, W)
 
+        # print("Invalid coordinates (X, Y, Z):", (~X.isfinite()).sum(), (~Y.isfinite()).sum(), (~Z.isfinite()).sum(), flush=True)
+
         return torch.stack((X, Y, Z), dim=-1) # (B, N, H, W, 3)
 
     def initialize(self, pred, gt):
         gt['depths'], gt['extrinsics'], gt['intrinsics'] = gt['depths'].cuda(), gt['extrinsics'].cuda(), gt['intrinsics'].cuda()
         B = gt['depths'].shape[0]
 
-        gt_valid_depth_mask = torch.isfinite(gt['depths']) & (gt['depths'] != 0)
+        gt_valid_depth_mask = torch.isfinite(gt['depths']) & (gt['depths'] > 0)
+        # torch._assert(gt_valid_depth_mask.sum() > 0, f"gt['depths'] has shape {gt['depths'].shape} and all of its elements are invalid.")
         gt_invalid_depth_mask = ~gt_valid_depth_mask
 
         # First, normalise the MEDIAN ground-truth depth to 1.
         # Calculate the median over only valid elements by filling all invalid with NaN and using torch.nanmedian().
         median_depths = torch.nanmedian(
-            gt['depths'].masked_fill(gt_invalid_depth_mask, float('nan')).flatten(1),
+            gt['depths'].masked_fill(gt_invalid_depth_mask, float('nan')).flatten(start_dim=1),
             dim=-1
         )[0]  # (B)
         torch._assert(
@@ -220,9 +223,18 @@ class PP3DR_loss(nn.Module):
             f"{median_depths.isnan().sum()} batch's gt depths are completely invalid."
         )
 
+        # print("Pre-normalise:", (~gt['depths'].isfinite()).sum(), (~median_depths.isfinite()).sum(), (median_depths == 0).sum(), self.median_depth, flush=True)
+        # print(f"depths_max: {gt['depths'].max()}", f"median_min: {median_depths.min()}", flush=True)
+
         gt['depths'] = self.median_depth * gt['depths'] / median_depths.view(B, 1, 1, 1)
-        # Sanitize GT depths before they touch the predictions by setting all invalid values to the median depth, 1.
-        gt['depths'] = gt['depths'].masked_fill(gt_invalid_depth_mask, 1)
+
+        # print("Post-fill:", (~gt['depths'].isfinite()).sum(), flush=True)
+
+        # Sanitize GT depths before they touch the predictions by setting all invalid values to the median depth.
+        # It doesn't actually matter what we set it to, since we'll be zeroing out their losses anyway, but I just chose
+        # to use the median depth here.
+        gt['depths'] = gt['depths'].masked_fill(gt_invalid_depth_mask, self.median_depth)
+
         weights = 2 * self.median_depth / (self.median_depth + gt['depths'])  # multiplied by 2 so the median weight is 1
         # Multiply weights by gt_valid_depth_mask to zero the weights of any points with invalid gt depths.
         weights = weights.masked_fill(gt_invalid_depth_mask, 0)
@@ -251,6 +263,15 @@ class PP3DR_loss(nn.Module):
         ) * weights.view(B, L, H, W, 1)  # Broadcasts against all 3 coordinates of each point.
         # total_point_loss = ((pred_points * scale.view(B, 1, 1, 1, 1) - gt_points)**2 * weights.view(B, L, H, W, 1))
         # We shouldn't have to masked_fill() total_point_loss here, as pred and gt should all be valid by this point.
+        # torch._assert(
+        #     (~total_point_loss.isfinite()).sum() == 0,
+        #     f"total_point_loss has shape {total_point_loss.shape}, "
+        #     f"and {(~total_point_loss.isfinite()).sum()} of its elements are invalid.\n"
+        #     f"{(~gt_valid_depth_mask).sum()} gt depths are invalid.\n"
+        #     f"{(~gt_points.isfinite()).sum()} gt point coordinates are invalid.\n"
+        #     f"{(~pred_points.isfinite()).sum()} pred point coordinates are invalid.\n"
+        #     f"{(~weights.isfinite()).sum()} weights are invalid."
+        # )
         return total_point_loss.sum() / (gt_valid_depth_mask.sum() * 3)  # *3 for x, y, and z
 
     def normal_loss(self, points, gt_points, mask, gt_depths):
@@ -419,12 +440,11 @@ class PP3DR_loss(nn.Module):
         pred_points, gt_points, scale, weights, median_depths, gt_valid_depth_mask = self.initialize(pred, gt)
 
         point_loss = self.point_loss(pred_points, gt_points, scale, weights, gt_valid_depth_mask)
-        # torch._assert(
-        #     point_loss.isfinite(),
-        #     f"Point loss invalid ({point_loss})\ttotal_point_loss = {total_point_loss}"
-        # )
+        torch._assert(point_loss.isfinite(), f"Point loss invalid ({point_loss})")
+
         gt_log_depths = torch.log(gt['depths'])
         depth_loss = self.depth_loss(pred['log_depths'], gt_log_depths, gt_valid_depth_mask)
+        torch._assert(depth_loss.isfinite(), f"Depth loss invalid ({depth_loss})")
 
         normal_loss = self.normal_loss(
             points=pred_points,
@@ -432,8 +452,10 @@ class PP3DR_loss(nn.Module):
             mask=gt_valid_depth_mask,
             gt_depths=gt['depths']
         )
+        torch._assert(normal_loss.isfinite(), f"Depth loss invalid ({normal_loss})")
 
         gradient_matching_loss = self.gradient_matching_loss(pred['log_depths'], gt_log_depths, gt_valid_depth_mask)
+        torch._assert(depth_loss.isfinite(), f"Gradient matching loss invalid ({gradient_matching_loss})")
 
         gt_relative_rotations, gt_relative_translations = self.obtain_gt_relative_poses(gt['extrinsics'])
 

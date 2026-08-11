@@ -75,7 +75,12 @@ class DatasetBase(torch.utils.data.Dataset):
         return torch.stack(
             [
                 transforms.functional.to_dtype(
-                    torchvision.io.decode_image(self.images[i]),
+                    # torchvision.io.decode_image(self.images[i]),
+                    # I'm using the below instead to be robust to 1-channel or 4-channel images.
+                    torchvision.io.read_image(
+                        self.images[i],
+                        mode=torchvision.io.image.ImageReadMode.RGB
+                    ),
                     torch.float32,
                     scale=True
                 )[:3]  # I'm including this here for the RGBA datasets.
@@ -252,6 +257,27 @@ class DatasetBase(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
         """
+        This function wraps the actual getitem() function to help make it robust against data corruption/invalid frames,
+        etc.
+        """
+        max_retries = 10
+        for _ in range(max_retries):
+            try:
+                return self.getitem(index)
+            except Exception as e:
+                latest_exception = e
+        print(
+            f"\n{'=' * 50}\n"
+            f"CRASH: Could not obtain an error-free sample after {max_retries} retries!\n"
+            f"Dataset: {type(self).__name__}\n"
+            f"Index: {index}\n"
+            f"{'=' * 50}",
+            flush=True
+        )
+        raise latest_exception
+
+    def getitem(self, index):
+        """
         Pick a random starting frame before the last 10 * x frames, then randomly sample x frames from the subsequent
         10 * x frames.
 
@@ -302,9 +328,24 @@ class DatasetBase(torch.utils.data.Dataset):
             images, depths, intrinsics = a.result(), b.result(), c.result()
             if self.raw:
                 output['raw_images'], output['raw_depths'], output['raw_intrinsics'] = images, depths, intrinsics
-            output['images'], output['depths'], output['intrinsics'], output['rope_x'], output['rope_y'] = self.input_helper(images, depths, intrinsics)
 
+            # if depths is None:
+            #     dataset_name = type(self).__name__
+            #     raise ValueError(
+            #         f"\n{'=' * 60}\n"
+            #         f"CRASH DETECTED: depths_helper returned None!\n"
+            #         f"Dataset: {dataset_name}\n"
+            #         f"Sequence Index: {index}\n"
+            #         f"{'=' * 60}"
+            #     )
+            # if images is None:
+            #     dataset_name = type(self).__name__
+            #     raise ValueError(f"CRASH: {dataset_name} images_helper returned None at seq {index}")
+
+            output['images'], output['depths'], output['intrinsics'], output['rope_x'], output['rope_y'] = self.input_helper(images, depths, intrinsics)
             output['extrinsics'] = d.result()
+
+        output['dataset_name'] = type(self).__name__ # DEBUG:
         return output
 
 
