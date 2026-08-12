@@ -10,12 +10,10 @@ import math
 
 
 def _smooth(err: torch.Tensor, beta: float = 0.0) -> torch.Tensor:
-    # if beta == 0:
-    #     return err
-    # else:
-    #     return torch.where(err < beta, 0.5 * err.square() / beta, err - 0.5 * beta)
-    # NOTE: I'm experimenting with L1 + MSE.
-    return err**2
+    if beta == 0:
+        return err
+    else:
+        return torch.where(err < beta, 0.5 * err.square() / beta, err - 0.5 * beta)
 
 
 def angle_diff_vec3(v1: torch.Tensor, v2: torch.Tensor, eps: float = 1e-8):
@@ -200,8 +198,6 @@ class PP3DR_loss(nn.Module):
         X = (x - cx) * Z / fx # (B, L, H, W)
         Y = (y - cy) * Z / fy # (B, L, H, W)
 
-        # print("Invalid coordinates (X, Y, Z):", (~X.isfinite()).sum(), (~Y.isfinite()).sum(), (~Z.isfinite()).sum(), flush=True)
-
         return torch.stack((X, Y, Z), dim=-1) # (B, N, H, W, 3)
 
     def initialize(self, pred, gt):
@@ -209,7 +205,6 @@ class PP3DR_loss(nn.Module):
         B = gt['depths'].shape[0]
 
         gt_valid_depth_mask = torch.isfinite(gt['depths']) & (gt['depths'] > 0)
-        # torch._assert(gt_valid_depth_mask.sum() > 0, f"gt['depths'] has shape {gt['depths'].shape} and all of its elements are invalid.")
         gt_invalid_depth_mask = ~gt_valid_depth_mask
 
         # First, normalise the MEDIAN ground-truth depth to 1.
@@ -222,13 +217,7 @@ class PP3DR_loss(nn.Module):
             median_depths.isnan().sum() == 0,
             f"{median_depths.isnan().sum()} batch's gt depths are completely invalid."
         )
-
-        # print("Pre-normalise:", (~gt['depths'].isfinite()).sum(), (~median_depths.isfinite()).sum(), (median_depths == 0).sum(), self.median_depth, flush=True)
-        # print(f"depths_max: {gt['depths'].max()}", f"median_min: {median_depths.min()}", flush=True)
-
         gt['depths'] = self.median_depth * gt['depths'] / median_depths.view(B, 1, 1, 1)
-
-        # print("Post-fill:", (~gt['depths'].isfinite()).sum(), flush=True)
 
         # Sanitize GT depths before they touch the predictions by setting all invalid values to the median depth.
         # It doesn't actually matter what we set it to, since we'll be zeroing out their losses anyway, but I just chose
@@ -261,17 +250,7 @@ class PP3DR_loss(nn.Module):
             gt_points,
             reduction='none'
         ) * weights.view(B, L, H, W, 1)  # Broadcasts against all 3 coordinates of each point.
-        # total_point_loss = ((pred_points * scale.view(B, 1, 1, 1, 1) - gt_points)**2 * weights.view(B, L, H, W, 1))
         # We shouldn't have to masked_fill() total_point_loss here, as pred and gt should all be valid by this point.
-        # torch._assert(
-        #     (~total_point_loss.isfinite()).sum() == 0,
-        #     f"total_point_loss has shape {total_point_loss.shape}, "
-        #     f"and {(~total_point_loss.isfinite()).sum()} of its elements are invalid.\n"
-        #     f"{(~gt_valid_depth_mask).sum()} gt depths are invalid.\n"
-        #     f"{(~gt_points.isfinite()).sum()} gt point coordinates are invalid.\n"
-        #     f"{(~pred_points.isfinite()).sum()} pred point coordinates are invalid.\n"
-        #     f"{(~weights.isfinite()).sum()} weights are invalid."
-        # )
         return total_point_loss.sum() / (gt_valid_depth_mask.sum() * 3)  # *3 for x, y, and z
 
     def normal_loss(self, points, gt_points, mask, gt_depths):
@@ -373,7 +352,7 @@ class PP3DR_loss(nn.Module):
         gt_valid_translation_mask = gt_relative_translations.isfinite().all(dim=-1, keepdim=True)  # (B, L - 1, 1)
         gt_invalid_translation_mask = ~gt_valid_translation_mask
         gt_relative_translations = gt_relative_translations.masked_fill(gt_invalid_translation_mask, 0)
-        total_translation_loss = F.huber_loss(
+        total_translation_loss = F.l1_loss(
             scale.view(B, 1, 1) * pred['relative_camera_translations'],
             self.median_depth * gt_relative_translations / median_depths.view(B, 1, 1),
             reduction='none'
@@ -469,6 +448,7 @@ class PP3DR_loss(nn.Module):
         # is Cosine Similarity. The magnitude of gradient_matching_loss is much smaller than the other two L1 losses,
         # but the gradient is the same, thanks to L1 loss.
         total_loss = point_loss + depth_loss + gradient_matching_loss + normal_loss + translation_loss + rotation_loss
+        # total_loss = point_loss + depth_loss + gradient_matching_loss + translation_loss + rotation_loss
         return total_loss, dict(
             total_loss=total_loss,
             point_loss=point_loss,

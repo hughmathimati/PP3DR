@@ -148,14 +148,14 @@ def visualize_gt_sequence(gt, port=8080):
 
 if __name__ == "__main__":
     from tqdm import tqdm
-    from datasets.interior_net_dataset import interior_net_dataset as dataset
+    from datasets.rtmv.rtmv_test_dataset import rtmv_test_dataset as dataset
     dataset = dataset()
     # for i in tqdm(range(0, len(dataset))):
     #     first = dataset[i]
     #     if first['images'].shape[1] > 1:
     #         continue
     # print(f"Monochrome {i}")
-    first = dataset[320]
+    first = dataset[39]
     """
     NOTE:
     Because you modified the camera intrinsics inside input_helper(), you DO NOT need to use the raw images/depths here!

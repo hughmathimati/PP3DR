@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=new_design_datasets
-#SBATCH --output=new_design_datasets-%j.out
+#SBATCH --job-name=new_design_datasets-l1-normal
+#SBATCH --output=new_design_datasets-l1-normal-%j.out
 #SBATCH --partition=vulcan-ampere
 #SBATCH --ntasks 1
 #SBATCH --cpus-per-task=64

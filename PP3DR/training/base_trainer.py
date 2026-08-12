@@ -84,8 +84,8 @@ class BaseTrainer:
                  model,
                  loss,
                  name="checkpoints",
-                 epochs=30,
-                 checkpoint_every=11,
+                 epochs=15,
+                 checkpoint_every=8,
                  pretrained_path=None,
                  checkpoint=None,
                  strict=True,
@@ -93,13 +93,12 @@ class BaseTrainer:
                  use_muon=False, # In my limited testing, Muon underperforms AdamW.
                  batch_size=4,
                  gradient_accumulation_steps=8,
-                 start_checkpointing=11, # Trying out 12 instead of 10
-                 # DEBUG: Only including RTMV datasets for debugging purposes
+                 start_checkpointing=11, # 11 keeps VRAM at around 99% with a batch size of 4.
                  train_datasets=[
-                     # dynamic_replica_dataset, dynamic_replica_val_dataset, dynamic_replica_test_dataset,
-                     # flying_things_3d_dataset, flying_things_3d_test_dataset,
-                     rtmv_dataset, rtmv_test_dataset, # DEBUG:
-                     # interior_net_dataset, nrgbd_dataset, dtu_dataset, eth3d_dataset
+                     dynamic_replica_dataset, dynamic_replica_val_dataset, dynamic_replica_test_dataset,
+                     flying_things_3d_dataset, flying_things_3d_test_dataset,
+                     rtmv_dataset, rtmv_test_dataset,
+                     interior_net_dataset, nrgbd_dataset, dtu_dataset, eth3d_dataset
                  ],
                  val_dataset=sintel_dataset,
                  ):
@@ -301,7 +300,7 @@ class BaseTrainer:
                          head_blocks: int = 8,
                          freeze_feature_extractor=True,
                          use_muon: bool = True,
-                         adamw_lr: float = 1e-4,
+                         adamw_lr: float = 1e-6, # 1e-4
                          muon_lr: float = 1e-3,
                          weight_decay: float = 0.04,
                          layer_decay: float = 0.95,
@@ -409,18 +408,6 @@ class BaseTrainer:
                 # Accelerate automatically handles autocast and automatically moves the batch's tensors to the right GPU.
                 pred = self.PP3DR_model(batch['images'], batch['rope_x'], batch['rope_y'])
                 loss, loss_dict = self.metric(pred, batch)
-
-                # DEBUG:
-                # TRAP 1: Catch NaN/Inf Losses
-                if not loss.isfinite():
-                    dataset_sources = set(batch.get('dataset_name', ['Unknown']))
-                    raise RuntimeError(
-                        f"\n{'=' * 60}\n"
-                        f"FATAL: POISON BATCH DETECTED!\n"
-                        f"Loss evaluated to: {loss.item()}\n"
-                        f"Datasets in this corrupted batch: {dataset_sources}\n"
-                        f"{'=' * 60}"
-                    )
 
                 self.state.train_losses[self.state.epoch - 1] += loss.detach()
                 with torch.autocast(device_type=self.accelerator.device.type, enabled=False):

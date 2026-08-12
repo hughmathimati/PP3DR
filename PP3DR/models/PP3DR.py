@@ -285,8 +285,10 @@ class PP3DR(nn.Module):
         assert decoder_blocks % 2 == 0, f"Number of decoder blocks ({decoder_blocks}) must be even for alternating global and frame-wise attention"
         self.decoder_blocks = decoder_blocks
         self.blocks_each = decoder_blocks // 2
-        # If we're unfreezing ViTTT, we'll be checkpointing its first 6 blocks rather than our first 6 blocks.
-        self.start_checkpointing = start_checkpointing if freeze_feature_extractor else 0
+        # If we're unfreezing ViTTT, we still want to maximise VRAM usage.
+        # To keep VRAM around 99% with the same batch size as freeze_feature_extractor=True, we're going to checkpoint
+        # *none* of the ViTTT blocks and 2 of the PP3DR blocks.
+        self.start_checkpointing = start_checkpointing if freeze_feature_extractor else 4
 
         # General decoder
         self.dim = dim

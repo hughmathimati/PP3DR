@@ -1,203 +1,223 @@
-import numpy as np
 import viser
 import time
-from models.PP3DR import PP3DR
+import numpy as np
 import torch
-from datasets.nrgbd_dataset import nrgbd_dataset
+from scipy.spatial.transform import Rotation
 
 
-def visualize_reconstruction(pred: dict, gt: dict):
+def visualize_pred_sequence(pred, gt, port=8080):
     """
-    Visualizes the unprojected video frames using Viser.
+    Visualizes a sequence of model PREDICTIONS in 3D.
+    Accumulates relative camera poses into absolute world trajectories.
 
-    Args:
-        pred: Dictionary containing predictions:
-            - "XY_rays": (B, L, H, W, 2)
-            - "log_depths": (B, L, H, W)
-            - "relative_camera_translations": (B, L - 1, 3)
-            - "relative_camera_rotations": (B, L - 1, 3, 3)
-        gt: Dictionary containing ground-truth data:
-            - "images": (B, L, H, W, 3)
-            - "depths": (B, L, H, W)
+    Expects `pred` dictionary to contain:
+      log_depths: (..., L, H, W)
+      focal_length: (..., L, 1) or scalar
+      relative_camera_translations: (..., L-1, 3)
+      relative_camera_rotations: (..., L-1, 3, 3)
+
+    Expects `gt` dictionary (for images, start anchor, and principal points):
+      images: (..., L, 3, H, W)
+      extrinsics: (..., L, 3, 4)
+      intrinsics: (..., L, 3, 3)
     """
-    # Start the viser server
-    server = viser.ViserServer(port=8080)
+    server = viser.ViserServer(port=port)
+    print(f"Viser server running at http://localhost:{port}")
 
-    # Extract dimensions
-    B, L, H, W, _ = pred["XY_rays"].shape
+    # 1. Helper to safely extract and strip batch dimensions (Assuming B=1 if batched)
+    def to_np_unbatched(x):
+        arr = x.detach().cpu().numpy() if hasattr(x, 'cpu') else np.array(x)
+        # If it has a batch dimension (e.g. 5D for images, 4D for depth), squeeze the first dim
+        if arr.ndim >= 3 and arr.shape[0] == 1:
+            arr = arr[0]
+        return arr
 
-    # -------------------------------------------------------------------------
-    # GUI Elements Setup
-    # -------------------------------------------------------------------------
-    with server.gui.add_folder("Controls"):
-        gui_batch = server.gui.add_slider(
-            "Batch Index", min=0, max=B - 1, step=1, initial_value=0, visible=(B > 1)
+    # --- Extract GT Context ---
+    images = to_np_unbatched(gt['images'])  # (L, 3, H, W)
+    gt_extrinsics = to_np_unbatched(gt['extrinsics'])  # (L, 3, 4)
+    gt_intrinsics = to_np_unbatched(gt['intrinsics'])  # (L, 3, 3)
+
+    L, _, H, W = images.shape
+
+    # --- Extract Predictions ---
+    log_depths = to_np_unbatched(pred['log_depths'])  # (L, H, W)
+    depths_pred = np.exp(log_depths)  # Convert log_depth back to metric Z
+
+    focal_lengths = to_np_unbatched(pred['focal_length']).flatten()  # Extract focal lengths
+
+    rel_T = to_np_unbatched(pred['relative_camera_translations'])  # (L-1, 3)
+    rel_R = to_np_unbatched(pred['relative_camera_rotations'])  # (L-1, 3, 3)
+
+    # --- Format Images ---
+    if images.dtype in (np.float32, np.float64) and images.max() <= 1.0:
+        images = (images * 255).astype(np.uint8)
+    images = np.transpose(images, (0, 2, 3, 1))  # -> (L, H, W, 3)
+
+    # --- Accumulate Relative Poses into Absolute Poses ---
+    extrinsics_pred = np.zeros((L, 3, 4), dtype=np.float32)
+
+    # Anchor Frame 0 to the exact starting position of the GT sequence
+    extrinsics_pred[0] = gt_extrinsics[0]
+
+    # Sequentially chain the relative predictions
+    for i in range(1, L):
+        R_prev = extrinsics_pred[i - 1, :3, :3]
+        T_prev = extrinsics_pred[i - 1, :3, 3]
+
+        # R_rel = R_next @ R_prev^T  =>  R_next = R_rel @ R_prev
+        R_next = rel_R[i - 1] @ R_prev
+
+        # T_rel = T_next - T_prev  =>  T_next = T_prev + T_rel
+        T_next = T_prev + rel_T[i - 1]
+
+        extrinsics_pred[i, :3, :3] = R_next
+        extrinsics_pred[i, :3, 3] = T_next
+
+    # --- Setup Viser UI ---
+    u, v = np.meshgrid(np.arange(W), np.arange(H))
+
+    gui_frame = server.gui.add_slider("Frame", min=0, max=L - 1, step=1, initial_value=0)
+    gui_play = server.gui.add_checkbox("Play Sequence", initial_value=False)
+    gui_fps = server.gui.add_slider("Playback FPS", min=1, max=60, step=1, initial_value=10)
+    gui_show_all = server.gui.add_checkbox("Show All Frustums", initial_value=True)
+    gui_accumulate = server.gui.add_checkbox("Accumulate Point Clouds", initial_value=False)
+
+    # --- Draw Camera Frustums ---
+    camera_nodes = []
+    for i in range(L):
+        R = extrinsics_pred[i, :3, :3]
+        T = extrinsics_pred[i, :3, 3]
+
+        # Handle sequence-unified vs per-frame focal length predictions
+        f = focal_lengths[0] if len(focal_lengths) == 1 else focal_lengths[i]
+
+        # Calculate Vertical FOV from the predicted focal length
+        fov = 2 * np.arctan(H / (2 * f))
+
+        # Convert Rotation Matrix to Viser Quaternion (w, x, y, z)
+        quat_xyzw = Rotation.from_matrix(R).as_quat()
+        quat_wxyz = quat_xyzw[[3, 0, 1, 2]]
+
+        cam_node = server.scene.add_camera_frustum(
+            f"/trajectory/cam_{i:04d}",
+            fov=fov,
+            aspect=W / H,
+            scale=0.1,  # Physical size of the frustum
+            image=images[i],  # Project the RGB image into the frustum
+            position=T,
+            wxyz=quat_wxyz,
         )
-        gui_frame = server.gui.add_slider(
-            "Current Frame", min=0, max=L - 1, step=1, initial_value=0
-        )
-        gui_accumulate = server.gui.add_checkbox(
-            "Accumulate Points", initial_value=False
-        )
-        gui_point_size = server.gui.add_slider(
-            "Point Size", min=0.001, max=0.05, step=0.001, initial_value=0.01
-        )
+        camera_nodes.append(cam_node)
 
-    # -------------------------------------------------------------------------
-    # Core Geometric Computations
-    # -------------------------------------------------------------------------
-    def compute_absolute_poses(b_idx):
-        """
-        Computes transformations mapping each frame's local space to the
-        coordinate system of the first camera (frame 0).
-        """
-        T_absolute = np.zeros((L, 4, 4))
-        T_absolute[:, 3, 3] = 1.0  # Set homogeneous coordinate
+    # Cache for point clouds
+    pc_nodes = [None] * L
 
-        # Frame 0 is our reference origin
-        current_R = np.eye(3)
-        current_t = np.zeros(3)
+    def update_frame():
+        i = gui_frame.value
 
-        T_absolute[0, :3, :3] = current_R
-        T_absolute[0, :3, 3] = current_t
+        # Lazy computation: Only unproject if we haven't rendered this frame yet
+        if pc_nodes[i] is None:
+            Z = depths_pred[i]
 
-        R_rel = pred["relative_camera_rotations"][b_idx]  # (L-1, 3, 3)
-        t_rel = pred["relative_camera_translations"][b_idx]  # (L-1, 3)
+            # Use predicted focal length, but fallback to GT for the principal points
+            f = focal_lengths[0] if len(focal_lengths) == 1 else focal_lengths[i]
+            cx, cy = gt_intrinsics[i, 0, 2], gt_intrinsics[i, 1, 2]
 
-        for i in range(L - 1):
-            # R_rel = R_next @ R_current.T  => R_next = R_rel @ R_current
-            current_R = R_rel[i] @ current_R
+            # Unproject to local camera coordinates
+            X = (u - cx) * Z / f
+            Y = (v - cy) * Z / f
+            pts_cam = np.stack([X, Y, Z], axis=-1).reshape(-1, 3)
 
-            # t_rel = t_next - t_current    => t_next = t_current + t_rel
-            # print(current_t.shape, t_rel[i].shape) # DEBUG
-            current_t = current_t + t_rel[i]
+            # Flatten arrays for filtering
+            Z_flat = Z.reshape(-1)
+            colors_flat = images[i].reshape(-1, 3)
 
-            T_absolute[i + 1, :3, :3] = current_R
-            T_absolute[i + 1, :3, 3] = current_t
+            # Drop invalid/empty depths (or wildly out of bounds predictions)
+            valid = (Z_flat > 0) & (Z_flat < 50.0) & np.isfinite(Z_flat)
+            pts_cam = pts_cam[valid]
+            colors_flat = colors_flat[valid]
 
-        return T_absolute
+            # Transform local points to World coordinates using our ACCUMULATED matrices
+            R = extrinsics_pred[i, :3, :3]
+            T = extrinsics_pred[i, :3, 3]
+            pts_world = (R @ pts_cam.T).T + T
 
-    def unproject_frame(b_idx, l_idx, T_world):
-        """Unprojects a single frame's valid points to the frame 0 space."""
-        # Convert log depth to absolute depth
-        log_depth = pred["log_depths"][b_idx, l_idx]
-        depth = np.exp(log_depth)
+            # Push to Viser
+            pc_nodes[i] = server.scene.add_point_cloud(
+                f"/point_clouds/frame_{i:04d}",
+                points=pts_world,
+                colors=colors_flat,
+                point_size=0.05
+            )
 
-        # Valid points mask (where ground truth depth is non-zero)
-        gt_depth = gt["depths"][b_idx, l_idx]
-        valid_mask = gt_depth > 0
-
-        if not np.any(valid_mask):
-            return np.zeros((0, 3)), np.zeros((0, 3))
-
-        # Filter rays, depths, and colors
-        xy_rays = pred["XY_rays"][b_idx, l_idx][valid_mask]  # (N, 2)
-        depth_valid = depth[valid_mask]  # (N,)
-
-        # Pull RGB and handle scaling normalization safely
-        reshaped = gt["images"][b_idx, l_idx].transpose(1, 2, 0)
-        img_colors = reshaped[valid_mask]  # (N, 3)
-        if img_colors.dtype == np.uint8:
-            img_colors = img_colors / 255.0
-
-        # Reconstruct 3D points in local camera space
-        # P_cam = [X_ray * depth, Y_ray * depth, depth]
-        pts_cam = np.stack([
-            xy_rays[:, 0] * depth_valid,
-            xy_rays[:, 1] * depth_valid,
-            depth_valid
-        ], axis=-1)
-
-        # Transform points to frame 0 reference space
-        pts_homo = np.concatenate([pts_cam, np.ones((pts_cam.shape[0], 1))], axis=-1)
-        pts_world = (pts_homo @ T_world.T)[..., :3]
-
-        return pts_world, img_colors
-
-    # -------------------------------------------------------------------------
-    # Render and State Update Logic
-    # -------------------------------------------------------------------------
-    def update_scene():
-        b_idx = gui_batch.value
-        current_l = gui_frame.value
+        # Update visibility states purely on the frontend
         accumulate = gui_accumulate.value
-        point_size = gui_point_size.value
+        show_all_frustums = gui_show_all.value
 
-        # Precompute absolute poses relative to frame 0 for this batch
-        T_absolute = compute_absolute_poses(b_idx)
+        for j in range(L):
+            camera_nodes[j].visible = True if show_all_frustums else (j == i)
+            if pc_nodes[j] is not None:
+                pc_nodes[j].visible = (j == i) or (accumulate and j <= i)
 
-        all_pts = []
-        all_colors = []
+    @gui_frame.on_update
+    def _(_):
+        update_frame()
 
-        # Determine which frames to parse based on accumulation toggle
-        frames_to_render = range(current_l + 1) if accumulate else [current_l]
+    @gui_show_all.on_update
+    def _(_):
+        update_frame()
 
-        for l_idx in frames_to_render:
-            pts, cols = unproject_frame(b_idx, l_idx, T_absolute[l_idx])
-            all_pts.append(pts)
-            all_colors.append(cols)
+    @gui_accumulate.on_update
+    def _(_):
+        update_frame()
 
-        if len(all_pts) > 0 and max(p.shape[0] for p in all_pts) > 0:
-            final_pts = np.concatenate(all_pts, axis=0)
-            final_cols = np.concatenate(all_colors, axis=0)
+    # Draw the first frame immediately
+    update_frame()
 
-            # Send/Update point cloud in the viser scene window
-            server.scene.add_point_cloud(
-                name="/reconstruction/point_cloud",
-                points=final_pts,
-                colors=final_cols,
-                point_size=point_size,
-            )
-        else:
-            # Clear point cloud if no valid data points exist
-            server.scene.add_point_cloud(
-                name="/reconstruction/point_cloud",
-                points=np.zeros((0, 3)),
-                colors=np.zeros((0, 3)),
-                point_size=point_size,
-            )
-
-    # Bind the reactive updates to GUI changes
-    gui_batch.on_update(lambda _: update_scene())
-    gui_frame.on_update(lambda _: update_scene())
-    gui_accumulate.on_update(lambda _: update_scene())
-    gui_point_size.on_update(lambda _: update_scene())
-
-    # Initialize scene display loop
-    update_scene()
-
-    print(f"Viser server running at: {server.get_host()}")
+    # Main render loop
     while True:
-        time.sleep(1.0)
+        if gui_play.value:
+            gui_frame.value = (gui_frame.value + 1) % L
+        time.sleep(1.0 / gui_fps.value)
 
 
-# -------------------------------------------------------------------------
-# Example Execution Context Block
-# -------------------------------------------------------------------------
 if __name__ == "__main__":
+    from datasets.nrgbd_dataset import nrgbd_dataset
+    # from datasets.rtmv.rtmv_test_dataset import rtmv_test_dataset
+    from models.PP3DR import PP3DR
+
     model = PP3DR()
-    loaded_state_dict = torch.load("/vulcanscratch/hughma/PP3DR/finetune/PP3DR.pth", weights_only=True)
-    # The lines here are necessary if all the loaded state dict entries begin with an extra "module."
-    new_state_dict = {}
-    for key in loaded_state_dict:
-        new_state_dict[key[7:]] = loaded_state_dict[key]
-    model.load_state_dict(new_state_dict)
-    model = model.eval().to("cuda")
     dataset = nrgbd_dataset()
+    remove_front = False
+    # I want to see which parameters are left over after loading this.
+    loaded_state_dict = torch.load("/vulcanscratch/hughma/PP3DR/new_design_datasets/PP3DR.pth", weights_only=True)
+    if remove_front:
+        # The lines here are necessary if all the loaded state dict entries begin with an extra "module."
+        new_state_dict = {}
+        for key in loaded_state_dict:
+            new_state_dict[key[7:]] = loaded_state_dict[key]
+        model.load_state_dict(new_state_dict)
+    else:
+        model.load_state_dict(loaded_state_dict)
+    print("post load")
+    model = model.eval().to("cuda")
+
     data = dataset[0]
     for key in data:
         data[key] = data[key].unsqueeze(0)
-    with torch.amp.autocast("cuda", dtype = torch.bfloat16), torch.no_grad():
-        pred = model(data['images'].cuda(), data['rope_x'].cuda(), data['rope_y'].cuda())
-    for key in pred:
-        pred[key] = pred[key].to(torch.float32).cpu().numpy(force=True)
-        print(f"{key}: {pred[key].shape}")
-    # Since we ran point-prediction only, we need to manually add back in some fake camera poses.
-    B, L = pred['log_depths'].shape[:2]
-    pred["relative_camera_translations"] = np.random.uniform(-0.1, 0.1, (B, L - 1, 3))
-    pred["relative_camera_rotations"] = np.tile(np.eye(3), (B, L - 1, 1, 1))
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16), torch.no_grad():
+        pred = model(data['images'].to("cuda"), data['rope_x'].to("cuda"), data['rope_y'].to("cuda"))
+    print("post pred")
 
-    for key in data:
-        data[key] = data[key].to(torch.float32).cpu().numpy(force=True)
-        print(f"{key}: {data[key].shape}")
-    visualize_reconstruction(pred, data)
+    # You can scale the translations and depths if the dataset (like RTMV) is physically tiny
+    scale = 1
+    pred['relative_camera_translations'] *= scale
+    pred['log_depths'] = pred['log_depths'] + np.log(scale)
+    data['extrinsics'][:, :, :3, 3] *= scale
+    for k in pred.keys():
+        pred[k] = pred[k].to(torch.float32)
+    for k in data.keys():
+        data[k] = data[k].to(torch.float32)
+
+    # Launch visualizer
+    visualize_pred_sequence(pred, data)

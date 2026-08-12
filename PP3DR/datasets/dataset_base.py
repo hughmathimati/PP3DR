@@ -345,7 +345,7 @@ class DatasetBase(torch.utils.data.Dataset):
             output['images'], output['depths'], output['intrinsics'], output['rope_x'], output['rope_y'] = self.input_helper(images, depths, intrinsics)
             output['extrinsics'] = d.result()
 
-        output['dataset_name'] = type(self).__name__ # DEBUG:
+        # output['dataset_name'] = type(self).__name__
         return output
 
 
