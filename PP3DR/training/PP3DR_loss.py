@@ -448,7 +448,6 @@ class PP3DR_loss(nn.Module):
         # is Cosine Similarity. The magnitude of gradient_matching_loss is much smaller than the other two L1 losses,
         # but the gradient is the same, thanks to L1 loss.
         total_loss = point_loss + depth_loss + gradient_matching_loss + normal_loss + translation_loss + rotation_loss
-        # total_loss = point_loss + depth_loss + gradient_matching_loss + translation_loss + rotation_loss
         return total_loss, dict(
             total_loss=total_loss,
             point_loss=point_loss,

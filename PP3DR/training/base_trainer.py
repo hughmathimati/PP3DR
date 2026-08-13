@@ -284,7 +284,6 @@ class BaseTrainer:
         AdamW_params, Muon_params = self.get_param_groups(
             PP3DR_model,
             decoder_blocks=PP3DR_model.decoder_blocks,
-            head_blocks=PP3DR_model.point_head.blocks,
             freeze_feature_extractor=freeze_feature_extractor,
             use_muon=use_muon
         )
@@ -296,11 +295,10 @@ class BaseTrainer:
 
     def get_param_groups(self,
                          model: nn.Module,
-                         decoder_blocks: int = 24,
-                         head_blocks: int = 8,
-                         freeze_feature_extractor=True,
-                         use_muon: bool = True,
-                         adamw_lr: float = 1e-6, # 1e-4
+                         decoder_blocks: int,
+                         freeze_feature_extractor: bool,
+                         use_muon: bool,
+                         adamw_lr: float = 1e-4, # 1e-4
                          muon_lr: float = 1e-3,
                          weight_decay: float = 0.04,
                          layer_decay: float = 0.95,
@@ -338,10 +336,8 @@ class BaseTrainer:
             """
             # Hardcoded value representing the # of blocks in the feature extractor.
             encoder_offset = 0 if freeze_feature_extractor else 12
-            num_layers = decoder_blocks + head_blocks + encoder_offset
+            num_layers = decoder_blocks + encoder_offset
             offset = encoder_offset
-            if "pose_head" in name or "point_head" in name:
-                offset += decoder_blocks
             if "blocks" in name:
                 layer_id = int(name.split("blocks.")[1].split(".")[0])
                 if "global_blocks." in name:

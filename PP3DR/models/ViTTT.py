@@ -60,7 +60,8 @@ class ViTTT(nn.Module):
             # Once I start doing long-sequence-length finetuning, I will almost certainly decrease this to maximize the
             # sequence length I can pass in.
             start_checkpointing = 12,
-            drop_rates = None
+            drop_rates = None,
+            output_blocks=[2, 11]
     ):
         super().__init__()
         self.dim = dim
@@ -78,6 +79,7 @@ class ViTTT(nn.Module):
         self.class_and_registers = nn.Parameter(torch.randn(num_registers, dim) * 0.02)
         self.final_layer_norm = nn.LayerNorm(dim)
         self.start_checkpointing = start_checkpointing
+        self.output_blocks = output_blocks
 
     def patch_embed(self, x):
         # B, 3, H, W -> B, dim, H // 16, W // 16 -> B, HW // 256, dim
@@ -108,9 +110,13 @@ class ViTTT(nn.Module):
         repeated_class_and_registers = self.class_and_registers.unsqueeze(0).repeat(B, 1, 1)
         x = torch.cat((repeated_class_and_registers, x), dim = 1)
         # assert x.shape == (B, 5 + H * W // 256, self.dim), f"x.shape should be {(B, 5 + H * W // 256, self.dim)} but is instead {x.shape}."
+        outputs = []
         for i, block in enumerate(self.blocks):
             if self.training and i >= self.start_checkpointing:
                 x = checkpoint(block, x, rope, use_reentrant = False)
             else:
                 x = block(x, rope)
-        return self.final_layer_norm(x)
+            if i in self.output_blocks:
+                outputs.append(x)
+
+        return self.final_layer_norm(x), outputs

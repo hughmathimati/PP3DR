@@ -8,12 +8,12 @@ from einops import rearrange
 from typing import Callable
 from torch.utils.checkpoint import checkpoint
 import torchvision.transforms.v2 as transforms
+from xformers.ops import SwiGLU
+from timm.layers import DropPath
 
 from models.BidirectionalLaCT import GlobalLaCT, LocalLaCT
 from models.pos_embed import RopePositionEmbedding, Rope3D, Rope2D
 from models.ViTTT import ViTTT
-from xformers.ops import SwiGLU
-from timm.layers import DropPath
 
 
 class LayerScale(nn.Module):
@@ -23,7 +23,6 @@ class LayerScale(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.scale * x
-
 
 class GlobalBlock(nn.Module):
     def __init__(self, dim, num_heads, ffn_ratio, drop_path=0):
@@ -55,7 +54,6 @@ class GlobalBlock(nn.Module):
         x = x + self.drop_path(self.layer_scale_2(self.ffn(self.layer_norm_2(x))))
         return x
 
-
 class LocalBlock(nn.Module):
     def __init__(self, dim, num_heads, ffn_ratio, drop_path=0):
         super().__init__()
@@ -75,6 +73,50 @@ class LocalBlock(nn.Module):
         x = x + self.drop_path(self.layer_scale_2(self.ffn(self.layer_norm_2(x))))
         return x
 
+class PoseHead(nn.Module):
+    """
+    Predict the relative camera pose per frame via the register (special) tokens.
+    You might ask: If we use the register tokens for our output, do we need to add even more register tokens to serve
+    the original purpose of the register tokens? The answer is: no, because now the register and "normal" tokens have
+    swapped purposes!
+    """
+
+    def __init__(
+            self,
+            dim=1280,
+            num_registers=5,
+            num_heads=20,
+            blocks=4,  # Pi3 has 5 transformer blocks per decoder. We need to use more.
+            ffn_ratio=4,
+            output_dim=9,  # (x, y, z) + 6D continuous rotation representation. This is per-frame.
+    ):
+        super().__init__()
+        self.dim = dim
+        self.layer_norm = nn.LayerNorm(num_registers * dim)  # Pre-projection layer norm.
+        self.dim_proj = nn.Linear(num_registers * dim, output_dim)
+        self.num_registers = num_registers
+        self.output_dim = output_dim
+
+    def forward(self, x: torch.Tensor, L) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        x: Input tensor
+        rope2d: 2D RoPE positional embedding
+        rope3d: 3D RoPE positional embedding
+        L: Number of frames. Necessary for the rearrange operations.
+        """
+        # x.shape == (B * L, num_registers + HW // 256, dim)
+        # Keep only the register tokens (recall that they're concatenated along the sequence dimension, not the embedding dimension).
+        x = x[:, :self.num_registers, :]
+        # x.shape == (B * L, num_registers, dim)
+        # Flatten the register tokens (and separate the batch size and frame dimensions):
+        x = rearrange(x, "(B L) reg dim -> B L (reg dim)", L=L)
+        x = self.layer_norm(x)
+        # Project so we end up with the correct number of dimensions at the end
+        x = self.dim_proj(x)
+        # x.shape == (B, L, output_dim)
+        return x
 
 class PointwiseSwiGLU(nn.Module):
     """
@@ -93,13 +135,14 @@ class PointwiseSwiGLU(nn.Module):
         hidden = F.silu(gate) * val
         return self.out_proj(hidden)
 
-
 class UpscaleBlock(nn.Module):
     def __init__(self, in_channels, out_channels, upscale_dim):
         super().__init__()
         self.upscale_dim = upscale_dim
-        self.initial_proj = PointwiseSwiGLU(in_features=in_channels, hidden_features=in_channels, out_features=out_channels)
-        self.residual = nn.ConvTranspose2d(in_channels=in_channels, out_channels=out_channels, kernel_size=upscale_dim, stride=upscale_dim)
+        self.initial_proj = PointwiseSwiGLU(in_features=in_channels, hidden_features=in_channels,
+                                            out_features=out_channels)
+        self.residual = nn.ConvTranspose2d(in_channels=in_channels, out_channels=out_channels, kernel_size=upscale_dim,
+                                           stride=upscale_dim)
         self.residual_ls = LayerScale([out_channels, 1, 1])  # Along the channel dimension
 
     def forward(self, x):
@@ -111,59 +154,84 @@ class UpscaleBlock(nn.Module):
         )
         return upscaled + self.residual_ls(self.residual(x))
 
+class FocalHead(nn.Module):
+    def __init__(self, dim=1280, num_registers=5):
+        super().__init__()
+        self.layer_norm = nn.LayerNorm(dim)
+        self.focal_proj = nn.Linear(num_registers * dim, 1)
 
-class DepthProj(nn.Module):
+    def forward(self, x, L, H, W):
+        """
+        Parameters
+        ----------
+        (B * L, num_registers, dim)
+
+        Returns
+        -------
+        (B,)
+        """
+        registers = self.layer_norm(x)
+        f_mult = self.focal_proj(registers.flatten(start_dim=-2)) # (B * L, 1)
+        f_mult = rearrange(f_mult.squeeze(-1), "(B L) -> B L", L=L).mean(dim=-1) # (B,)
+        f_mult = F.softplus(f_mult)
+        return f_mult * max(H, W)
+
+class DepthHead(nn.Module):
     def __init__(self, dim=1280):
         super().__init__()
-        self.proj = nn.Sequential(
-            UpscaleBlock(dim, dim // 8, 4), # 1280 -> 160
-            nn.SiLU(),
-            UpscaleBlock(dim // 8, dim // 64, 4),
-            nn.SiLU()
+        self.initial_proj = nn.ModuleList([
+            UpscaleBlock(dim, dim // 64, 8), # 1/2
+            UpscaleBlock(dim, dim // 16, 4), # 1/4
+            UpscaleBlock(dim, dim // 4, 2), # 1/8
+            nn.Identity() # 1/16
+        ])
+        self.fusion_proj = nn.ModuleList([
+            UpscaleBlock(dim, dim // 4, 2), # 1/8
+            UpscaleBlock(dim // 4, dim // 16, 2), # 1/4
+            UpscaleBlock(dim // 16, dim // 64, 2), # 1/2
+        ])
+        self.final_proj = PointwiseSwiGLU(in_features=dim // 64, hidden_features=dim // 64, out_features=4)
+
+    def forward(self, x, L):
+        """
+        Parameters
+        ----------
+        4 x (B * L, dim, H // patch_size, W // patch_size)
+
+        Returns
+        -------
+        (B, L, H, W)
+        """
+        a, b, c, d = [self.initial_proj[i](y) for i, y in enumerate(x)]
+        x = F.silu(c + self.fusion_proj[0](d))
+        x = F.silu(b + self.fusion_proj[1](x))
+        x = F.silu(a + self.fusion_proj[2](x))
+        return rearrange(
+            self.final_proj(x),
+            "(B L) (p1 p2) H_p W_p -> B L (H_p p1) (W_p p2)",
+            L=L, p1 = 2, p2 = 2
         )
-        self.final_proj = PointwiseSwiGLU(in_features=dim // 64, hidden_features=dim // 64, out_features=1)
 
-    def forward(self, x):
-        # (B, L, H // 16, W // 16, dim) -> (B, L, H // 16, W // 16, hidden_dim) -> (B, L, H, W, hidden_dim)
-        B = x.shape[0]
-        x = rearrange(x, "B L H_p W_p dim -> (B L) dim H_p W_p")
-        x = self.proj(x)
-        return rearrange(self.final_proj(x), "(B L) C H W -> B L H W C", B=B) # (B, L, H, W, 1)
-
-
-class DepthFocalHead(nn.Module):
+class PointHead(nn.Module):
     def __init__(
             self,
-            input_dim=2 * 1280,
-            hidden_dim=1280,
+            dim=1280,
             num_registers=5,
-            num_heads=20,
-            blocks=4,  # Pi3 has 5 transformer blocks per decoder
-            ffn_ratio=4,
     ):
         super().__init__()
-        assert blocks % 2 == 0, f"Number of decoder blocks ({blocks}) must be even for alternating global and frame-wise attention"
-        self.blocks = blocks
-        self.blocks_each = blocks // 2
-        self.input_proj = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
-        self.hidden_dim = hidden_dim
-
-        self.global_blocks = nn.ModuleList(
-            [GlobalBlock(hidden_dim, num_heads, ffn_ratio) for _ in range(self.blocks_each)])
-        self.local_blocks = nn.ModuleList(
-            [LocalBlock(hidden_dim, num_heads, ffn_ratio) for _ in range(self.blocks_each)])
-
-        self.registers_layer_norm = nn.LayerNorm(hidden_dim)  # Pre-projection layer norm.
-        self.tokens_layer_norm = nn.LayerNorm(hidden_dim)  # Pre-projection layer norm.
-        # We will predict a single unified focal length per sequence by predicting one per frame and taking the mean.
-        self.focal_proj = nn.Linear(num_registers * hidden_dim, 1)
-        self.depth_proj = DepthProj(dim=hidden_dim)
+        self.dim = dim
         self.num_registers = num_registers
+        self.focal_head = FocalHead()
+        self.token_layer_norms = nn.ModuleList([nn.LayerNorm(dim) for _ in range(4)])
+        self.depth_head = DepthHead()
 
-    def forward(self, x: torch.Tensor, rope2d, rope3d, L, H, W) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, L, H, W) -> torch.Tensor:
         """
-        Input to the model consists of the outputs of the last global block AND the last local block, concatenated
-        along the last dimension. Thus, the input dimension is 2 * 1280.
+        Inputs consist of:
+        1. The output of block 6/12 (index 5) from ViTTT
+        2. The output at the end of ViTTT
+        3. The output of block 18/36 (index 17) from PP3DR
+        4. The output at the end of PP3DR
 
         Parameters
         ----------
@@ -172,96 +240,11 @@ class DepthFocalHead(nn.Module):
         rope3d: 3D RoPE positional embedding
         L: Number of frames. Necessary for the rearrange operations.
         """
-        x = self.input_proj(x)
-        for i in range(self.blocks_each):
-            if self.training:
-                # Global attention: absorb frame-length into patch-length dimension.
-                x = checkpoint(self.global_blocks[i], x, rope3d, L, use_reentrant=False)
-                # Local attention: absorb frame-length into batch dimension. Sequence length is now patch-length.
-                x = checkpoint(self.local_blocks[i], x, rope2d, L, use_reentrant=False)
-            else:
-                x = self.global_blocks[i](x, rope3d, L)
-                x = self.local_blocks[i](x, rope2d, L)
+        # 4 x (B * L, HW // 256, dim)
+        tokens = [self.token_layer_norms[i](y[:, self.num_registers:, :]) for i, y in enumerate(x)]
+        tokens = [rearrange(y, "BL (H_p W_p) dim -> BL dim H_p W_p", H_p=H // 16) for y in tokens]
 
-        x = rearrange(x, "(B L) X dim -> B L X dim", L=L)  # (B, L, num_registers + HW // 256, dim)
-        B = x.shape[0]
-        registers = self.registers_layer_norm(x[:, :, :self.num_registers, :])  # (B, L, num_registers, dim)
-        # (B, L, num_registers * dim) -> (B, L, 1) -> (B, L) -> (B,)
-        f_mult = self.focal_proj(registers.flatten(start_dim=2)).squeeze(-1).mean(dim=-1)
-        f_mult = F.softplus(f_mult)
-        focal_length = f_mult * max(H, W)
-
-        tokens = self.tokens_layer_norm(x[:, :, self.num_registers:, :])  # (B, L, HW // 256, dim)
-        log_depths = self.depth_proj(tokens.view(B, L, H // 16, W // 16, self.hidden_dim))
-        
-        # log_depths has shape (B, L, HW). fx, fy, cx, and cy have shape (B, L).
-        return log_depths.squeeze(-1), focal_length
-
-
-class PoseHead(nn.Module):
-    """
-    Predict the relative camera pose per frame via the register (special) tokens.
-    You might ask: If we use the register tokens for our output, do we need to add even more register tokens to serve
-    the original purpose of the register tokens? The answer is: no, because now the register and "normal" tokens have
-    swapped purposes!
-    """
-
-    def __init__(
-            self,
-            input_dim=2 * 1280,
-            hidden_dim=1280,
-            num_registers=5,
-            num_heads=20,
-            blocks=4,  # Pi3 has 5 transformer blocks per decoder. We need to use more.
-            ffn_ratio=4,
-            output_dim=9,  # (x, y, z) + 6D continuous rotation representation. This is per-frame.
-    ):
-        super().__init__()
-        assert blocks % 2 == 0, f"Number of decoder blocks ({blocks}) must be even for alternating global and frame-wise attention"
-        self.blocks_each = blocks // 2
-        self.input_proj = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
-        self.hidden_dim = hidden_dim
-        self.global_blocks = nn.ModuleList(
-            [GlobalBlock(hidden_dim, num_heads, ffn_ratio) for _ in range(self.blocks_each)])
-        self.local_blocks = nn.ModuleList(
-            [LocalBlock(hidden_dim, num_heads, ffn_ratio) for _ in range(self.blocks_each)])
-        self.layer_norm = nn.LayerNorm(num_registers * hidden_dim)  # Pre-projection layer norm.
-        self.dim_proj = nn.Linear(num_registers * hidden_dim, output_dim)
-        self.num_registers = num_registers
-        self.output_dim = output_dim
-        self.num_blocks = blocks
-
-    def forward(self, x: torch.Tensor, rope2d, rope3d, L) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        x: Input tensor
-        rope2d: 2D RoPE positional embedding
-        rope3d: 3D RoPE positional embedding
-        L: Number of frames. Necessary for the rearrange operations.
-        """
-        x = self.input_proj(x)
-        for i in range(self.blocks_each):
-            if self.training:
-                # Global attention: absorb frame-length into patch-length dimension.
-                x = checkpoint(self.global_blocks[i], x, rope3d, L, use_reentrant=False)
-                # Local attention: absorb frame-length into batch dimension. Sequence length is now patch-length.
-                x = checkpoint(self.local_blocks[i], x, rope2d, L, use_reentrant=False)
-            else:
-                x = self.global_blocks[i](x, rope3d, L)
-                x = self.local_blocks[i](x, rope2d, L)
-
-        # x.shape == (B * L, num_registers + HW // 256, dim)
-        # Keep only the register tokens (recall that they're concatenated along the sequence dimension, not the embedding dimension).
-        x = x[:, :self.num_registers, :]
-        # x.shape == (B * L, num_registers, dim)
-        # Flatten the register tokens (and separate the batch size and frame dimensions):
-        x = rearrange(x, "(B L) reg dim -> B L (reg dim)", L=L)
-        x = self.layer_norm(x)
-        # Project so we end up with the correct number of dimensions at the end
-        x = self.dim_proj(x)
-        # x.shape == (B, L, output_dim)
-        return x
+        return self.focal_head(x[-1][:, :self.num_registers, :], L, H, W), self.depth_head(tokens, L)
 
 
 @torch.compile()
@@ -278,8 +261,9 @@ class PP3DR(nn.Module):
             freeze_feature_extractor=True,
             PP3DR_drop_rates=None,
             ViTTT_drop_rates=None,
-            point_head_class=DepthFocalHead,
-            pose_head_class=PoseHead
+            point_head_class=PointHead,
+            pose_head_class=PoseHead,
+            output_blocks = [8, 17] # These are block_each indices. The highest block_each index is 17.
     ):
         super().__init__()
         assert decoder_blocks % 2 == 0, f"Number of decoder blocks ({decoder_blocks}) must be even for alternating global and frame-wise attention"
@@ -287,8 +271,9 @@ class PP3DR(nn.Module):
         self.blocks_each = decoder_blocks // 2
         # If we're unfreezing ViTTT, we still want to maximise VRAM usage.
         # To keep VRAM around 99% with the same batch size as freeze_feature_extractor=True, we're going to checkpoint
-        # *none* of the ViTTT blocks and 2 of the PP3DR blocks.
-        self.start_checkpointing = start_checkpointing if freeze_feature_extractor else 4
+        # *none* of the ViTTT blocks and 6 of the PP3DR blocks.
+        # Keep in mind that this varies wildly with the specific architecture we're using, so you should check each time.
+        self.start_checkpointing = start_checkpointing if freeze_feature_extractor else 6
 
         # General decoder
         self.dim = dim
@@ -330,6 +315,8 @@ class PP3DR(nn.Module):
         """
         self.pose_head = pose_head_class()
 
+        self.output_blocks = output_blocks
+
     def train(self, mode=True):
         super().train(mode)
         if self.freeze_feature_extractor:
@@ -365,7 +352,7 @@ class PP3DR(nn.Module):
 
         # Step 1: ViT
         # ViT is frame-wise. We need to collapse the batch dimension into the sequence dimension before passing it into Dino.
-        x = self.ViT(x.flatten(0, 1))
+        x, outputs = self.ViT(x.flatten(0, 1))
         # x.shape == (B * L, num_registers + HW // 256, dim)
 
         """
@@ -377,7 +364,7 @@ class PP3DR(nn.Module):
         rope2d has shape (B * L, HW, head_dim), and rope3d has shape (B, L, HW, head_dim).
         """
         rope2d, rope3d = self.rope2d(rope_x, rope_y), self.rope3d(rope_x, rope_y)
-        for i in range(self.blocks_each - 1):
+        for i in range(self.blocks_each):
             if self.training and i >= self.start_checkpointing:
                 # Global attention: absorb frame-length into patch-length dimension.
                 x = checkpoint(self.global_blocks[i], x, rope3d, L, use_reentrant=False)
@@ -386,26 +373,18 @@ class PP3DR(nn.Module):
             else:
                 x = self.global_blocks[i](x, rope3d, L)
                 x = self.local_blocks[i](x, rope2d, L)
-        # Save one block from each of the last two layers
-        last_index = self.blocks_each - 1
-        if self.training and self.start_checkpointing == self.blocks_each:
-            x = checkpoint(self.global_blocks[last_index], x, rope3d, L, use_reentrant=False)
-            x = torch.cat([
-                x.view(B * L, -1, self.dim),
-                checkpoint(self.local_blocks[last_index], x, rope2d, L, use_reentrant=False)
-            ], dim=-1)
-        else:
-            x = self.global_blocks[last_index](x, rope3d, L)
-            x = torch.cat([
-                x.view(B * L, -1, self.dim),
-                self.local_blocks[last_index](x, rope2d, L)
-            ], dim=-1)
+            if i in self.output_blocks:
+                outputs.append(x)
         # x.shape == (B * L, num_registers + HW // 256, 2 * dim)
 
         # Step 2: Per-task decoders
-        log_depths, focal_length = self.point_head(x, rope2d, rope3d, L, H, W)
+        """
+        If you're observant, you'll notice that every tensor added to `outputs` was the output of a LocalBlock.
+        This is fine, because we're doing dense depth prediction. This would be harder to justify for the PoseHead.
+        """
+        focal_length, log_depths = self.point_head(outputs, L, H, W)
         # We're predicting the relative pose from this frame to the next one, which is why our sequence length is L - 1.
-        poses = self.pose_head(x, rope2d, rope3d, L)[:, :-1]  # (B, L - 1, 9)
+        poses = self.pose_head(x, L)[:, :-1]  # (B, L - 1, 9)
 
         # Get the rotation matrix by orthogonalizing the first two 3D vectors, then taking the cross product for the third.
         # We're going to construct the actual columns as rows of the current matrix, then take the transpose at the end.
