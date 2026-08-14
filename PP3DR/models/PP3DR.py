@@ -220,6 +220,7 @@ class PointHead(nn.Module):
         self.dim = dim
         self.num_registers = num_registers
         self.focal_head = FocalHead()
+        # These LayerNorms are for the depth head only. The FocalHead has its own layer norm.
         self.token_layer_norms = nn.ModuleList([nn.LayerNorm(dim) for _ in range(4)])
         self.depth_head = DepthHead()
 

@@ -84,8 +84,8 @@ class BaseTrainer:
                  model,
                  loss,
                  name="checkpoints",
-                 epochs=15,
-                 checkpoint_every=8,
+                 epochs=30,
+                 checkpoint_every=11,
                  pretrained_path=None,
                  checkpoint=None,
                  strict=True,
@@ -297,7 +297,7 @@ class BaseTrainer:
                          decoder_blocks: int,
                          freeze_feature_extractor: bool,
                          use_muon: bool,
-                         adamw_lr: float = 1e-4, # 1e-4
+                         adamw_lr: float = 1e-5, # 1e-4
                          muon_lr: float = 1e-3,
                          weight_decay: float = 0.04,
                          layer_decay: float = 0.95,
