@@ -61,7 +61,7 @@ class ViTTT(nn.Module):
             # sequence length I can pass in.
             start_checkpointing = 12,
             drop_rates = None,
-            output_blocks=[2, 11]
+            output_blocks=[1, 4, 11]
     ):
         super().__init__()
         self.dim = dim

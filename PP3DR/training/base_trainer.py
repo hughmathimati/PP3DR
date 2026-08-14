@@ -93,7 +93,7 @@ class BaseTrainer:
                  use_muon=False, # In my limited testing, Muon underperforms AdamW.
                  batch_size=4,
                  gradient_accumulation_steps=8,
-                 start_checkpointing=11, # 11 keeps VRAM at around 99% with a batch size of 4.
+                 # start_checkpointing is handled inside PP3DR itself.
                  train_datasets=[
                      dynamic_replica_dataset, dynamic_replica_val_dataset, dynamic_replica_test_dataset,
                      flying_things_3d_dataset, flying_things_3d_test_dataset,
@@ -140,7 +140,6 @@ class BaseTrainer:
                 self.initialize,
                 model,
                 pretrained_path,
-                start_checkpointing,
                 strict,
                 freeze_feature_extractor,
                 use_muon
@@ -242,8 +241,8 @@ class BaseTrainer:
 
         return train_dataloader, val_dataloader
 
-    def initialize(self, model, pretrained_path, start_checkpointing, strict, freeze_feature_extractor, use_muon):
-        PP3DR_model = model(start_checkpointing=start_checkpointing, freeze_feature_extractor=freeze_feature_extractor)
+    def initialize(self, model, pretrained_path, strict, freeze_feature_extractor, use_muon):
+        PP3DR_model = model(freeze_feature_extractor=freeze_feature_extractor)
 
         # 1. Initialize ONLY the new LaCT blocks and Decoder Heads!
         for name, module in PP3DR_model.named_modules():

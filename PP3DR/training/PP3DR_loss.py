@@ -329,7 +329,7 @@ class PP3DR_loss(nn.Module):
 
         loss_dy = F.l1_loss(pred_dy[mask_dy], gt_dy[mask_dy], reduction='mean')
         loss_dx = F.l1_loss(pred_dx[mask_dx], gt_dx[mask_dx], reduction='mean')
-        # loss_dy = loss_dy + F.mse_loss(pred_dy[mask_dy], gt_dy[mask_dy])
+        # loss_dy = loss_dy + F.mse_loss(pred_dy[mask_dy], gt_dy[mask_dy]) # TESTING
         # loss_dx = loss_dx + F.mse_loss(pred_dx[mask_dx], gt_dx[mask_dx])
 
         # Optional: You can also weight these by the distance from edges, but standard L1
@@ -341,7 +341,7 @@ class PP3DR_loss(nn.Module):
         L1 loss on raw depths.
         """
         return F.l1_loss(pred_depth[valid_mask], gt_depth[valid_mask], reduction='mean')
-        # return F.mse_loss(pred_depth[valid_mask], gt_depth[valid_mask], reduction='mean')
+        # return F.l1_loss(pred_depth[valid_mask], gt_depth[valid_mask], reduction='mean') + F.mse_loss(pred_depth[valid_mask], gt_depth[valid_mask], reduction='mean') # TESTING
 
     def translation_loss(self, pred, gt_relative_translations, scale, median_depths):
         """

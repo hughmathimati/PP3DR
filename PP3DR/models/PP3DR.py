@@ -190,7 +190,8 @@ class DepthHead(nn.Module):
             UpscaleBlock(dim // 4, dim // 16, 2), # 1/4
             UpscaleBlock(dim // 16, dim // 64, 2), # 1/2
         ])
-        self.final_proj = PointwiseSwiGLU(in_features=dim // 64, hidden_features=dim // 64, out_features=4)
+        self.final_upscale = UpscaleBlock(dim // 64, dim // 256, 2) # original dimensions
+        self.final_proj = PointwiseSwiGLU(in_features=dim // 256, hidden_features=dim // 256, out_features=1)
 
     def forward(self, x, L):
         """
@@ -206,11 +207,8 @@ class DepthHead(nn.Module):
         x = F.silu(c + self.fusion_proj[0](d))
         x = F.silu(b + self.fusion_proj[1](x))
         x = F.silu(a + self.fusion_proj[2](x))
-        return rearrange(
-            self.final_proj(x),
-            "(B L) (p1 p2) H_p W_p -> B L (H_p p1) (W_p p2)",
-            L=L, p1 = 2, p2 = 2
-        )
+        x = F.silu(self.final_upscale(x))
+        return rearrange(self.final_proj(x).squeeze(1), "(B L) H W -> B L H W", L=L)
 
 class PointHead(nn.Module):
     def __init__(
@@ -257,13 +255,13 @@ class PP3DR(nn.Module):
             decoder_blocks: int = 36,  # Pi3 is 36 decoder blocks.
             ffn_ratio: int = 4,
             num_registers: int = 5,
-            start_checkpointing=6,  # How many blocks EACH to checkpoint (total # is twice as many).
+            start_checkpointing=13,  # How many blocks EACH not to checkpoint (total # is twice as many).
             freeze_feature_extractor=True,
             PP3DR_drop_rates=None,
             ViTTT_drop_rates=None,
             point_head_class=PointHead,
             pose_head_class=PoseHead,
-            output_blocks = [8, 17] # These are block_each indices. The highest block_each index is 17.
+            output_blocks = [17] # These are block_each indices. The highest block_each index is 17.
     ):
         super().__init__()
         assert decoder_blocks % 2 == 0, f"Number of decoder blocks ({decoder_blocks}) must be even for alternating global and frame-wise attention"
