@@ -8,7 +8,7 @@ if __name__ == "__main__":
     BaseTrainer(
         PP3DR_pretrained_depth,
         PP3DR_loss,
-        name="pretrained_depth",
-        # pretrained_path="/vulcanscratch/hughma/PP3DR/dpt_all-blocks/PP3DR.pth",
+        name="not_pretrained_depth-finetune",
+        pretrained_path="/vulcanscratch/hughma/PP3DR/not_pretrained_depth/PP3DR.pth",
         freeze_feature_extractor=False,
     )

@@ -21,28 +21,14 @@ from models.vggt_omega_depth_head import DenseHead
 class PointHead(nn.Module):
     def __init__(
             self,
-            dim=2048,
+            dim=2560,
             num_registers=5,
     ):
         super().__init__()
         self.dim = dim
         self.num_registers = num_registers
         self.focal_head = FocalHead(dim=dim)
-        self.depth_head = DenseHead()
-        self.depth_head.load_state_dict(torch.load("/vulcanscratch/hughma/PP3DR/models/vggt_dense_head.pth",
-                                              weights_only=True,
-                                              map_location="cpu"))
-        for parameter in self.depth_head.parameters():
-            parameter.requires_grad = False
-        self.depth_head.eval()
-
-    def train(self, mode=True):
-        """
-        Keep the pretrained depth head in eval mode.
-        """
-        super().train(mode)
-        self.depth_head.eval()
-        return self
+        self.depth_head = DenseHead(dim_in=dim)
 
     def forward(self, x: torch.Tensor, L, H, W) -> torch.Tensor:
         """
@@ -70,72 +56,18 @@ class PointHead(nn.Module):
 class PP3DR_pretrained_depth(PP3DR):
     def __init__(
             self,
-            dim: int = 1024,
-            # dim must be divisible by num_heads. VGGT-Omega uses 16 heads.
-            # Rope3D was written to be flexible with input dims, but a dim of 1024 with 16 heads gives us a head_dim of
-            # 64, which is actually the exact same as a dim of 1280 with 20 heads. Thus, there's nothing to worry about.
-            num_heads: int = 16,
-            encoder_blocks: int = 12,  # Pi3 is 36 ViT blocks
-            decoder_blocks: int = 36,  # Pi3 is 36 decoder blocks.
-            ffn_ratio: int = 4,
-            num_registers: int = 5,
             # How many blocks EACH not to checkpoint (total # is twice as many).
-            # Keep in mind we're already not checkpointing all 12 ViTTT blocks.z
-            start_checkpointing=11,
+            # Keep in mind we're already not checkpointing all 12 ViTTT blocks.
             # freeze_feature_extractor is kept for compatibility with the BaseTrainer but is not used.
             freeze_feature_extractor=False,
-            point_head_class=PointHead,
-            pose_head_class=PoseHead,
-            output_blocks = [3, 8, 13, 17] # These are block_each indices. The highest block_each index is 17.
+            output_blocks = [0, 5, 11, 17], # These are block_each indices. The highest block_each index is 17.
     ):
-        nn.Module.__init__(self) # Don't call the PP3DR init.
-        assert decoder_blocks % 2 == 0, f"Number of decoder blocks ({decoder_blocks}) must be even for alternating global and frame-wise attention"
-        self.decoder_blocks = decoder_blocks
-        self.blocks_each = decoder_blocks // 2
-        self.start_checkpointing = start_checkpointing
-
-        # Drop rates
-        rates = torch.linspace(0, 0.1, encoder_blocks + decoder_blocks)
-        ViTTT_drop_rates = rates[:encoder_blocks]
-        PP3DR_drop_rates = rates[encoder_blocks:]
-
-        # General decoder
-        self.dim = dim
-        drop_rates = [x.item() for x in PP3DR_drop_rates]
-        self.global_blocks = nn.ModuleList([
-            GlobalBlock(dim, num_heads, ffn_ratio, drop_rates[2 * i])
-            for i in range(self.blocks_each)
-        ])
-        self.local_blocks = nn.ModuleList([
-            LocalBlock(dim, num_heads, ffn_ratio, drop_rates[2 * i + 1])
-            for i in range(self.blocks_each)
-        ])
-
-        self.rope2d = Rope2D(embed_dim=dim, num_heads=num_heads, device="cuda")
-        self.rope3d = Rope3D(embed_dim=dim, num_heads=num_heads, device="cuda")
-
-        self.ViTTT = ViTTT(dim, num_heads, encoder_blocks, ffn_ratio, drop_rates=ViTTT_drop_rates, output_blocks=[])
-        # Don't load the pretrained ViTTT, as its dimension is 1280 instead of 1024 as required here.
-        # ViTTT puts in the registers for me.
-        self.num_registers = num_registers
-
-        # Per-task decoders
-        self.point_head = point_head_class()
-        """
-        The camera decoder will predict the relative SE3 transformation to the next frame.
-        We are parameterizing our camera with three scalars for the translation and six scalars for the rotation.
-        Details of how the rotation prediction works are in the forward() method.
-        """
-        self.pose_head = pose_head_class(dim=dim)
-
-        self.output_blocks = output_blocks
-
-    def train(self, mode=True):
-        """
-        Bypass the PP3DR train override to just use the original default.
-        """
-        nn.Module.train(self, mode)
-        return self
+        super().__init__(
+            freeze_feature_extractor=freeze_feature_extractor,
+            start_checkpointing=(11 if freeze_feature_extractor else 4),
+            point_head_class=PointHead,
+            output_blocks=output_blocks
+        )
 
     def forward(self, x: torch.Tensor, rope_x, rope_y) -> dict:
         """

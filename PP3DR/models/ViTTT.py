@@ -62,7 +62,8 @@ class ViTTT(nn.Module):
             start_checkpointing = 12,
             drop_rates = None,
 #            output_blocks=[1, 4, 11]
-            output_blocks = list(range(12))
+#             output_blocks = list(range(12))
+            output_blocks=[]
     ):
         super().__init__()
         self.dim = dim

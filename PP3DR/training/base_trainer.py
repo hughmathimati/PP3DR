@@ -84,13 +84,12 @@ class BaseTrainer:
                  model,
                  loss,
                  name="checkpoints",
-                 epochs=30,
-                 checkpoint_every=11,
+                 epochs=15,
+                 checkpoint_every=8,
                  pretrained_path=None,
                  checkpoint=None,
                  strict=True,
                  freeze_feature_extractor=True,
-                 use_muon=False, # In my limited testing, Muon underperforms AdamW.
                  batch_size=4,
                  gradient_accumulation_steps=8,
                  # start_checkpointing is handled inside PP3DR itself.
@@ -142,11 +141,10 @@ class BaseTrainer:
                 pretrained_path,
                 strict,
                 freeze_feature_extractor,
-                use_muon
             )
             self.metric = loss(scale=False)
             train_dataloader, val_dataloader = a.result()
-            self.state, PP3DR_model, AdamW, Muon = b.result()
+            self.state, PP3DR_model, AdamW = b.result()
 
         self.train_dataloader, self.val_dataloader = self.accelerator.prepare(train_dataloader, val_dataloader)
         total_training_steps = math.ceil(len(self.train_dataloader) / gradient_accumulation_steps) * epochs
@@ -156,14 +154,9 @@ class BaseTrainer:
             total_training_steps // 10,
             total_training_steps
         )
-        Muon_scheduler = transformers.optimization.get_cosine_schedule_with_warmup(
-            Muon,
-            total_training_steps // 10,
-            total_training_steps
-        )
-        self.accelerator.register_for_checkpointing(AdamW_scheduler, Muon_scheduler)
-        self.PP3DR_model, self.AdamW, self.Muon, self.AdamW_scheduler, self.Muon_scheduler = self.accelerator.prepare(
-            PP3DR_model, AdamW, Muon, AdamW_scheduler, Muon_scheduler
+        self.accelerator.register_for_checkpointing(AdamW_scheduler)
+        self.PP3DR_model, self.AdamW, self.AdamW_scheduler, = self.accelerator.prepare(
+            PP3DR_model, AdamW, AdamW_scheduler
         )
 
         if checkpoint is not None:
@@ -241,7 +234,7 @@ class BaseTrainer:
 
         return train_dataloader, val_dataloader
 
-    def initialize(self, model, pretrained_path, strict, freeze_feature_extractor, use_muon):
+    def initialize(self, model, pretrained_path, strict, freeze_feature_extractor):
         # Drop rates get handled inside the model itself.
         PP3DR_model = model(freeze_feature_extractor=freeze_feature_extractor)
 
@@ -281,34 +274,30 @@ class BaseTrainer:
                 print(f"  -> Missing keys (New Layers initialized from scratch): {missing}")
                 print(f"  -> Unexpected keys (Old Layers discarded): {unexpected}")
 
-        AdamW_params, Muon_params = self.get_param_groups(
+        AdamW_params = self.get_param_groups(
             PP3DR_model,
             decoder_blocks=PP3DR_model.decoder_blocks,
             freeze_feature_extractor=freeze_feature_extractor,
-            use_muon=use_muon
         )
         AdamW = torch.optim.AdamW(AdamW_params, betas=(0.9, 0.99), foreach=True)
-        Muon = torch.optim.Muon(Muon_params)
         state = State(self.epochs, self.accelerator.device)
         self.accelerator.register_for_checkpointing(state)
-        return state, PP3DR_model, AdamW, Muon
+        return state, PP3DR_model, AdamW
 
     def get_param_groups(self,
                          model: nn.Module,
                          decoder_blocks: int,
                          freeze_feature_extractor: bool,
-                         use_muon: bool,
                          adamw_lr: float = 1e-4, # 1e-4
-                         muon_lr: float = 1e-3,
                          weight_decay: float = 0.04,
                          layer_decay: float = 0.95,
                          ):
         """
-        Separates model parameters into AdamW and Muon parameter groups,
+        Separates model parameters into parameter groups,
         applying Layer-wise LR Decay (LLRD) and selective weight decay independently to both scales.
-        Returns: (AdamW parameter groups, Muon parameter groups)
+        Returns: parameter groups
         """
-        AdamW_params, Muon_params = {}, {}
+        AdamW_params = {}
 
         for name, param in model.named_parameters():
             if not param.requires_grad:
@@ -358,36 +347,13 @@ class BaseTrainer:
             # ==========================================
             # 3. Route to Optimizers with Decoupled Base LRs
             # ==========================================
-            if use_muon:
-                if param.dim() == 2 and "point_head" not in name and "pose_head" not in name:
-                    # Muon strictly uses the massive base LR, scaled by the decay multiplier
-                    lr = muon_lr * lr_mult
-                    group_key = (lr, wd)
+            lr = adamw_lr * lr_mult
+            group_key = (lr, wd)
+            if group_key not in AdamW_params:
+                AdamW_params[group_key] = {"params": [], "lr": lr, "weight_decay": wd}
+            AdamW_params[group_key]["params"].append(param)
 
-                    if group_key not in Muon_params:
-                        Muon_params[group_key] = {"params": [], "lr": lr, "weight_decay": wd}
-                    Muon_params[group_key]["params"].append(param)
-
-                else:
-                    # AdamW strictly uses the tiny base LR, scaled by the decay multiplier
-                    lr = adamw_lr * lr_mult
-                    group_key = (lr, wd)
-
-                    if group_key not in AdamW_params:
-                        AdamW_params[group_key] = {"params": [], "lr": lr, "weight_decay": wd}
-                    AdamW_params[group_key]["params"].append(param)
-            else:
-                lr = adamw_lr * lr_mult
-                group_key = (lr, wd)
-                if group_key not in AdamW_params:
-                    AdamW_params[group_key] = {"params": [], "lr": lr, "weight_decay": wd}
-                AdamW_params[group_key]["params"].append(param)
-
-        # If we're not using Muon, we need to add a dummy parameter at the very end.
-        if not use_muon:
-            Muon_params[(1, 1)] = {"params": [torch.zeros(1, 1)], "lr": 1, "weight_decay": 1}  # dummy parameter
-
-        return list(AdamW_params.values()), list(Muon_params.values())
+        return list(AdamW_params.values())
 
     def train_on_dataset(self, name, iterator, dataloader):
         """
@@ -408,14 +374,11 @@ class BaseTrainer:
                 self.state.train_losses[self.state.epoch - 1] += loss.detach()
                 with torch.autocast(device_type=self.accelerator.device.type, enabled=False):
                     self.AdamW.zero_grad()
-                    self.Muon.zero_grad()
                     self.accelerator.backward(loss)
                     if self.accelerator.sync_gradients:
                         torch.nn.utils.clip_grad_norm_(self.PP3DR_model.parameters(), max_norm=1.0)
                     self.AdamW.step()
-                    self.Muon.step()
                     self.AdamW_scheduler.step()
-                    self.Muon_scheduler.step()
 
             # Log to WandB once per batch
             if self.accelerator.is_local_main_process:
