@@ -45,8 +45,9 @@ class DecomposedSwiGLU(nn.Module):
             H_gate = H_gate + self.gate_projs[i](tensor_list[i])
             H_up = H_up + self.up_projs[i](tensor_list[i])
 
-        H_gate = H_gate + self.gate_bias
-        H_up = H_up + self.up_bias
+        # Divide by len(tensor_list) to help keep the variance under control
+        H_gate = (H_gate + self.gate_bias) / len(tensor_list)
+        H_up = (H_up + self.up_bias) / len(tensor_list)
 
         # 3. Apply the non-linearity to the completely aggregated context
         H_mid = F.silu(H_gate) * H_up
@@ -66,7 +67,7 @@ class DepthHead(nn.Module):
             UpscaleBlock(dim // 16, dim // 256, 4),
             nn.SiLU(inplace=True),
         )
-        self.final_proj = PointwiseSwiGLU(in_features=dim // 256, hidden_features=dim // 256, out_features=1)
+        self.final_proj = PointwiseSwiGLU(in_features=dim // 256, hidden_features=dim // 256, out_features=2)
 
     def forward(self, x, L, H, W):
         """
@@ -83,7 +84,7 @@ class DepthHead(nn.Module):
         x = rearrange(x, "BL (H_p W_p) dim -> BL dim H_p W_p", H_p=H // 16, W_p=W // 16)
         x = self.upscale(x)
         x = self.final_proj(x)
-        return rearrange(x.squeeze(1), "(B L) H W -> B L H W", L=L)
+        return rearrange(x, "(B L) two H W -> B L two H W", L=L).unbind(2)
 
 class PointHead(nn.Module):
     def __init__(
@@ -112,13 +113,13 @@ class PointHead(nn.Module):
         """
         # 4 x (B * L, HW // 256, dim)
         tokens = [y[:, self.num_registers:, :] for y in x]
-        return self.focal_head(x[-1][:, :self.num_registers, :], L, H, W), self.depth_head(tokens, L, H, W)
+        return self.focal_head(x[-1][:, :self.num_registers, :], L, H, W), *self.depth_head(tokens, L, H, W)
 
 
 @torch.compile()
 class PP3DR_all_blocks(PP3DR):
     """
-    NOTE: You'll have to decrease start_checkpointing. You'll also have to pass in range(num_blocks) for ViTTT and PP3DR.
+    NOTE: You'll have to decrease start_checkpointing. You'll also have to pass in range(num_blocks) for ViTTT.
     """
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs, point_head_class=PointHead)
+        super().__init__(*args, **kwargs, point_head_class=PointHead, output_blocks=list(range(18)))

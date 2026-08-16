@@ -85,9 +85,6 @@ class PoseHead(nn.Module):
             self,
             dim=1280,
             num_registers=5,
-            num_heads=20,
-            blocks=4,  # Pi3 has 5 transformer blocks per decoder. We need to use more.
-            ffn_ratio=4,
             output_dim=9,  # (x, y, z) + 6D continuous rotation representation. This is per-frame.
     ):
         super().__init__()
@@ -191,7 +188,7 @@ class DepthHead(nn.Module):
             UpscaleBlock(dim // 16, dim // 64, 2), # 1/2
         ])
         self.final_upscale = UpscaleBlock(dim // 64, dim // 256, 2) # original dimensions
-        self.final_proj = PointwiseSwiGLU(in_features=dim // 256, hidden_features=dim // 256, out_features=1)
+        self.final_proj = PointwiseSwiGLU(in_features=dim // 256, hidden_features=dim // 256, out_features=2)
 
     def forward(self, x, L):
         """
@@ -201,14 +198,15 @@ class DepthHead(nn.Module):
 
         Returns
         -------
-        (B, L, H, W)
+        log_depths (B, L, H, W)
+        raw_uncertainty (B, L, H, W)
         """
         a, b, c, d = [self.initial_proj[i](y) for i, y in enumerate(x)]
         x = F.silu(c + self.fusion_proj[0](d))
         x = F.silu(b + self.fusion_proj[1](x))
         x = F.silu(a + self.fusion_proj[2](x))
-        x = F.silu(self.final_upscale(x))
-        return rearrange(self.final_proj(x).squeeze(1), "(B L) H W -> B L H W", L=L)
+        x = F.silu(self.final_upscale(x)) # (B * L, 2, H, W)
+        return rearrange(self.final_proj(x), "(B L) two H W -> B L two H W", L=L).unbind(2)
 
 class PointHead(nn.Module):
     def __init__(
@@ -243,7 +241,7 @@ class PointHead(nn.Module):
         tokens = [self.token_layer_norms[i](y[:, self.num_registers:, :]) for i, y in enumerate(x)]
         tokens = [rearrange(y, "BL (H_p W_p) dim -> BL dim H_p W_p", H_p=H // 16) for y in tokens]
 
-        return self.focal_head(x[-1][:, :self.num_registers, :], L, H, W), self.depth_head(tokens, L)
+        return self.focal_head(x[-1][:, :self.num_registers, :], L, H, W), *self.depth_head(tokens, L)
 
 
 @torch.compile()
@@ -256,10 +254,8 @@ class PP3DR(nn.Module):
             decoder_blocks: int = 36,  # Pi3 is 36 decoder blocks.
             ffn_ratio: int = 4,
             num_registers: int = 5,
-            start_checkpointing=13,  # How many blocks EACH not to checkpoint (total # is twice as many).
+            start_checkpointing=11,  # How many blocks EACH not to checkpoint (total # is twice as many).
             freeze_feature_extractor=True,
-            PP3DR_drop_rates=None,
-            ViTTT_drop_rates=None,
             point_head_class=PointHead,
             pose_head_class=PoseHead,
             output_blocks = [17] # These are block_each indices. The highest block_each index is 17.
@@ -272,14 +268,20 @@ class PP3DR(nn.Module):
         # To keep VRAM around 99% with the same batch size as freeze_feature_extractor=True, we're going to checkpoint
         # *none* of the ViTTT blocks and 6 of the PP3DR blocks.
         # Keep in mind that this varies wildly with the specific architecture we're using, so you should check each time.
-        self.start_checkpointing = start_checkpointing if freeze_feature_extractor else 6
+        self.start_checkpointing = start_checkpointing if freeze_feature_extractor else 4
+
+        # Drop rates
+        if freeze_feature_extractor:
+            ViTTT_drop_rates = None
+            PP3DR_drop_rates = torch.linspace(0, 0.1, decoder_blocks)
+        else:
+            rates = torch.linspace(0, 0.1, encoder_blocks + decoder_blocks)
+            ViTTT_drop_rates = rates[:encoder_blocks]
+            PP3DR_drop_rates = rates[encoder_blocks:]
 
         # General decoder
         self.dim = dim
-        drop_rates = [
-            x.item() for x in
-            (torch.linspace(0, 0.1, decoder_blocks) if PP3DR_drop_rates is None else PP3DR_drop_rates)
-        ]
+        drop_rates = [x.item() for x in PP3DR_drop_rates]
         self.global_blocks = nn.ModuleList([
             GlobalBlock(dim, num_heads, ffn_ratio, drop_rates[2 * i])
             for i in range(self.blocks_each)
@@ -381,7 +383,7 @@ class PP3DR(nn.Module):
         If you're observant, you'll notice that every tensor added to `outputs` was the output of a LocalBlock.
         This is fine, because we're doing dense depth prediction. This would be harder to justify for the PoseHead.
         """
-        focal_length, log_depths = self.point_head(outputs, L, H, W)
+        focal_length, log_depths, raw_uncertainty = self.point_head(outputs, L, H, W)
         # We're predicting the relative pose from this frame to the next one, which is why our sequence length is L - 1.
         poses = self.pose_head(x, L)[:, :-1]  # (B, L - 1, 9)
 
@@ -396,10 +398,11 @@ class PP3DR(nn.Module):
 
         return {
             # e^-80 to e^80 is safely within the range of bfloat16.
-            "log_depths": torch.clamp(log_depths, min=-80, max=80),
-            "focal_length": focal_length,
-            "relative_camera_translations": poses[:, :, :3],  # (B, L - 1, 3) -> 3 scalars, (x, y, z)
-            "relative_camera_rotations": torch.stack([a, b, c], dim=-1)  # (B, L - 1, 3, 3)
+            "log_depths": torch.clamp(log_depths, min=-80, max=80).to(torch.float32),
+            "raw_uncertainty": torch.clamp(raw_uncertainty, min=-80, max=80).to(torch.float32),
+            "focal_length": focal_length.to(torch.float32),
+            "relative_camera_translations": poses[:, :, :3].to(torch.float32),  # (B, L - 1, 3) -> 3 scalars, (x, y, z)
+            "relative_camera_rotations": torch.stack([a, b, c], dim=-1).to(torch.float32)  # (B, L - 1, 3, 3)
         }
 
 

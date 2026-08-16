@@ -242,6 +242,7 @@ class BaseTrainer:
         return train_dataloader, val_dataloader
 
     def initialize(self, model, pretrained_path, strict, freeze_feature_extractor, use_muon):
+        # Drop rates get handled inside the model itself.
         PP3DR_model = model(freeze_feature_extractor=freeze_feature_extractor)
 
         # 1. Initialize ONLY the new LaCT blocks and Decoder Heads!
@@ -297,7 +298,7 @@ class BaseTrainer:
                          decoder_blocks: int,
                          freeze_feature_extractor: bool,
                          use_muon: bool,
-                         adamw_lr: float = 1e-5, # 1e-4
+                         adamw_lr: float = 1e-4, # 1e-4
                          muon_lr: float = 1e-3,
                          weight_decay: float = 0.04,
                          layer_decay: float = 0.95,
