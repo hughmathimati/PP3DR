@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.utils import create_uv_grid, position_grid_to_embed
+from models.utils import apply_pos_embed
 
 
 class DenseHead(nn.Module):
@@ -132,12 +132,12 @@ class DenseHead(nn.Module):
             x = self.norm(x)
             x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
             x = self.projects[feature_idx](x)
-            x = self._apply_pos_embed(x, width, height)
+            x = apply_pos_embed(x, width, height)
             x = self.resize_layers[feature_idx](x)
             multi_scale_features.append(x)
 
         fused = self.scratch_forward(multi_scale_features)
-        fused = self._apply_pos_embed(fused, width, height)
+        fused = apply_pos_embed(fused, width, height)
 
         depth_logits = self.proj(fused)
         depth_logits = F.pixel_shuffle(depth_logits, self.final_shuffle_factor)
@@ -164,14 +164,14 @@ class DenseHead(nn.Module):
 
         return depth, depth_conf
 
-    def _apply_pos_embed(self, x: torch.Tensor, width: int, height: int, ratio: float = 0.1) -> torch.Tensor:
-        patch_w = x.shape[-1]
-        patch_h = x.shape[-2]
-        pos_embed = create_uv_grid(patch_w, patch_h, aspect_ratio=width / height, dtype=x.dtype, device=x.device)
-        pos_embed = position_grid_to_embed(pos_embed, x.shape[1])
-        pos_embed = pos_embed * ratio
-        pos_embed = pos_embed.permute(2, 0, 1)[None].expand(x.shape[0], -1, -1, -1)
-        return x + pos_embed
+    # def _apply_pos_embed(self, x: torch.Tensor, width: int, height: int, ratio: float = 0.1) -> torch.Tensor:
+    #     patch_w = x.shape[-1]
+    #     patch_h = x.shape[-2]
+    #     pos_embed = create_uv_grid(patch_w, patch_h, aspect_ratio=width / height, dtype=x.dtype, device=x.device)
+    #     pos_embed = position_grid_to_embed(pos_embed, x.shape[1])
+    #     pos_embed = pos_embed * ratio
+    #     pos_embed = pos_embed.permute(2, 0, 1)[None].expand(x.shape[0], -1, -1, -1)
+    #     return x + pos_embed
 
     def scratch_forward(self, features: list[torch.Tensor]) -> torch.Tensor:
         layer_1, layer_2, layer_3, layer_4 = features

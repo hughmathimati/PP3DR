@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=dpt_1e-5_30-epochs
+#SBATCH --job-name=pos-finetune
 #SBATCH --output=%x-%j.out
 #SBATCH --partition=vulcan-ampere
 #SBATCH --ntasks 1

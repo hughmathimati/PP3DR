@@ -19,12 +19,13 @@ from tqdm import tqdm, trange
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pickle
 import accelerate
-from accelerate import Accelerator, ProfileKwargs, DataLoaderConfiguration
-from accelerate.utils import ProjectConfiguration, DistributedDataParallelKwargs
+from accelerate import Accelerator, DataLoaderConfiguration
 from torch.utils.data import ConcatDataset, DataLoader
 import os
 import math
 from torch.utils.data import default_collate
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
+
 
 def debug_collate(batch):
     """
@@ -55,25 +56,21 @@ def debug_collate(batch):
         raise e
 
 class State:
-    def __init__(self, epochs, device):
+    def __init__(self):
         self.epoch = 1
-        self.train_losses = torch.zeros((epochs), device=device)
-        self.val_losses = torch.zeros((epochs), device=device)
+        self.global_step = 0
 
     def state_dict(self):
         # This is called automatically by accelerator.save_state()
         return {
             "epoch": self.epoch,
-            "train_losses": self.train_losses,
-            "val_losses": self.val_losses
+            "global_step": self.global_step
         }
 
     def load_state_dict(self, state):
         # This is called automatically by accelerator.load_state()
-        self.epoch = state["epoch"]
-        self.train_losses = state["train_losses"]
-        self.val_losses = state["val_losses"]
-
+        self.epoch = state['epoch']
+        self.global_step = state['global_step']
 
 class BaseTrainer:
     """
@@ -84,14 +81,15 @@ class BaseTrainer:
                  model,
                  loss,
                  name="checkpoints",
-                 epochs=15,
-                 checkpoint_every=8,
+                 epochs=30,
+                 checkpoint_every=16,
                  pretrained_path=None,
-                 checkpoint=None,
                  strict=True,
                  freeze_feature_extractor=True,
+                 ema = False,
                  batch_size=4,
                  gradient_accumulation_steps=8,
+                 checkpoint=None,
                  # start_checkpointing is handled inside PP3DR itself.
                  train_datasets=[
                      dynamic_replica_dataset, dynamic_replica_val_dataset, dynamic_replica_test_dataset,
@@ -111,7 +109,6 @@ class BaseTrainer:
         # torch.autograd.set_detect_anomaly(True) # DEBUG
 
         self.accelerator = Accelerator(
-            # kwargs_handlers=[ProfileKwargs(activities=["cpu", "cuda"])],
             dataloader_config=DataLoaderConfiguration(non_blocking=True),
             log_with="wandb",
             gradient_accumulation_steps=gradient_accumulation_steps
@@ -123,8 +120,8 @@ class BaseTrainer:
             print("\033[95m" + f"Train job: {name}" + "\033[0m")
 
         self.name = name
-        self.pretrained_path = pretrained_path
         self.epochs = epochs
+        self.pretrained_path = pretrained_path
         self.checkpoint_every = checkpoint_every
 
         # ProcessPoolExecutor -> Cannot re-initialize CUDA in forked subprocess.
@@ -144,29 +141,39 @@ class BaseTrainer:
             )
             self.metric = loss(scale=False)
             train_dataloader, val_dataloader = a.result()
-            self.state, PP3DR_model, AdamW = b.result()
+            train_model, AdamW = b.result()
 
         self.train_dataloader, self.val_dataloader = self.accelerator.prepare(train_dataloader, val_dataloader)
-        total_training_steps = math.ceil(len(self.train_dataloader) / gradient_accumulation_steps) * epochs
 
+        total_training_steps = math.ceil(len(self.train_dataloader) / gradient_accumulation_steps) * epochs
         AdamW_scheduler = transformers.optimization.get_cosine_schedule_with_warmup(
             AdamW,
             total_training_steps // 10,
             total_training_steps
         )
-        self.accelerator.register_for_checkpointing(AdamW_scheduler)
-        self.PP3DR_model, self.AdamW, self.AdamW_scheduler, = self.accelerator.prepare(
-            PP3DR_model, AdamW, AdamW_scheduler
+        self.train_model, self.AdamW, self.AdamW_scheduler, = self.accelerator.prepare(
+            train_model, AdamW, AdamW_scheduler
         )
+
+        self.ema = ema
+        if ema:
+            # train_model is the unwrapped model, and self.train_model is the accelerator-prepared wrapped model.
+            self.eval_model = AveragedModel(train_model, multi_avg_fn=get_ema_multi_avg_fn(0.99))
+            self.eval_model = self.eval_model.to(self.accelerator.device)
+            # self.eval_model.eval() will get called right before the validation for each epoch.
+            for param in self.eval_model.parameters():
+                param.requires_grad = False
+            self.accelerator.register_for_checkpointing(self.eval_model)
+        else:
+            # Safely point the eval reference to the prepared training model
+            self.eval_model = self.train_model
+        self.state = State()
+        self.accelerator.register_for_checkpointing(self.state)
 
         if checkpoint is not None:
             self.accelerator.load_state(checkpoint)
             if self.accelerator.is_local_main_process:
-                print(f"Loaded checkpoint from {checkpoint}")
-            # For some reason, accelerate seems to load the `state` tensors on the cpu. I don't know why this is, but I'll
-            # just move them back.
-            self.state.train_losses = self.state.train_losses.to(self.accelerator.device, non_blocking=True)
-            self.state.val_losses = self.state.val_losses.to(self.accelerator.device, non_blocking=True)
+                print(f"Loaded checkpoint from {checkpoint}.")
         else:
             accelerate.utils.set_seed(42)
             if self.accelerator.is_local_main_process:
@@ -175,34 +182,14 @@ class BaseTrainer:
         self.train_iter = iter(self.train_dataloader)
 
         # Training loop
-        # global_step exists for the sole purpose of tensorboard.
-        self.global_step = 0
-        # with accelerator.profile() as prof:
-        while self.state.epoch <= self.epochs:
+        while self.state.epoch <= epochs:
             self.per_epoch()
 
-        # if accelerator.is_local_main_process:
-        #     prof.export_chrome_trace(f"trace.json")
-        #     print("Saved trace")
-        # accelerator.end_training()
-
-        # End of training loop; write losses to file
         if self.accelerator.is_local_main_process:
             print("Training done.")
-        self.accelerator.reduce(self.state.train_losses, "sum")
-        self.accelerator.reduce(self.state.val_losses, "sum")
-
-        if self.accelerator.is_local_main_process:
-            with open(f"/vulcanscratch/hughma/PP3DR/{name}/train_losses.pkl", "wb") as f:
-                pickle.dump(self.state.train_losses.numpy(force=True), f)
-            print("Saved train_losses")
-            with open(f"/vulcanscratch/hughma/PP3DR/{name}/val_losses.pkl", "wb") as f:
-                pickle.dump(self.state.val_losses.numpy(force=True), f)
-            print("Saved val_losses")
-            torch.save(PP3DR_model.state_dict(), f"/vulcanscratch/hughma/PP3DR/{name}/PP3DR.pth")
-            print("Saved model")
-        if self.accelerator.is_local_main_process:
-            self.accelerator.end_training()
+            torch.save(self.eval_model.state_dict(), f"/vulcanscratch/hughma/PP3DR/{name}/PP3DR.pth")
+            print("Saved model.")
+        self.accelerator.end_training()
 
     def prepare_dataloaders(self, train_datasets, val_dataset, batch_size):
         constructed = []
@@ -236,10 +223,10 @@ class BaseTrainer:
 
     def initialize(self, model, pretrained_path, strict, freeze_feature_extractor):
         # Drop rates get handled inside the model itself.
-        PP3DR_model = model(freeze_feature_extractor=freeze_feature_extractor)
+        train_model = model(freeze_feature_extractor=freeze_feature_extractor)
 
         # 1. Initialize ONLY the new LaCT blocks and Decoder Heads!
-        for name, module in PP3DR_model.named_modules():
+        for name, module in train_model.named_modules():
             # Explicitly protect the backbone from randomization!
             if "ViTTT" in name or "ViT" in name:
                 continue
@@ -266,7 +253,7 @@ class BaseTrainer:
                     clean_state_dict[k] = v
 
             # 3. Load the fine-tuned weights ON TOP of the initialization.
-            missing, unexpected = PP3DR_model.load_state_dict(clean_state_dict, strict=strict)
+            missing, unexpected = train_model.load_state_dict(clean_state_dict, strict=strict)
             print(f"Loaded pretrained weights from {pretrained_path}")
 
             # Print a helpful debug summary so strict=False never blinds us again
@@ -275,20 +262,18 @@ class BaseTrainer:
                 print(f"  -> Unexpected keys (Old Layers discarded): {unexpected}")
 
         AdamW_params = self.get_param_groups(
-            PP3DR_model,
-            decoder_blocks=PP3DR_model.decoder_blocks,
+            train_model,
+            decoder_blocks=train_model.decoder_blocks,
             freeze_feature_extractor=freeze_feature_extractor,
         )
         AdamW = torch.optim.AdamW(AdamW_params, betas=(0.9, 0.99), foreach=True)
-        state = State(self.epochs, self.accelerator.device)
-        self.accelerator.register_for_checkpointing(state)
-        return state, PP3DR_model, AdamW
+        return train_model, AdamW
 
     def get_param_groups(self,
                          model: nn.Module,
                          decoder_blocks: int,
                          freeze_feature_extractor: bool,
-                         adamw_lr: float = 1e-4, # 1e-4
+                         adamw_lr: float = 1e-5, # 1e-4
                          weight_decay: float = 0.04,
                          layer_decay: float = 0.95,
                          ):
@@ -335,7 +320,7 @@ class BaseTrainer:
                     lr_mult = layer_decay ** (num_layers - (2 * layer_id + 1 + offset))
                 else:
                     lr_mult = layer_decay ** (num_layers - layer_id)
-            elif any(k in name for k in ["patch_conv", "class_and_registers"]): # ViTTT blocks only
+            elif any(k in name for k in ["patch_conv", "class_and_registers","block_weights"]):
                 lr_mult = layer_decay ** (num_layers + 1)
             elif "final_layer_norm" in name: # ViTTT blocks only
                 lr_mult = layer_decay ** (num_layers - encoder_offset)  # It comes after all the ViTTT blocks.
@@ -366,24 +351,34 @@ class BaseTrainer:
                 iterator, desc=name, disable=not self.accelerator.is_local_main_process, total=len(dataloader),
                 mininterval=1
         ):
-            with self.accelerator.accumulate(self.PP3DR_model):
+            with self.accelerator.accumulate(self.train_model):
                 # Accelerate automatically handles autocast and automatically moves the batch's tensors to the right GPU.
-                pred = self.PP3DR_model(batch['images'], batch['rope_x'], batch['rope_y'])
+                pred = self.train_model(
+                    batch['images'],
+                    batch['rope_x'],
+                    batch['rope_y'],
+                    batch['original_height'],
+                    batch['original_width']
+                )
                 loss, loss_dict = self.metric(pred, batch)
 
-                self.state.train_losses[self.state.epoch - 1] += loss.detach()
                 with torch.autocast(device_type=self.accelerator.device.type, enabled=False):
                     self.AdamW.zero_grad()
                     self.accelerator.backward(loss)
                     if self.accelerator.sync_gradients:
-                        torch.nn.utils.clip_grad_norm_(self.PP3DR_model.parameters(), max_norm=1.0)
+                        torch.nn.utils.clip_grad_norm_(self.train_model.parameters(), max_norm=1.0)
+                        if self.ema:
+                            self.eval_model.update_parameters(self.train_model)
                     self.AdamW.step()
                     self.AdamW_scheduler.step()
 
             # Log to WandB once per batch
             if self.accelerator.is_local_main_process:
-                self.accelerator.log({f"train/{key}": value for key, value in loss_dict.items()}, step=self.global_step)
-                self.global_step += 1
+                self.accelerator.log(
+                    {f"train/{key}": value for key, value in loss_dict.items()},
+                    step=self.state.global_step
+                )
+                self.state.global_step += 1
 
     def val_on_dataset(self, name, iterator, dataloader):
         """
@@ -404,17 +399,22 @@ class BaseTrainer:
         for batch in tqdm(iterator, desc=f"Validation {name}", disable=not self.accelerator.is_local_main_process,
                           total=len_dataloader):
             # Accelerate automatically handles autocast.
-            pred = self.PP3DR_model(batch['images'], batch['rope_x'], batch['rope_y'])
+            pred = self.eval_model(
+                batch['images'],
+                batch['rope_x'],
+                batch['rope_y'],
+                batch['original_height'],
+                batch['original_width']
+            )
             loss, loss_dict = self.metric(pred, batch)
-            self.state.val_losses[self.state.epoch - 1] += loss.detach()
             for k, v in loss_dict.items():
                 sum_loss_dict[k] += v.item()
 
-        # Log to Tensorboard once per epoch
+        # Log to WandB once per epoch
         if self.accelerator.is_local_main_process:
             loss_dict = {f"val/{key}": value / len_dataloader for key, value in sum_loss_dict.items()}
-            self.accelerator.log(loss_dict, step=self.global_step)
-            self.global_step += 1
+            self.accelerator.log(loss_dict, step=self.state.global_step)
+            self.state.global_step += 1
 
     def per_epoch(self):
         val_iter = iter(self.val_dataloader)
@@ -427,17 +427,15 @@ class BaseTrainer:
         if self.accelerator.is_local_main_process:
             print(f"Epoch {self.state.epoch}/{self.epochs}:")
 
-        self.PP3DR_model.train()
-        with torch.profiler.record_function("training"):
-            self.train_on_dataset("Combined train set", self.train_iter, self.train_dataloader)
+        self.train_model.train()
+        self.train_on_dataset("Combined train set", self.train_iter, self.train_dataloader)
 
         # Pre-load train iterator for the next epoch.
         if self.state.epoch != self.epochs:
             self.train_iter = iter(self.train_dataloader)
 
         # Validation on Sintel
-        self.PP3DR_model.eval()
-        # with torch.profiler.record_function("validation"):
+        self.eval_model.eval() # This is necessary if ema is False.
         with torch.no_grad():
             self.val_on_dataset("Sintel", val_iter, self.val_dataloader)
 

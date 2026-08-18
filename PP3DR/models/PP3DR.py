@@ -14,6 +14,8 @@ from timm.layers import DropPath
 from models.BidirectionalLaCT import GlobalLaCT, LocalLaCT
 from models.pos_embed import RopePositionEmbedding, Rope3D, Rope2D
 from models.ViTTT import ViTTT
+from models.BidirectionalLaCT import GlobalLaCT, LocalLaCT
+from models.utils import apply_pos_embed
 
 
 class LayerScale(nn.Module):
@@ -190,7 +192,7 @@ class DepthHead(nn.Module):
         self.final_upscale = UpscaleBlock(dim // 64, dim // 256, 2) # original dimensions
         self.final_proj = PointwiseSwiGLU(in_features=dim // 256, hidden_features=dim // 256, out_features=2)
 
-    def forward(self, x, L):
+    def forward(self, x, L, original_height, original_width):
         """
         Parameters
         ----------
@@ -201,10 +203,12 @@ class DepthHead(nn.Module):
         log_depths (B, L, H, W)
         raw_uncertainty (B, L, H, W)
         """
+        # x = [apply_pos_embed(y, original_width, original_height, L) for y in x]
         a, b, c, d = [self.initial_proj[i](y) for i, y in enumerate(x)]
         x = F.silu(c + self.fusion_proj[0](d))
         x = F.silu(b + self.fusion_proj[1](x))
         x = F.silu(a + self.fusion_proj[2](x))
+        # x = apply_pos_embed(x, original_width, original_height, L)
         x = F.silu(self.final_upscale(x)) # (B * L, 2, H, W)
         return rearrange(self.final_proj(x), "(B L) two H W -> B L two H W", L=L).unbind(2)
 
@@ -222,26 +226,19 @@ class PointHead(nn.Module):
         self.token_layer_norms = nn.ModuleList([nn.LayerNorm(dim) for _ in range(4)])
         self.depth_head = DepthHead()
 
-    def forward(self, x: torch.Tensor, L, H, W) -> torch.Tensor:
+    def forward(
+            self, x, outputs: torch.Tensor, L, H, W, original_height, original_width
+    ) -> torch.Tensor:
         """
-        Inputs consist of:
-        1. The output of block 6/12 (index 5) from ViTTT
-        2. The output at the end of ViTTT
-        3. The output of block 18/36 (index 17) from PP3DR
-        4. The output at the end of PP3DR
-
-        Parameters
-        ----------
-        x: Input tensor
-        rope2d: 2D RoPE positional embedding
-        rope3d: 3D RoPE positional embedding
-        L: Number of frames. Necessary for the rearrange operations.
+        `x` has shape (B * L, X, dim).
+        `outputs` has four tensors of shape (B * L, X, dim).
         """
         # 4 x (B * L, HW // 256, dim)
-        tokens = [self.token_layer_norms[i](y[:, self.num_registers:, :]) for i, y in enumerate(x)]
+        tokens = [self.token_layer_norms[i](y[:, self.num_registers:, :]) for i, y in enumerate(outputs)]
         tokens = [rearrange(y, "BL (H_p W_p) dim -> BL dim H_p W_p", H_p=H // 16) for y in tokens]
-
-        return self.focal_head(x[-1][:, :self.num_registers, :], L, H, W), *self.depth_head(tokens, L)
+        focal = self.focal_head(x[:, :self.num_registers, :], L, H, W)
+        depths, confidence = self.depth_head(tokens, L, original_height, original_width)
+        return focal, depths, confidence
 
 
 @torch.compile()
@@ -254,11 +251,14 @@ class PP3DR(nn.Module):
             decoder_blocks: int = 36,  # Pi3 is 36 decoder blocks.
             ffn_ratio: int = 4,
             num_registers: int = 5,
-            start_checkpointing=11,  # How many blocks EACH not to checkpoint (total # is twice as many).
+            start_checkpointing=12,  # How many blocks EACH not to checkpoint (total # is twice as many).
             freeze_feature_extractor=True,
             point_head_class=PointHead,
             pose_head_class=PoseHead,
-            output_blocks = [17] # These are block_each indices. The highest block_each index is 17.
+            # First element must be zero, and last element must be equal to blocks_each.
+            chunk_starts: list[int] = [0, 9, 18]
+            # chunk_starts: list[int] = [0, 18]
+
     ):
         super().__init__()
         assert decoder_blocks % 2 == 0, f"Number of decoder blocks ({decoder_blocks}) must be even for alternating global and frame-wise attention"
@@ -268,7 +268,7 @@ class PP3DR(nn.Module):
         # To keep VRAM around 99% with the same batch size as freeze_feature_extractor=True, we're going to checkpoint
         # *none* of the ViTTT blocks and 6 of the PP3DR blocks.
         # Keep in mind that this varies wildly with the specific architecture we're using, so you should check each time.
-        self.start_checkpointing = start_checkpointing if freeze_feature_extractor else 4
+        self.start_checkpointing = start_checkpointing if freeze_feature_extractor else 5
 
         # Drop rates
         if freeze_feature_extractor:
@@ -296,9 +296,12 @@ class PP3DR(nn.Module):
         self.rope3d = Rope3D(embed_dim=dim, num_heads=num_heads, device="cuda")
 
         self.ViTTT = ViTTT(dim, num_heads, encoder_blocks, ffn_ratio, drop_rates=ViTTT_drop_rates)
-        self.ViTTT.load_state_dict(torch.load("/vulcanscratch/hughma/ViT/best_checkpoint.pth",
-                                              weights_only=True,
-                                              map_location="cpu"))
+        state_dict = torch.load("/vulcanscratch/hughma/ViT/best_checkpoint.pth", weights_only=True, map_location="cpu")
+        missing, unexpected = self.ViTTT.load_state_dict(state_dict, strict=False)
+        if len(missing) > 0 or len(unexpected) > 0:
+            print('\033[93m' + "Warning: When loading ViTTT weights:" + '\033[0m')
+            print(f"  -> Missing keys (New Layers initialized from scratch): {missing}")
+            print(f"  -> Unexpected keys (Old Layers discarded): {unexpected}")
         self.freeze_feature_extractor = freeze_feature_extractor
         if self.freeze_feature_extractor:
             for parameter in self.ViTTT.parameters():
@@ -316,7 +319,13 @@ class PP3DR(nn.Module):
         """
         self.pose_head = pose_head_class()
 
-        self.output_blocks = output_blocks
+        self.chunk_starts = chunk_starts
+        # The weights start off as a uniform average.
+        self.block_weights = torch.zeros(self.blocks_each)
+        self.block_weights[8] = self.block_weights[17] = 1
+        # self.block_weights[17] = 1
+        self.block_weights = nn.Parameter(self.block_weights)
+        self.block_weights.requires_grad = False # COMMENT FOR FINETUNE
 
     def train(self, mode=True):
         super().train(mode)
@@ -327,7 +336,7 @@ class PP3DR(nn.Module):
     def ViT(self, image):
         return self.ViTTT(image)
 
-    def forward(self, x: torch.Tensor, rope_x, rope_y) -> dict:
+    def forward(self, x: torch.Tensor, rope_x, rope_y, original_height, original_width) -> dict:
         """
         The input must be pre-processed so its height and width are multiples of the patch size.
 
@@ -338,6 +347,8 @@ class PP3DR(nn.Module):
         images: (batch size, RGB, height, width)
         rope_x: The 2D x-coordinates to be fed into RoPE (B, L, HW)
         rope_y: The 2D y-coordinates to be fed into RoPE; same shape as above.
+        original_height: The original (non-resized, non-padded) image heights (B,)
+        original_width: The original (non-resized, non-padded) image widths (B,)
 
         Returns
         -------
@@ -365,6 +376,7 @@ class PP3DR(nn.Module):
         rope2d has shape (B * L, HW, head_dim), and rope3d has shape (B, L, HW, head_dim).
         """
         rope2d, rope3d = self.rope2d(rope_x, rope_y), self.rope3d(rope_x, rope_y)
+        accumulator = None
         for i in range(self.blocks_each):
             if self.training and i >= self.start_checkpointing:
                 # Global attention: absorb frame-length into patch-length dimension.
@@ -374,8 +386,15 @@ class PP3DR(nn.Module):
             else:
                 x = self.global_blocks[i](x, rope3d, L)
                 x = self.local_blocks[i](x, rope2d, L)
-            if i in self.output_blocks:
-                outputs.append(x)
+
+            y = x * self.block_weights[i]
+            if i in self.chunk_starts:
+                if accumulator is not None:
+                    outputs.append(accumulator)
+                accumulator = y
+            else:
+                accumulator = accumulator + y
+        outputs.append(accumulator)
         # x.shape == (B * L, num_registers + HW // 256, 2 * dim)
 
         # Step 2: Per-task decoders
@@ -383,7 +402,9 @@ class PP3DR(nn.Module):
         If you're observant, you'll notice that every tensor added to `outputs` was the output of a LocalBlock.
         This is fine, because we're doing dense depth prediction. This would be harder to justify for the PoseHead.
         """
-        focal_length, log_depths, raw_uncertainty = self.point_head(outputs, L, H, W)
+        focal_length, log_depths, raw_uncertainty = self.point_head(
+            x, outputs, L, H, W, original_height, original_width
+        )
         # We're predicting the relative pose from this frame to the next one, which is why our sequence length is L - 1.
         poses = self.pose_head(x, L)[:, :-1]  # (B, L - 1, 9)
 
@@ -407,25 +428,13 @@ class PP3DR(nn.Module):
 
 
 if __name__ == "__main__":
-    import time
-    from transformers.image_utils import load_image
-    import torchvision.transforms.v2 as transforms
-    from Dinov3 import low_rank, write_to_image
-    from datasets.nrgbd_dataset import nrgbd_dataset
-
-    model = PP3DR().to("cuda").eval()  # You should really rename this
-    loaded_state_dict = torch.load("/vulcanscratch/hughma/PP3DR/finetune/PP3DR.pth", weights_only=True)
-    # The lines here are necessary if all the loaded state dict entries begin with an extra "module."
-    new_state_dict = {}
-    for key in loaded_state_dict:
-        new_state_dict[key[7:]] = loaded_state_dict[key]
-    model.load_state_dict(new_state_dict)
-    print("loaded state dict")
-
-    dataset = nrgbd_dataset()
-    data = dataset[0]
-    for key in data:
-        data[key] = data[key].unsqueeze(0)
-    with torch.amp.autocast("cuda", dtype=torch.bfloat16), torch.no_grad():
-        pred = model(data['images'].to("cuda"), data['rope_x'].to("cuda"), data['rope_y'].to("cuda"))
-    print("Done.")
+    """
+    Save PP3DR model from checkpoint.
+    """
+    import accelerate
+    accelerator = accelerate.Accelerator()
+    accelerator.load_state(checkpoint)
+    if accelerator.is_local_main_process:
+        print(f"Loaded checkpoint from {checkpoint}")
+        torch.save(self.eval_model.state_dict(), f"/vulcanscratch/hughma/PP3DR/{name}/PP3DR.pth")
+        print("Saved model")

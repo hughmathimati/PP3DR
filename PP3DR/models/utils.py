@@ -7,6 +7,46 @@
 import torch
 
 
+def apply_pos_embed(x: torch.Tensor, W_orig: torch.Tensor, H_orig: torch.Tensor, L: int,
+                     ratio: float = 0.1) -> torch.Tensor:
+    """
+    Dynamically generates and injects UV positional embeddings, handling
+    heterogeneous aspect ratios across the batch.
+    """
+    B_times_L, C, patch_h, patch_w = x.shape
+    B = B_times_L // L
+
+    batched_pos_embeds = []
+
+    # Iterate over the batch to handle unique aspect ratios per sequence
+    for b in range(B):
+        # Extract the raw float dimensions for this specific batch item
+        aspect_ratio = W_orig[b].to(x.dtype) / H_orig[b].to(x.dtype)
+
+        # create_uv_grid returns (patch_h, patch_w, 2)
+        pos_embed = create_uv_grid(
+            width=patch_w,
+            height=patch_h,
+            aspect_ratio=aspect_ratio,
+            dtype=x.dtype,
+            device=x.device
+        )
+
+        # position_grid_to_embed returns (patch_h, patch_w, C)
+        pos_embed = position_grid_to_embed(pos_embed, C)
+        pos_embed = pos_embed * ratio
+
+        # Permute to match image feature dims: (C, patch_h, patch_w)
+        pos_embed = pos_embed.permute(2, 0, 1)
+
+        # Repeat this sequence's unique embedding for all L frames
+        for _ in range(L):
+            batched_pos_embeds.append(pos_embed)
+
+    # Stack back into (B*L, C, patch_h, patch_w) and add to the features
+    return x + torch.stack(batched_pos_embeds, dim=0)
+
+
 def position_grid_to_embed(pos_grid: torch.Tensor, embed_dim: int, omega_0: float = 100) -> torch.Tensor:
     """
     Convert 2D position grid (HxWx2) to sinusoidal embeddings (HxWxC)

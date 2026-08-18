@@ -50,20 +50,14 @@ class ViTTT(nn.Module):
             self,
             dim: int = 1280,
             num_heads: int = 20,
-            blocks = 12, # DINOv3 H+ has 32 layers.
-            ffn_ratio = 4,
-            num_registers = 5,
-            # In the ViTTT code found in the ViTTT folder, the default value for start_checkpointing is 8.
-            # The reason it's increased to 12 here is so the non-checkpointed blocks take up around the same VRAM whether
-            # freeze_feature_extractor is enabled or not, so I obtain maximum VRAM usage without having to adjust the
-            # batch size every time I change freeze_feature_extractor.
-            # Once I start doing long-sequence-length finetuning, I will almost certainly decrease this to maximize the
-            # sequence length I can pass in.
-            start_checkpointing = 12,
-            drop_rates = None,
-#            output_blocks=[1, 4, 11]
-#             output_blocks = list(range(12))
-            output_blocks=[]
+            blocks: int = 12,
+            ffn_ratio: int = 4,
+            num_registers: int = 5,
+            start_checkpointing: int = 12,
+            drop_rates: bool | None = None,
+            # First element must be zero, and last element must be equal to blocks.
+            chunk_starts: list[int] = [0, 6, 12]
+            # chunk_starts: list[int] = [0, 4, 8, 12] # output_blocks = [1, 4, 11]
     ):
         super().__init__()
         self.dim = dim
@@ -81,7 +75,14 @@ class ViTTT(nn.Module):
         self.class_and_registers = nn.Parameter(torch.randn(num_registers, dim) * 0.02)
         self.final_layer_norm = nn.LayerNorm(dim)
         self.start_checkpointing = start_checkpointing
-        self.output_blocks = output_blocks
+
+        self.chunk_starts = chunk_starts
+        # The weights start off as a uniform average.
+        self.block_weights = torch.zeros(blocks)
+        self.block_weights[2] = self.block_weights[11] = 1
+        # self.block_weights[1] = self.block_weights[4] = self.block_weights[11] = 1
+        self.block_weights = nn.Parameter(self.block_weights)
+        self.block_weights.requires_grad = False # COMMENT FOR FINETUNE
 
     def patch_embed(self, x):
         # B, 3, H, W -> B, dim, H // 16, W // 16 -> B, HW // 256, dim
@@ -102,23 +103,23 @@ class ViTTT(nn.Module):
         B, C, H, W = x.shape
         x = self.patch_embed(x)
         rope = self.rope(H // 16, W // 16)
-        """
-        Why is the shape (196, 64)?
-        Our input tensor was 224x224; with 16x16 patches, it becomes 14x14 -> HW sequence length of 196 (we don't apply
-        RoPE to special tokens).
-        Our RoPE dimension is 64 because our total dimension is 1280 and we have 20 heads; 1280 / 20 = 64.
-        """
-        # print("RoPE shapes:", rope[0].shape, rope[1].shape)
         repeated_class_and_registers = self.class_and_registers.unsqueeze(0).repeat(B, 1, 1)
         x = torch.cat((repeated_class_and_registers, x), dim = 1)
-        # assert x.shape == (B, 5 + H * W // 256, self.dim), f"x.shape should be {(B, 5 + H * W // 256, self.dim)} but is instead {x.shape}."
-        outputs = []
+
+        outputs, accumulator = [], None
         for i, block in enumerate(self.blocks):
             if self.training and i >= self.start_checkpointing:
                 x = checkpoint(block, x, rope, use_reentrant = False)
             else:
                 x = block(x, rope)
-            if i in self.output_blocks:
-                outputs.append(x)
+
+            y = x * self.block_weights[i]
+            if i in self.chunk_starts:
+                if accumulator is not None:
+                    outputs.append(accumulator)
+                accumulator = y
+            else:
+                accumulator = accumulator + y
+        outputs.append(accumulator)
 
         return self.final_layer_norm(x), outputs

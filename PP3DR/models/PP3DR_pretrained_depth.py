@@ -54,22 +54,10 @@ class PointHead(nn.Module):
 
 @torch.compile()
 class PP3DR_pretrained_depth(PP3DR):
-    def __init__(
-            self,
-            # How many blocks EACH not to checkpoint (total # is twice as many).
-            # Keep in mind we're already not checkpointing all 12 ViTTT blocks.
-            # freeze_feature_extractor is kept for compatibility with the BaseTrainer but is not used.
-            freeze_feature_extractor=False,
-            output_blocks = [0, 5, 11, 17], # These are block_each indices. The highest block_each index is 17.
-    ):
-        super().__init__(
-            freeze_feature_extractor=freeze_feature_extractor,
-            start_checkpointing=(11 if freeze_feature_extractor else 4),
-            point_head_class=PointHead,
-            output_blocks=output_blocks
-        )
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs, point_head_class=PointHead)
 
-    def forward(self, x: torch.Tensor, rope_x, rope_y) -> dict:
+    def forward(self, x: torch.Tensor, rope_x, rope_y, original_height, original_width) -> dict:
         """
         The input must be pre-processed so its height and width are multiples of the patch size.
 

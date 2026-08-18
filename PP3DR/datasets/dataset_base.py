@@ -326,6 +326,7 @@ class DatasetBase(torch.utils.data.Dataset):
             d = executor.submit(self.extrinsics_helper, index, frame_indices)
 
             images, depths, intrinsics = a.result(), b.result(), c.result()
+            output['original_height'], output['original_width'] = images.shape[-2], images.shape[-1]
             if self.raw:
                 output['raw_images'], output['raw_depths'], output['raw_intrinsics'] = images, depths, intrinsics
 
