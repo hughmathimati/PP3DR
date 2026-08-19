@@ -157,7 +157,7 @@ class PointwiseSwiGLU(nn.Module):
         return self.out_proj(hidden)
 
 class UpscaleBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, ffn_ratio, upscale_dim):
+    def __init__(self, in_channels, out_channels, upscale_dim, ffn_ratio=1):
         super().__init__()
         self.upscale_dim = upscale_dim
         self.initial_proj = PointwiseSwiGLU(in_features=in_channels, hidden_features=in_channels * ffn_ratio,
@@ -192,22 +192,22 @@ class DepthHead(nn.Module):
     def __init__(self, dim=1280):
         super().__init__()
         self.initial_proj = nn.ModuleList([
-            UpscaleBlock(dim, 256, 1, 8), # 1/2
-            UpscaleBlock(dim, 256, 1, 4), # 1/4
-            UpscaleBlock(dim, 256, 1, 2), # 1/8
-            nn.Identity() # 1/16
+            UpscaleBlock(dim, 64, 8), # 1/2
+            UpscaleBlock(dim, 128, 4), # 1/4
+            UpscaleBlock(dim, 256, 2), # 1/8
+            nn.Identity()
         ])
         self.fusion_proj = nn.ModuleList([
-            UpscaleBlock(256, 256, 2, 2), # 1/8
-            UpscaleBlock(256, 256, 2, 2), # 1/4
-            UpscaleBlock(256, 256, 2, 2), # 1/2
+            UpscaleBlock(dim, 256, 2), # 1/8
+            UpscaleBlock(256, 128, 2), # 1/4
+            UpscaleBlock(128, 64, 2), # 1/2
         ])
         self.fusion_resconv = nn.ModuleList([
             ResidualConvUnit(256),  # Refines the 1/8th scale fusion
-            ResidualConvUnit(256),  # Refines the 1/4th scale fusion
-            ResidualConvUnit(256),  # Refines the 1/2th scale fusion
+            ResidualConvUnit(128),  # Refines the 1/4th scale fusion
+            ResidualConvUnit(64),  # Refines the 1/2th scale fusion
         ])
-        self.final_upscale = UpscaleBlock(256, 2, 1, 2) # original dimensions
+        self.final_upscale = UpscaleBlock(64, 2, 2) # original dimensions
 
     def forward(self, x, L, original_height, original_width):
         """
