@@ -17,15 +17,15 @@ from models.utils import apply_pos_embed
 
 
 class DenseHead(nn.Module):
-    """Dense prediction head used by the released VGGT-Omega checkpoints."""
+    """Dense prediction head modified to handle heterogeneous batched aspect ratios."""
 
     def __init__(
-        self,
-        dim_in: int = 2048,
-        patch_size: int = 16,
-        features: int = 256,
-        out_channels: list[int] = [256, 512, 1024, 1024],
-        intermediate_layer_idx: list[int] = [4, 11, 17, 23],
+            self,
+            dim_in: int = 2048,
+            patch_size: int = 16,
+            features: int = 256,
+            out_channels: list[int] = [256, 512, 1024, 1024],
+            intermediate_layer_idx: list[int] = [4, 11, 17, 23],
     ) -> None:
         super().__init__()
 
@@ -61,27 +61,32 @@ class DenseHead(nn.Module):
 
         self.proj = _make_prediction_head(
             features,
-            self.final_shuffle_factor**2,
+            self.final_shuffle_factor ** 2,
         )
         self.proj_conf = _make_prediction_head(
             features,
-            self.final_shuffle_factor**2,
+            self.final_shuffle_factor ** 2,
         )
         _init_small_conf_prediction_head(self.proj_conf)
 
     def forward(
-        self,
-        aggregated_tokens_list: list[torch.Tensor | None],
-        batch_size, num_frames, height, width,
-        patch_token_start: int,
-        frames_chunk_size: int | None = 8,
+            self,
+            aggregated_tokens_list: list[torch.Tensor | None],
+            batch_size: int,
+            num_frames: int,
+            patch_h: int,
+            patch_w: int,
+            original_height: torch.Tensor,
+            original_width: torch.Tensor,
+            patch_token_start: int,
+            frames_chunk_size: int | None = 8,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if patch_token_start is None:
             raise ValueError("patch_token_start is required for DenseHead")
 
-
         if frames_chunk_size is None or frames_chunk_size >= num_frames:
-            return self._forward_impl(aggregated_tokens_list, batch_size, num_frames, height, width, patch_token_start)
+            return self._forward_impl(aggregated_tokens_list, batch_size, num_frames, original_height, original_width,
+                                      patch_token_start)
 
         assert frames_chunk_size > 0
 
@@ -91,7 +96,9 @@ class DenseHead(nn.Module):
             frames_end_idx = min(frames_start_idx + frames_chunk_size, num_frames)
             depth_chunk, depth_conf_chunk = self._forward_impl(
                 aggregated_tokens_list,
-                batch_size, num_frames, height, width,
+                batch_size, num_frames,
+                patch_w, patch_h,
+                original_height, original_width,
                 patch_token_start,
                 frames_start_idx,
                 frames_end_idx,
@@ -104,15 +111,21 @@ class DenseHead(nn.Module):
     def _forward_impl(
             self,
             aggregated_tokens_list: list[torch.Tensor | None],
-            batch_size, num_frames, height, width,
+            batch_size: int,
+            num_frames: int,
+            patch_h: int,
+            patch_w: int,
+            original_height: torch.Tensor,
+            original_width: torch.Tensor,
             patch_token_start: int,
             frames_start_idx: int | None = None,
             frames_end_idx: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
-        patch_h, patch_w = height // self.patch_size, width // self.patch_size
+        # Dynamically infer the spatial dimensions from the sequence length
+        # This safely bypasses trying to use the batched (B,) tensors for math.
+        seq_len = aggregated_tokens_list[0].shape[2] - patch_token_start
 
-        # FIX 1: Dynamically calculate the chunk size to bypass the Meta bug!
         if frames_start_idx is not None and frames_end_idx is not None:
             chunk_frames = frames_end_idx - frames_start_idx
         else:
@@ -121,29 +134,28 @@ class DenseHead(nn.Module):
         multi_scale_features = []
         for feature_idx in range(len(self.intermediate_layer_idx)):
             x = aggregated_tokens_list[feature_idx]
-            x = x[:, :, patch_token_start:]  # (B, L, HW // 256, dim)
+            x = x[:, :, patch_token_start:]  # (B, L, HW, dim)
             if frames_start_idx is not None and frames_end_idx is not None:
                 x = x[:, frames_start_idx:frames_end_idx]
-            # if x.dtype != torch.float32:
-            #     x = x.float()
 
-            # Apply the chunk_frames calculation here
             x = x.reshape(batch_size * chunk_frames, -1, x.shape[-1])
             x = self.norm(x)
             x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
             x = self.projects[feature_idx](x)
-            x = apply_pos_embed(x, width, height)
+
+            # Pass chunk_frames instead of num_frames to prevent shape mismatch!
+            x = apply_pos_embed(x, original_width, original_height, chunk_frames)
+
             x = self.resize_layers[feature_idx](x)
             multi_scale_features.append(x)
 
         fused = self.scratch_forward(multi_scale_features)
-        fused = apply_pos_embed(fused, width, height)
+
+        # Pass chunk_frames instead of num_frames
+        fused = apply_pos_embed(fused, original_width, original_height, chunk_frames)
 
         depth_logits = self.proj(fused)
         depth_logits = F.pixel_shuffle(depth_logits, self.final_shuffle_factor)
-
-        # FIX 2: Squeeze the trailing '1' dimension so it perfectly matches the (B, L, H, W)
-        # shape expected by your PP3DR_loss.py!
         depth_logits = depth_logits.permute(0, 2, 3, 1).squeeze(-1)
 
         confidence_logits = self.proj_conf(fused)
@@ -153,25 +165,10 @@ class DenseHead(nn.Module):
         depth = depth_logits
         depth_conf = confidence_logits
 
-        # FIX 3: Reshape back using chunk_frames instead of num_frames
         depth = depth.view(batch_size, chunk_frames, *depth.shape[1:])
         depth_conf = depth_conf.view(batch_size, chunk_frames, *depth_conf.shape[1:])
 
-        # CHANGE:
-        # if depth.dtype != torch.float32 or depth_conf.dtype != torch.float32:
-        #     raise TypeError(f"DenseHead outputs must be fp32, got depth={depth.dtype}, conf={depth_conf.dtype}")
-        # The main model's forward() will cast everything to float32.
-
         return depth, depth_conf
-
-    # def _apply_pos_embed(self, x: torch.Tensor, width: int, height: int, ratio: float = 0.1) -> torch.Tensor:
-    #     patch_w = x.shape[-1]
-    #     patch_h = x.shape[-2]
-    #     pos_embed = create_uv_grid(patch_w, patch_h, aspect_ratio=width / height, dtype=x.dtype, device=x.device)
-    #     pos_embed = position_grid_to_embed(pos_embed, x.shape[1])
-    #     pos_embed = pos_embed * ratio
-    #     pos_embed = pos_embed.permute(2, 0, 1)[None].expand(x.shape[0], -1, -1, -1)
-    #     return x + pos_embed
 
     def scratch_forward(self, features: list[torch.Tensor]) -> torch.Tensor:
         layer_1, layer_2, layer_3, layer_4 = features

@@ -117,42 +117,6 @@ class PoseHead(nn.Module):
         # x.shape == (B, L, output_dim)
         return x
 
-class PointwiseSwiGLU(nn.Module):
-    """
-    Mathematically identical to a standard Linear SwiGLU, but uses
-    1x1 Convolutions so it can operate directly on (B, C, H, W) spatial maps.
-    """
-    def __init__(self, in_features, hidden_features, out_features):
-        super().__init__()
-        self.gate_proj = nn.Conv2d(in_features, hidden_features, kernel_size=1)
-        self.val_proj = nn.Conv2d(in_features, hidden_features, kernel_size=1)
-        self.out_proj = nn.Conv2d(hidden_features, out_features, kernel_size=1)
-
-    def forward(self, x):
-        gate = self.gate_proj(x)
-        val = self.val_proj(x)
-        hidden = F.silu(gate) * val
-        return self.out_proj(hidden)
-
-class UpscaleBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, upscale_dim):
-        super().__init__()
-        self.upscale_dim = upscale_dim
-        self.initial_proj = PointwiseSwiGLU(in_features=in_channels, hidden_features=in_channels,
-                                            out_features=out_channels)
-        self.residual = nn.ConvTranspose2d(in_channels=in_channels, out_channels=out_channels, kernel_size=upscale_dim,
-                                           stride=upscale_dim)
-        self.residual_ls = LayerScale([out_channels, 1, 1])  # Along the channel dimension
-
-    def forward(self, x):
-        upscaled = F.interpolate(
-            self.initial_proj(x),
-            scale_factor=self.upscale_dim,
-            mode='bilinear',
-            align_corners=False
-        )
-        return upscaled + self.residual_ls(self.residual(x))
-
 class FocalHead(nn.Module):
     def __init__(self, dim=1280, num_registers=5):
         super().__init__()
@@ -175,22 +139,75 @@ class FocalHead(nn.Module):
         f_mult = F.softplus(f_mult)
         return f_mult * max(H, W)
 
+class PointwiseSwiGLU(nn.Module):
+    """
+    Mathematically identical to a standard Linear SwiGLU, but uses
+    1x1 Convolutions so it can operate directly on (B, C, H, W) spatial maps.
+    """
+    def __init__(self, in_features, hidden_features, out_features):
+        super().__init__()
+        self.gate_proj = nn.Conv2d(in_features, hidden_features, kernel_size=1)
+        self.val_proj = nn.Conv2d(in_features, hidden_features, kernel_size=1)
+        self.out_proj = nn.Conv2d(hidden_features, out_features, kernel_size=1)
+
+    def forward(self, x):
+        gate = self.gate_proj(x)
+        val = self.val_proj(x)
+        hidden = F.silu(gate) * val
+        return self.out_proj(hidden)
+
+class UpscaleBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, ffn_ratio, upscale_dim):
+        super().__init__()
+        self.upscale_dim = upscale_dim
+        self.initial_proj = PointwiseSwiGLU(in_features=in_channels, hidden_features=in_channels * ffn_ratio,
+                                            out_features=out_channels)
+        self.residual = nn.ConvTranspose2d(in_channels=in_channels, out_channels=out_channels, kernel_size=upscale_dim,
+                                           stride=upscale_dim)
+
+    def forward(self, x):
+        upscaled = F.interpolate(
+            self.initial_proj(x),
+            scale_factor=self.upscale_dim,
+            mode='bilinear',
+            align_corners=False
+        )
+        return upscaled + self.residual(x)
+
+class ResidualConvUnit(nn.Module):
+    def __init__(self, features: int) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(features, features, kernel_size=3, stride=1, padding=1, bias=True)
+        self.conv2 = nn.Conv2d(features, features, kernel_size=3, stride=1, padding=1, bias=True)
+        self.activation = nn.SiLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.activation(x)
+        out = self.conv1(out)
+        out = self.activation(out)
+        out = self.conv2(out)
+        return out + x
+
 class DepthHead(nn.Module):
     def __init__(self, dim=1280):
         super().__init__()
         self.initial_proj = nn.ModuleList([
-            UpscaleBlock(dim, dim // 64, 8), # 1/2
-            UpscaleBlock(dim, dim // 16, 4), # 1/4
-            UpscaleBlock(dim, dim // 4, 2), # 1/8
+            UpscaleBlock(dim, 256, 1, 8), # 1/2
+            UpscaleBlock(dim, 256, 1, 4), # 1/4
+            UpscaleBlock(dim, 256, 1, 2), # 1/8
             nn.Identity() # 1/16
         ])
         self.fusion_proj = nn.ModuleList([
-            UpscaleBlock(dim, dim // 4, 2), # 1/8
-            UpscaleBlock(dim // 4, dim // 16, 2), # 1/4
-            UpscaleBlock(dim // 16, dim // 64, 2), # 1/2
+            UpscaleBlock(256, 256, 2, 2), # 1/8
+            UpscaleBlock(256, 256, 2, 2), # 1/4
+            UpscaleBlock(256, 256, 2, 2), # 1/2
         ])
-        self.final_upscale = UpscaleBlock(dim // 64, dim // 256, 2) # original dimensions
-        self.final_proj = PointwiseSwiGLU(in_features=dim // 256, hidden_features=dim // 256, out_features=2)
+        self.fusion_resconv = nn.ModuleList([
+            ResidualConvUnit(256),  # Refines the 1/8th scale fusion
+            ResidualConvUnit(256),  # Refines the 1/4th scale fusion
+            ResidualConvUnit(256),  # Refines the 1/2th scale fusion
+        ])
+        self.final_upscale = UpscaleBlock(256, 2, 1, 2) # original dimensions
 
     def forward(self, x, L, original_height, original_width):
         """
@@ -203,14 +220,14 @@ class DepthHead(nn.Module):
         log_depths (B, L, H, W)
         raw_uncertainty (B, L, H, W)
         """
-        # x = [apply_pos_embed(y, original_width, original_height, L) for y in x]
+        x = [apply_pos_embed(y, original_width, original_height, L) for y in x]
         a, b, c, d = [self.initial_proj[i](y) for i, y in enumerate(x)]
-        x = F.silu(c + self.fusion_proj[0](d))
-        x = F.silu(b + self.fusion_proj[1](x))
-        x = F.silu(a + self.fusion_proj[2](x))
-        # x = apply_pos_embed(x, original_width, original_height, L)
-        x = F.silu(self.final_upscale(x)) # (B * L, 2, H, W)
-        return rearrange(self.final_proj(x), "(B L) two H W -> B L two H W", L=L).unbind(2)
+        x = self.fusion_resconv[0](c + self.fusion_proj[0](d))
+        x = self.fusion_resconv[1](b + self.fusion_proj[1](x))
+        x = self.fusion_resconv[2](a + self.fusion_proj[2](x))
+        x = apply_pos_embed(x, original_width, original_height, L)
+        # (B * L, 2, H, W)
+        return rearrange(self.final_upscale(x), "(B L) two H W -> B L two H W", L=L).unbind(2)
 
 class PointHead(nn.Module):
     def __init__(
@@ -251,14 +268,11 @@ class PP3DR(nn.Module):
             decoder_blocks: int = 36,  # Pi3 is 36 decoder blocks.
             ffn_ratio: int = 4,
             num_registers: int = 5,
-            start_checkpointing=12,  # How many blocks EACH not to checkpoint (total # is twice as many).
+            start_checkpointing=11,  # How many blocks EACH not to checkpoint (total # is twice as many).
             freeze_feature_extractor=True,
             point_head_class=PointHead,
             pose_head_class=PoseHead,
-            # First element must be zero, and last element must be equal to blocks_each.
-            chunk_starts: list[int] = [0, 9, 18]
-            # chunk_starts: list[int] = [0, 18]
-
+            output_blocks = [8, 17] # These are block_each indices. The highest block_each index is 17.
     ):
         super().__init__()
         assert decoder_blocks % 2 == 0, f"Number of decoder blocks ({decoder_blocks}) must be even for alternating global and frame-wise attention"
@@ -268,7 +282,7 @@ class PP3DR(nn.Module):
         # To keep VRAM around 99% with the same batch size as freeze_feature_extractor=True, we're going to checkpoint
         # *none* of the ViTTT blocks and 6 of the PP3DR blocks.
         # Keep in mind that this varies wildly with the specific architecture we're using, so you should check each time.
-        self.start_checkpointing = start_checkpointing if freeze_feature_extractor else 5
+        self.start_checkpointing = start_checkpointing if freeze_feature_extractor else 6
 
         # Drop rates
         if freeze_feature_extractor:
@@ -296,17 +310,15 @@ class PP3DR(nn.Module):
         self.rope3d = Rope3D(embed_dim=dim, num_heads=num_heads, device="cuda")
 
         self.ViTTT = ViTTT(dim, num_heads, encoder_blocks, ffn_ratio, drop_rates=ViTTT_drop_rates)
-        state_dict = torch.load("/vulcanscratch/hughma/ViT/best_checkpoint.pth", weights_only=True, map_location="cpu")
-        missing, unexpected = self.ViTTT.load_state_dict(state_dict, strict=False)
-        if len(missing) > 0 or len(unexpected) > 0:
-            print('\033[93m' + "Warning: When loading ViTTT weights:" + '\033[0m')
-            print(f"  -> Missing keys (New Layers initialized from scratch): {missing}")
-            print(f"  -> Unexpected keys (Old Layers discarded): {unexpected}")
+        # DEBUG: Retrain the feature extractor from scratch.
+        # self.ViTTT.load_state_dict(torch.load("/vulcanscratch/hughma/ViT/best_checkpoint.pth",
+        #                                       weights_only=True,
+        #                                       map_location="cpu"))
         self.freeze_feature_extractor = freeze_feature_extractor
-        if self.freeze_feature_extractor:
-            for parameter in self.ViTTT.parameters():
-                parameter.requires_grad = False
-            self.ViTTT.eval()
+        # if self.freeze_feature_extractor:
+        #     for parameter in self.ViTTT.parameters():
+        #         parameter.requires_grad = False
+        #     self.ViTTT.eval()
         # ViTTT puts in the registers for me.
         self.num_registers = num_registers
 
@@ -319,13 +331,7 @@ class PP3DR(nn.Module):
         """
         self.pose_head = pose_head_class()
 
-        self.chunk_starts = chunk_starts
-        # The weights start off as a uniform average.
-        self.block_weights = torch.zeros(self.blocks_each)
-        self.block_weights[8] = self.block_weights[17] = 1
-        # self.block_weights[17] = 1
-        self.block_weights = nn.Parameter(self.block_weights)
-        self.block_weights.requires_grad = False # COMMENT FOR FINETUNE
+        self.output_blocks = output_blocks
 
     def train(self, mode=True):
         super().train(mode)
@@ -347,8 +353,6 @@ class PP3DR(nn.Module):
         images: (batch size, RGB, height, width)
         rope_x: The 2D x-coordinates to be fed into RoPE (B, L, HW)
         rope_y: The 2D y-coordinates to be fed into RoPE; same shape as above.
-        original_height: The original (non-resized, non-padded) image heights (B,)
-        original_width: The original (non-resized, non-padded) image widths (B,)
 
         Returns
         -------
@@ -376,7 +380,6 @@ class PP3DR(nn.Module):
         rope2d has shape (B * L, HW, head_dim), and rope3d has shape (B, L, HW, head_dim).
         """
         rope2d, rope3d = self.rope2d(rope_x, rope_y), self.rope3d(rope_x, rope_y)
-        accumulator = None
         for i in range(self.blocks_each):
             if self.training and i >= self.start_checkpointing:
                 # Global attention: absorb frame-length into patch-length dimension.
@@ -386,15 +389,8 @@ class PP3DR(nn.Module):
             else:
                 x = self.global_blocks[i](x, rope3d, L)
                 x = self.local_blocks[i](x, rope2d, L)
-
-            y = x * self.block_weights[i]
-            if i in self.chunk_starts:
-                if accumulator is not None:
-                    outputs.append(accumulator)
-                accumulator = y
-            else:
-                accumulator = accumulator + y
-        outputs.append(accumulator)
+            if i in self.output_blocks:
+                outputs.append(x)
         # x.shape == (B * L, num_registers + HW // 256, 2 * dim)
 
         # Step 2: Per-task decoders

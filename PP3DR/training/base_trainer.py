@@ -273,7 +273,7 @@ class BaseTrainer:
                          model: nn.Module,
                          decoder_blocks: int,
                          freeze_feature_extractor: bool,
-                         adamw_lr: float = 1e-5, # 1e-4
+                         adamw_lr: float = 1e-4, # 1e-4
                          weight_decay: float = 0.04,
                          layer_decay: float = 0.95,
                          ):

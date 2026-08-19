@@ -50,14 +50,14 @@ class ViTTT(nn.Module):
             self,
             dim: int = 1280,
             num_heads: int = 20,
-            blocks: int = 12,
-            ffn_ratio: int = 4,
-            num_registers: int = 5,
-            start_checkpointing: int = 12,
-            drop_rates: bool | None = None,
-            # First element must be zero, and last element must be equal to blocks.
-            chunk_starts: list[int] = [0, 6, 12]
-            # chunk_starts: list[int] = [0, 4, 8, 12] # output_blocks = [1, 4, 11]
+            blocks = 12, # DINOv3 H+ has 32 layers.
+            ffn_ratio = 4,
+            num_registers = 5,
+            start_checkpointing = 12,
+            drop_rates = None,
+            # output_blocks=[2, 3, 10, 11]
+            output_blocks = [2, 11]
+
     ):
         super().__init__()
         self.dim = dim
@@ -75,14 +75,7 @@ class ViTTT(nn.Module):
         self.class_and_registers = nn.Parameter(torch.randn(num_registers, dim) * 0.02)
         self.final_layer_norm = nn.LayerNorm(dim)
         self.start_checkpointing = start_checkpointing
-
-        self.chunk_starts = chunk_starts
-        # The weights start off as a uniform average.
-        self.block_weights = torch.zeros(blocks)
-        self.block_weights[2] = self.block_weights[11] = 1
-        # self.block_weights[1] = self.block_weights[4] = self.block_weights[11] = 1
-        self.block_weights = nn.Parameter(self.block_weights)
-        self.block_weights.requires_grad = False # COMMENT FOR FINETUNE
+        self.output_blocks = output_blocks
 
     def patch_embed(self, x):
         # B, 3, H, W -> B, dim, H // 16, W // 16 -> B, HW // 256, dim
@@ -105,21 +98,13 @@ class ViTTT(nn.Module):
         rope = self.rope(H // 16, W // 16)
         repeated_class_and_registers = self.class_and_registers.unsqueeze(0).repeat(B, 1, 1)
         x = torch.cat((repeated_class_and_registers, x), dim = 1)
-
-        outputs, accumulator = [], None
+        outputs = []
         for i, block in enumerate(self.blocks):
             if self.training and i >= self.start_checkpointing:
                 x = checkpoint(block, x, rope, use_reentrant = False)
             else:
                 x = block(x, rope)
-
-            y = x * self.block_weights[i]
-            if i in self.chunk_starts:
-                if accumulator is not None:
-                    outputs.append(accumulator)
-                accumulator = y
-            else:
-                accumulator = accumulator + y
-        outputs.append(accumulator)
+            if i in self.output_blocks:
+                outputs.append(x)
 
         return self.final_layer_norm(x), outputs

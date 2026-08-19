@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=pos-finetune
+#SBATCH --job-name=2-11_8-17_resconv_pos-embed
 #SBATCH --output=%x-%j.out
 #SBATCH --partition=vulcan-ampere
 #SBATCH --ntasks 1
-#SBATCH --cpus-per-task=64
+#SBATCH --cpus-per-task=48
 #SBATCH --mem=512gb
-#SBATCH --gres=gpu:h200-sxm:4
+#SBATCH --gres=gpu:h200-sxm:3
 #SBATCH --account=vulcan-jbhuang
 #SBATCH --qos=vulcan-high-h200
 #SBATCH --time=36:00:00
