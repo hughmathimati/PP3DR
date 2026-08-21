@@ -55,8 +55,7 @@ class ViTTT(nn.Module):
             num_registers = 5,
             start_checkpointing = 12,
             drop_rates = None,
-            # output_blocks=[2, 3, 10, 11]
-            output_blocks = [2, 11]
+            output_blocks = [5, 23]
 
     ):
         super().__init__()

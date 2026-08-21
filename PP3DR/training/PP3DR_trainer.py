@@ -7,8 +7,7 @@ if __name__ == "__main__":
     BaseTrainer(
         PP3DR,
         PP3DR_loss,
-        name="2-11_8-17_resconv_pos-embed",
+        name="5-23_11-23_dim-1024_100-epochs",
         # pretrained_path="/vulcanscratch/hughma/PP3DR/2-11_8-17_pos-embed/PP3DR.pth",
-        # strict=False,
-        freeze_feature_extractor=False,
+        # checkpoint=""
     )

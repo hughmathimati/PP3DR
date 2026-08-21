@@ -43,7 +43,7 @@ def depth_edge(depth: torch.Tensor, rtol: float = 0.03) -> torch.Tensor:
 
 @torch.compile()
 class PP3DR_loss(nn.Module):
-    def __init__(self, scale=False, median_depth=10):
+    def __init__(self, scale=False, median_depth=1):
         super().__init__()
         self.scale = scale
         self.median_depth = median_depth

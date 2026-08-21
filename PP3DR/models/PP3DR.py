@@ -85,7 +85,7 @@ class PoseHead(nn.Module):
 
     def __init__(
             self,
-            dim=1280,
+            dim,
             num_registers=5,
             output_dim=9,  # (x, y, z) + 6D continuous rotation representation. This is per-frame.
     ):
@@ -118,7 +118,7 @@ class PoseHead(nn.Module):
         return x
 
 class FocalHead(nn.Module):
-    def __init__(self, dim=1280, num_registers=5):
+    def __init__(self, dim, num_registers=5):
         super().__init__()
         self.layer_norm = nn.LayerNorm(dim)
         self.focal_proj = nn.Linear(num_registers * dim, 1)
@@ -137,6 +137,7 @@ class FocalHead(nn.Module):
         f_mult = self.focal_proj(registers.flatten(start_dim=-2)) # (B * L, 1)
         f_mult = rearrange(f_mult.squeeze(-1), "(B L) -> B L", L=L).mean(dim=-1) # (B,)
         f_mult = F.softplus(f_mult)
+        # H and W are the padded + resized dimensions. The
         return f_mult * max(H, W)
 
 class PointwiseSwiGLU(nn.Module):
@@ -156,24 +157,6 @@ class PointwiseSwiGLU(nn.Module):
         hidden = F.silu(gate) * val
         return self.out_proj(hidden)
 
-class UpscaleBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, upscale_dim, ffn_ratio=1):
-        super().__init__()
-        self.upscale_dim = upscale_dim
-        self.initial_proj = PointwiseSwiGLU(in_features=in_channels, hidden_features=in_channels * ffn_ratio,
-                                            out_features=out_channels)
-        self.residual = nn.ConvTranspose2d(in_channels=in_channels, out_channels=out_channels, kernel_size=upscale_dim,
-                                           stride=upscale_dim)
-
-    def forward(self, x):
-        upscaled = F.interpolate(
-            self.initial_proj(x),
-            scale_factor=self.upscale_dim,
-            mode='bilinear',
-            align_corners=False
-        )
-        return upscaled + self.residual(x)
-
 class ResidualConvUnit(nn.Module):
     def __init__(self, features: int) -> None:
         super().__init__()
@@ -188,26 +171,55 @@ class ResidualConvUnit(nn.Module):
         out = self.conv2(out)
         return out + x
 
+class UpscaleBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, upscale_dim, proj_type, ffn_ratio=None):
+        super().__init__()
+        self.upscale_dim = upscale_dim
+        self.residual = nn.ConvTranspose2d(
+            in_channels=in_channels, out_channels=out_channels, kernel_size=upscale_dim, stride=upscale_dim
+        )
+        if proj_type == "swiglu":
+            if ffn_ratio is None:
+                raise ValueError(f"ffn_ratio cannot be None when proj_type is 'swiglu'.")
+            self.initial_proj = PointwiseSwiGLU(
+                in_features=in_channels, hidden_features=in_channels * ffn_ratio, out_features=out_channels
+            )
+        elif proj_type == "linear_silu":
+            self.initial_proj = nn.Sequential( nn.Conv2d(in_channels, out_channels, kernel_size=1), nn.SiLU() )
+        elif proj_type == "pure_linear":
+            self.initial_proj = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        else:
+            raise ValueError(f"Unknown proj_type: {proj_type}")
+
+    def forward(self, x):
+        upscaled = F.interpolate(
+            self.initial_proj(x),
+            scale_factor=self.upscale_dim,
+            mode='bilinear',
+            align_corners=False
+        )
+        return upscaled + self.residual(x)
+
 class DepthHead(nn.Module):
-    def __init__(self, dim=1280):
+    def __init__(self, dim):
         super().__init__()
         self.initial_proj = nn.ModuleList([
-            UpscaleBlock(dim, 64, 8), # 1/2
-            UpscaleBlock(dim, 128, 4), # 1/4
-            UpscaleBlock(dim, 256, 2), # 1/8
-            nn.Identity()
+            UpscaleBlock(dim, 128, 8, proj_type="linear_silu"), # 1/2
+            UpscaleBlock(dim, 256, 4, proj_type="linear_silu"), # 1/4
+            UpscaleBlock(dim, 256, 2, proj_type="linear_silu"), # 1/8
+            nn.Sequential( nn.Conv2d(dim, 256, kernel_size=1), nn.SiLU() )
         ])
         self.fusion_proj = nn.ModuleList([
-            UpscaleBlock(dim, 256, 2), # 1/8
-            UpscaleBlock(256, 128, 2), # 1/4
-            UpscaleBlock(128, 64, 2), # 1/2
+            UpscaleBlock(256, 256, 2, proj_type="swiglu", ffn_ratio=2), # 1/8
+            UpscaleBlock(256, 256, 2, proj_type="swiglu", ffn_ratio=2), # 1/4
+            UpscaleBlock(256, 128, 2, proj_type="swiglu", ffn_ratio=1), # 1/2
         ])
         self.fusion_resconv = nn.ModuleList([
             ResidualConvUnit(256),  # Refines the 1/8th scale fusion
-            ResidualConvUnit(128),  # Refines the 1/4th scale fusion
-            ResidualConvUnit(64),  # Refines the 1/2th scale fusion
+            ResidualConvUnit(256),  # Refines the 1/4th scale fusion
+            ResidualConvUnit(128),  # Refines the 1/2th scale fusion
         ])
-        self.final_upscale = UpscaleBlock(64, 2, 2) # original dimensions
+        self.final_upscale = UpscaleBlock(128, 2, 2, proj_type="pure_linear") # original dimensions
 
     def forward(self, x, L, original_height, original_width):
         """
@@ -232,16 +244,16 @@ class DepthHead(nn.Module):
 class PointHead(nn.Module):
     def __init__(
             self,
-            dim=1280,
+            dim,
             num_registers=5,
     ):
         super().__init__()
         self.dim = dim
         self.num_registers = num_registers
-        self.focal_head = FocalHead()
+        self.focal_head = FocalHead(dim)
         # These LayerNorms are for the depth head only. The FocalHead has its own layer norm.
         self.token_layer_norms = nn.ModuleList([nn.LayerNorm(dim) for _ in range(4)])
-        self.depth_head = DepthHead()
+        self.depth_head = DepthHead(dim)
 
     def forward(
             self, x, outputs: torch.Tensor, L, H, W, original_height, original_width
@@ -262,36 +274,33 @@ class PointHead(nn.Module):
 class PP3DR(nn.Module):
     def __init__(
             self,
-            dim: int = 1280,
-            num_heads: int = 20,
-            encoder_blocks: int = 12,  # Pi3 is 36 ViT blocks
-            decoder_blocks: int = 36,  # Pi3 is 36 decoder blocks.
+            dim: int = 1024,
+            num_heads: int = 16,
+            # These are the same number of blocks VGGT-Omega uses.
+            encoder_blocks: int = 24,
+            decoder_blocks: int = 48,
             ffn_ratio: int = 4,
             num_registers: int = 5,
-            start_checkpointing=11,  # How many blocks EACH not to checkpoint (total # is twice as many).
-            freeze_feature_extractor=True,
+            # How many blocks EACH not to checkpoint (total # is twice as many).
+            start_checkpointing=14, # 96% VRAM usage. 15 leads to OOM.
             point_head_class=PointHead,
             pose_head_class=PoseHead,
-            output_blocks = [8, 17] # These are block_each indices. The highest block_each index is 17.
+            output_blocks = [11, 23] # These are block_each indices. The highest block_each index is 17.
     ):
         super().__init__()
-        assert decoder_blocks % 2 == 0, f"Number of decoder blocks ({decoder_blocks}) must be even for alternating global and frame-wise attention"
+        assert decoder_blocks % 2 == 0,\
+            f"Number of decoder blocks ({decoder_blocks}) must be even for alternating global and frame-wise attention."
+        assert dim % num_heads == 0, f"dim {dim} must be divisible by num_heads {num_heads}."
+
+        self.encoder_blocks = encoder_blocks
         self.decoder_blocks = decoder_blocks
         self.blocks_each = decoder_blocks // 2
-        # If we're unfreezing ViTTT, we still want to maximise VRAM usage.
-        # To keep VRAM around 99% with the same batch size as freeze_feature_extractor=True, we're going to checkpoint
-        # *none* of the ViTTT blocks and 6 of the PP3DR blocks.
-        # Keep in mind that this varies wildly with the specific architecture we're using, so you should check each time.
-        self.start_checkpointing = start_checkpointing if freeze_feature_extractor else 6
+        self.start_checkpointing = start_checkpointing
 
         # Drop rates
-        if freeze_feature_extractor:
-            ViTTT_drop_rates = None
-            PP3DR_drop_rates = torch.linspace(0, 0.1, decoder_blocks)
-        else:
-            rates = torch.linspace(0, 0.1, encoder_blocks + decoder_blocks)
-            ViTTT_drop_rates = rates[:encoder_blocks]
-            PP3DR_drop_rates = rates[encoder_blocks:]
+        rates = torch.linspace(0, 0.1, encoder_blocks + decoder_blocks)
+        ViTTT_drop_rates = rates[:encoder_blocks]
+        PP3DR_drop_rates = rates[encoder_blocks:]
 
         # General decoder
         self.dim = dim
@@ -309,38 +318,22 @@ class PP3DR(nn.Module):
         self.rope2d = Rope2D(embed_dim=dim, num_heads=num_heads, device="cuda")
         self.rope3d = Rope3D(embed_dim=dim, num_heads=num_heads, device="cuda")
 
-        self.ViTTT = ViTTT(dim, num_heads, encoder_blocks, ffn_ratio, drop_rates=ViTTT_drop_rates)
-        # DEBUG: Retrain the feature extractor from scratch.
-        # self.ViTTT.load_state_dict(torch.load("/vulcanscratch/hughma/ViT/best_checkpoint.pth",
-        #                                       weights_only=True,
-        #                                       map_location="cpu"))
-        self.freeze_feature_extractor = freeze_feature_extractor
-        # if self.freeze_feature_extractor:
-        #     for parameter in self.ViTTT.parameters():
-        #         parameter.requires_grad = False
-        #     self.ViTTT.eval()
-        # ViTTT puts in the registers for me.
+        # Don't checkpoint the ViTTT blocks. Checkpointing the PP3DR blocks saves more time.
+        self.ViTTT = ViTTT(
+            dim, num_heads, encoder_blocks, ffn_ratio, drop_rates=ViTTT_drop_rates, start_checkpointing=0
+        )
         self.num_registers = num_registers
 
         # Per-task decoders
-        self.point_head = point_head_class()
+        self.point_head = point_head_class(dim=dim)
         """
         The camera decoder will predict the relative SE3 transformation to the next frame.
         We are parameterizing our camera with three scalars for the translation and six scalars for the rotation.
         Details of how the rotation prediction works are in the forward() method.
         """
-        self.pose_head = pose_head_class()
+        self.pose_head = pose_head_class(dim=dim)
 
         self.output_blocks = output_blocks
-
-    def train(self, mode=True):
-        super().train(mode)
-        if self.freeze_feature_extractor:
-            self.ViTTT.eval()
-        return self
-
-    def ViT(self, image):
-        return self.ViTTT(image)
 
     def forward(self, x: torch.Tensor, rope_x, rope_y, original_height, original_width) -> dict:
         """
@@ -368,7 +361,7 @@ class PP3DR(nn.Module):
 
         # Step 1: ViT
         # ViT is frame-wise. We need to collapse the batch dimension into the sequence dimension before passing it into Dino.
-        x, outputs = self.ViT(x.flatten(0, 1))
+        x, outputs = self.ViTTT(x.flatten(0, 1))
         # x.shape == (B * L, num_registers + HW // 256, dim)
 
         """

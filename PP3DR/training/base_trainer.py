@@ -81,11 +81,10 @@ class BaseTrainer:
                  model,
                  loss,
                  name="checkpoints",
-                 epochs=30,
-                 checkpoint_every=16,
+                 epochs=100,
+                 checkpoint_every=26,
                  pretrained_path=None,
                  strict=True,
-                 freeze_feature_extractor=True,
                  ema = False,
                  batch_size=4,
                  gradient_accumulation_steps=8,
@@ -137,7 +136,6 @@ class BaseTrainer:
                 model,
                 pretrained_path,
                 strict,
-                freeze_feature_extractor,
             )
             self.metric = loss(scale=False)
             train_dataloader, val_dataloader = a.result()
@@ -221,16 +219,12 @@ class BaseTrainer:
 
         return train_dataloader, val_dataloader
 
-    def initialize(self, model, pretrained_path, strict, freeze_feature_extractor):
+    def initialize(self, model, pretrained_path, strict):
         # Drop rates get handled inside the model itself.
-        train_model = model(freeze_feature_extractor=freeze_feature_extractor)
+        train_model = model()
 
         # 1. Initialize ONLY the new LaCT blocks and Decoder Heads!
         for name, module in train_model.named_modules():
-            # Explicitly protect the backbone from randomization!
-            if "ViTTT" in name or "ViT" in name:
-                continue
-
             if isinstance(module, nn.Linear):
                 # Truncated normal tightly bounds the initial weights
                 nn.init.trunc_normal_(module.weight, std=0.02)
@@ -263,16 +257,16 @@ class BaseTrainer:
 
         AdamW_params = self.get_param_groups(
             train_model,
+            encoder_blocks=train_model.encoder_blocks,
             decoder_blocks=train_model.decoder_blocks,
-            freeze_feature_extractor=freeze_feature_extractor,
         )
         AdamW = torch.optim.AdamW(AdamW_params, betas=(0.9, 0.99), foreach=True)
         return train_model, AdamW
 
     def get_param_groups(self,
                          model: nn.Module,
+                         encoder_blocks: int,
                          decoder_blocks: int,
-                         freeze_feature_extractor: bool,
                          adamw_lr: float = 1e-4, # 1e-4
                          weight_decay: float = 0.04,
                          layer_decay: float = 0.95,
@@ -309,21 +303,19 @@ class BaseTrainer:
             Thus, the "true" index of a global block is 2 * i, and the "true" index of a local block is 2 * i + 1.
             """
             # Hardcoded value representing the # of blocks in the feature extractor.
-            encoder_offset = 0 if freeze_feature_extractor else 12
-            num_layers = decoder_blocks + encoder_offset
-            offset = encoder_offset
+            num_layers = encoder_blocks + decoder_blocks
             if "blocks" in name:
                 layer_id = int(name.split("blocks.")[1].split(".")[0])
                 if "global_blocks." in name:
-                    lr_mult = layer_decay ** (num_layers - (2 * layer_id + offset))
+                    lr_mult = layer_decay ** (num_layers - (2 * layer_id + encoder_blocks))
                 elif "local_blocks." in name:
-                    lr_mult = layer_decay ** (num_layers - (2 * layer_id + 1 + offset))
+                    lr_mult = layer_decay ** (num_layers - (2 * layer_id + 1 + encoder_blocks))
                 else:
                     lr_mult = layer_decay ** (num_layers - layer_id)
             elif any(k in name for k in ["patch_conv", "class_and_registers","block_weights"]):
                 lr_mult = layer_decay ** (num_layers + 1)
             elif "final_layer_norm" in name: # ViTTT blocks only
-                lr_mult = layer_decay ** (num_layers - encoder_offset)  # It comes after all the ViTTT blocks.
+                lr_mult = layer_decay ** (num_layers - encoder_blocks)  # It comes after all the ViTTT blocks.
             else:
                 # This comprises the final projections/LayerNorms in the per-task decoder heads.
                 # Recall that RoPE does not have trainable parameters.
