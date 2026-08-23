@@ -188,25 +188,31 @@ if __name__ == "__main__":
 
     model = PP3DR()
     dataset = nrgbd_dataset()
-    remove_front = False
     # I want to see which parameters are left over after loading this.
-    loaded_state_dict = torch.load("/vulcanscratch/hughma/PP3DR/new_design_datasets/PP3DR.pth", weights_only=True)
-    if remove_front:
-        # The lines here are necessary if all the loaded state dict entries begin with an extra "module."
-        new_state_dict = {}
-        for key in loaded_state_dict:
-            new_state_dict[key[7:]] = loaded_state_dict[key]
-        model.load_state_dict(new_state_dict)
-    else:
-        model.load_state_dict(loaded_state_dict)
+    loaded_state_dict = torch.load("/vulcanscratch/hughma/PP3DR/5-23_11-23_dim-1024_100-more-epochs/PP3DR.pth", weights_only=True, map_location="cpu")
+
+    # 2. Fix the DDP "module." prefix trap!
+    clean_state_dict = {}
+    for k, v in loaded_state_dict.items():
+        if k.startswith("module."):
+            clean_state_dict[k[7:]] = v
+        else:
+            clean_state_dict[k] = v
+
+    # 3. Load the fine-tuned weights ON TOP of the initialization.
+    model.load_state_dict(clean_state_dict)
     print("post load")
     model = model.eval().to("cuda")
 
-    data = dataset[0]
+    data = dataset[0] # 8
+    print("post dataset")
     for key in data:
-        data[key] = data[key].unsqueeze(0)
-    with torch.amp.autocast("cuda", dtype=torch.bfloat16), torch.no_grad():
-        pred = model(data['images'].to("cuda"), data['rope_x'].to("cuda"), data['rope_y'].to("cuda"))
+        try:
+            data[key] = data[key].unsqueeze(0)
+        except:
+            data[key] = torch.tensor([data[key]])
+    with torch.amp.autocast("cuda", dtype = torch.bfloat16), torch.no_grad():
+        pred = model(data['images'].to("cuda"), data['rope_x'].to("cuda"), data['rope_y'].to("cuda"), data['original_height'].to('cuda'), data['original_width'].to('cuda'))
     print("post pred")
 
     # You can scale the translations and depths if the dataset (like RTMV) is physically tiny

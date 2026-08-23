@@ -7,31 +7,43 @@
 - ### images:
   - Visualisations of features produced by DINOv3 and ViTTT, for two test images (cat + Sintel)
 - ### models:
-  - **BidirectionalLaCT.py**: Variant 1 Bidirectional LaCT (update last layer only) from https://github.com/JunchenLiu77/ViTTT/tree/main
-  - **Dinov3.py**: Utilities for working with DINOv3 from HuggingFace
-  - **ViTTT**: TTT feature extractor
-  - **pos_embed**: 2D RoPE embedding class (taken from DINOv3)
-- **Remaining three scripts are:**
-- The train script used for the 24-block variant
-- The train script used for the 12-block variant (which actually outperformed the 24-block variant in both train *and* val loss)
-- The script used for extracting partial losses and model weights from a training checkpoint
+  - `BidirectionalLaCT.py`: Variant 1 Bidirectional LaCT (update last layer only) from https://github.com/JunchenLiu77/ViTTT/tree/main
+  - `Dinov3.py`: Utilities for working with DINOv3 from HuggingFace
+  - `ViTTT.py`: TTT feature extractor
+  - `pos_embed.py`: 2D RoPE embedding class (taken from DINOv3)
+- `Remaining three scripts are:`
+- The train script used for the 24-block variant (`ViTTT_distill_more_datasets.py`)
+- The train script used for the 12-block variant (which actually outperformed the 24-block variant in both train *and* val loss) (`ViTTT_distill_12_blocks.py`)
+- The train script used fo finetuning the 12-block variant (`ViTTT_distill_12_blocks_finetune.py`)
+- The script used for extracting partial losses and model weights from a training checkpoint (`loss_extractor.py`)
 
 ## PP3DR (name subject to change):
 - ### datasets
-  - **dataset_base.py**: The (virtual/abstract) base dataset class, which includes basic init and helper functions and handles `__getitem__()`
-  - **sintel_io.py**: Provided by the Sintel dataset to aid in processing their files
+  - #### dynamic_replica
+    - Contains the train, validation, and test datasets.
+  - #### flying_things_3d
+    - Contains the train and test datasets.
+  - #### rtmv
+    - Contains the train and test datasets.
+  - #### sintel
+    - Contains the dataset, along with `sintel_io.py`, consisting of helper functions provided by the creators to aid in processing their files
+  - `dataset_base.py`: The (virtual/abstract) base dataset class, which includes basic init and helper functions and handles `__getitem__()`
   - The rest of the files are datasets implemented for their respective file structures.
-- **models**:
-  - **BidirectionalLaCT.py**: Same as above, plus custom global/local LaCT blocks
-  - **Dinov3.py**: Same as above
-  - **ViTTT**: Same as above
-  - **pos_embed**: Same as above, plus custom 2D and 3D RoPE implementations
-  - **PP3DR.py**: End-to-end TTT for dynamic 3D reconstruction
-  - **PP3DR_Dino.py**: Baseline using DINOv3 rather than TTT for feature extraction
-  - **PP3DR_depth_focal.py**: Variant which predicts intrinsics instead of XY rays
-- **PP3DR_trainer.py**: Self-explanatory.
-- **PP3DR_loss.py**: Self-explanatory.
-- **PP3DR_finetune.py**: Train script for fine-tuning PP3DR, which involves longer sequences and unfreezes the underlying ViTTT.
-- **PP3DR_depth_focal_loss.py**: Adapted loss for the depth-focal variant of the model.
-- **visualise.py**: Script for Viser visualisation of model predictions
-- **visualise_gt.py**: Script for Viser visualisation of GT dataset scenes.
+- ### models:
+  - `BidirectionalLaCT.py`: Same as above, plus custom global/local LaCT blocks
+  - `ViTTT`: Same as above
+  - `pos_embed`: Same as above, plus custom 2D and 3D RoPE implementations
+  - `PP3DR.py`: End-to-end TTT for dynamic 3D reconstruction
+  - `PP3DR_pretrained_depth.py`: PP3DR, using VGGT-Omega's depth head (the name is because I previously tried training with VGGT-Omega's pretrained head weights, which gave terrible results)
+  - `vggt_omega_depth_head.py`: The code for VGGT-Omega's depth head
+  - `utils.py`: Helper functions used in VGGT-Omega's depth head. I added a custom one which was previously left inside the DenseHead class. This custom helper function is also used in my own depth head.
+- ### training:
+  - `base_trainer.py`: Base PP3DR trainer, which contains essentially all the code you need (that's why `PP3DR_trainer.py` is so short)
+  - `PP3DR_trainer.py`: Self-explanatory.
+  - `PP3DR_sanity.py`: Sanity-check train script (NRGBD only, no validation)
+  - `PP3DR_loss.py`: Self-explanatory. L1 depth-weighted point loss, L1 depth loss, L1 depth gradient-matching loss, L1 normal loss on the angle, L1 pose translation loss, Cosine Similarity pose rotation loss.
+- ### visualise:
+  - `visualise.py`: Script for Viser visualisation of model predictions
+  - `visualise_gt.py`: Script for Viser visualisation of GT dataset scenes
+  - `notebook.ipynb`: Jupyter notebook for visualising GT depth, predicted depth, and predicted aleatoric uncertainty
+  - `jupyter.sh`: Script you can run with `sbatch` to launch a Jupyter server on a GPU node.

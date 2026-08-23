@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=5-23_11-23_dim-1024_100-epochs
+#SBATCH --job-name=bigger-part-3
 #SBATCH --output=%x-%j.out
 #SBATCH --partition=vulcan-ampere
 #SBATCH --ntasks 1
