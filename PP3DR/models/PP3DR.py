@@ -232,8 +232,13 @@ class DepthHead(nn.Module):
         log_depths (B, L, H, W)
         raw_uncertainty (B, L, H, W)
         """
-        x = [apply_pos_embed(y, original_width, original_height, L) for y in x]
-        a, b, c, d = [self.initial_proj[i](y) for i, y in enumerate(x)]
+        # x = [apply_pos_embed(y, original_width, original_height, L) for y in x]
+        # a, b, c, d = [self.initial_proj[i](y) for i, y in enumerate(x)]
+
+        # Trying out positional embedding post-dim-proj
+        projected = [self.initial_proj[i](y) for i, y in enumerate(x)]
+        a, b, c, d = [apply_pos_embed(y, original_width, original_height, L) for y in projected]
+
         x = self.fusion_resconv[0](c + self.fusion_proj[0](d))
         x = self.fusion_resconv[1](b + self.fusion_proj[1](x))
         x = self.fusion_resconv[2](a + self.fusion_proj[2](x))
@@ -276,16 +281,17 @@ class PP3DR(nn.Module):
             self,
             dim: int = 1024,
             num_heads: int = 16,
-            # These are the same number of blocks VGGT-Omega uses.
-            encoder_blocks: int = 24,
-            decoder_blocks: int = 48,
+            # VGGT-Omega uses 24 encoder blocks and 48 decoder blocks.
+            encoder_blocks: int = 16,
+            decoder_blocks: int = 36,
             ffn_ratio: int = 4,
             num_registers: int = 5,
             # How many blocks EACH not to checkpoint (total # is twice as many).
-            start_checkpointing=14, # 96% VRAM usage. 15 leads to OOM.
+            start_checkpointing=16,
             point_head_class=PointHead,
             pose_head_class=PoseHead,
-            output_blocks = [11, 23] # These are block_each indices. The highest block_each index is 17.
+            # These are block_each indices.
+            output_blocks = None
     ):
         super().__init__()
         assert decoder_blocks % 2 == 0,\
@@ -320,7 +326,15 @@ class PP3DR(nn.Module):
 
         # Don't checkpoint the ViTTT blocks. Checkpointing the PP3DR blocks saves more time.
         self.ViTTT = ViTTT(
-            dim, num_heads, encoder_blocks, ffn_ratio, drop_rates=ViTTT_drop_rates, start_checkpointing=0
+            dim,
+            num_heads,
+            encoder_blocks,
+            ffn_ratio,
+            drop_rates=ViTTT_drop_rates,
+            start_checkpointing=0,
+            final_layer_norm = False,
+            # For 16 blocks, this is [3, 15].
+            output_blocks = [encoder_blocks // 4 - 1, encoder_blocks - 1]
         )
         self.num_registers = num_registers
 
@@ -333,7 +347,8 @@ class PP3DR(nn.Module):
         """
         self.pose_head = pose_head_class(dim=dim)
 
-        self.output_blocks = output_blocks
+        # For 18 blocks each (36 blocks total), this is [8, 17].
+        self.output_blocks = [self.blocks_each // 2 - 1, self.blocks_each - 1] if output_blocks is None else output_blocks
 
     def forward(self, x: torch.Tensor, rope_x, rope_y, original_height, original_width) -> dict:
         """

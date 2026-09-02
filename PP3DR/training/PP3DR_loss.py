@@ -8,6 +8,38 @@ from einops import rearrange
 from typing import Callable
 import math
 
+class HughberLoss(nn.Module):
+    def __init__(self, beta = 1e-2):
+        super().__init__()
+        self.beta = beta
+
+    def _forward2(self, x, gt):
+        """
+        NOTE: Performs reduction='none'.
+        """
+        return F.smooth_l1_loss(x, gt, reduction="none", beta=self.beta) + F.mse_loss(x, gt, reduction="none")
+
+    def _forward1(self, error):
+        """
+        NOTE: Performs reduction='none'.
+        Expects a single ABSOLUTE `error` tensor (e.g., predictions - gt).
+        """
+
+        # Calculates the exact formula from your screenshot seamlessly
+        square = torch.square(error)
+        loss = torch.where(
+            error < self.beta,
+            0.5 * square / self.beta,
+            error - 0.5 * self.beta
+        ) + square
+
+        return loss
+
+    def forward(self, *args):
+        if len(args) == 1:
+            return self._forward1(*args)
+        else:
+            return self._forward2(*args)
 
 def _smooth(err: torch.Tensor, beta: float = 0.0) -> torch.Tensor:
     if beta == 0:
@@ -43,10 +75,11 @@ def depth_edge(depth: torch.Tensor, rtol: float = 0.03) -> torch.Tensor:
 
 @torch.compile()
 class PP3DR_loss(nn.Module):
-    def __init__(self, scale=False, median_depth=1):
+    def __init__(self, scale=False, median_depth=10):
         super().__init__()
         self.scale = scale
         self.median_depth = median_depth
+        self.hughber_loss = HughberLoss()
 
     def calculate_scale(self, pred_pts, gt_pts, weights):
         pred = pred_pts.detach().flatten(1, -2)
@@ -130,7 +163,6 @@ class PP3DR_loss(nn.Module):
             f"{median_depths.isnan().sum()} batch's gt depths are completely invalid."
         )
         gt['depths'] = self.median_depth * gt['depths'] / median_depths.view(B, 1, 1, 1)
-
         gt['depths'] = gt['depths'].masked_fill(gt_invalid_depth_mask, self.median_depth)
 
         weights = 2 * self.median_depth / (self.median_depth + gt['depths'])
@@ -144,34 +176,36 @@ class PP3DR_loss(nn.Module):
 
         return pred_points, gt_points, scale, weights, median_depths, gt_valid_depth_mask
 
-    def point_loss(self, pred_points, gt_points, scale, weights, gt_valid_depth_mask, sigma):
+    def point_loss(self, pred_points, gt_points, scale, weights, gt_valid_depth_mask, s):
         B, L, H, W = pred_points.shape[:4]
 
-        # 1. Calculate Raw Error
-        raw_error = F.l1_loss(
-            (pred_points * scale.view(B, 1, 1, 1, 1)),
-            gt_points,
-            reduction='none'
+        # raw_error = F.smooth_l1_loss(
+        #     pred_points * scale.view(B, 1, 1, 1, 1),
+        #     gt_points,
+        #     reduction='none',
+        #     beta=1e-2
+        # ) * weights.view(B, L, H, W, 1)
+        raw_error = self.hughber_loss(
+            pred_points * scale.view(B, 1, 1, 1, 1),
+            gt_points
         ) * weights.view(B, L, H, W, 1)
 
-        # 2. Bayesian Tug-of-War
-        sigma_expanded = sigma.view(B, L, H, W, 1)
-        loss = (raw_error / sigma_expanded) + torch.log(sigma_expanded)
+        s_expanded = s.view(B, L, H, W, 1)
+        loss = raw_error * torch.exp(-s_expanded) + s_expanded
 
-        # 3. Mask and Reduce
         loss = loss.masked_fill(~gt_valid_depth_mask.unsqueeze(-1), 0.0)
         return loss.sum(dtype=torch.float32) / (gt_valid_depth_mask.sum() * 3 + 1e-6)
 
-    def normal_loss(self, points, gt_points, mask, gt_depths, sigma):
+    def normal_loss(self, points, gt_points, mask, gt_depths, s):
         not_edge = ~depth_edge(gt_depths, rtol=0.03)
         mask = mask & not_edge
 
-        B, L, H, W = sigma.shape
-        sigma_2d = sigma.view(B * L, 1, H, W)
+        B, L, H, W = s.shape
+        s_2d = s.view(B * L, 1, H, W)
 
-        # 1. Extract Max Uncertainty for 2x2 Patches
-        sigma_norm_2d = F.max_pool2d(sigma_2d, kernel_size=2, stride=1)
-        sigma_normal = sigma_norm_2d.view(B, L, H - 1, W - 1)
+        # Max pooling works perfectly on log(sigma). Max s = Max uncertainty.
+        s_norm_2d = F.max_pool2d(s_2d, kernel_size=2, stride=1)
+        s_normal = s_norm_2d.view(B, L, H - 1, W - 1)
 
         leftup, rightup, leftdown, rightdown = points[..., :-1, :-1, :], points[..., :-1, 1:, :], points[
             ..., 1:, :-1, :], points[..., 1:, 1:, :]
@@ -192,27 +226,35 @@ class PP3DR_loss(nn.Module):
         gt_leftup, gt_rightup, gt_leftdown, gt_rightdown = gt_points[..., :-1, :-1, :], gt_points[..., :-1, 1:, :], \
         gt_points[..., 1:, :-1, :], gt_points[..., 1:, 1:, :]
 
-        # 2. Compute Raw Angular Errors
-        raw_upxleft = _smooth(angle_diff_vec3(torch.cross(upxleft, leftdown - rightdown, dim=-1),
+        upxleft_angle = angle_diff_vec3(torch.cross(upxleft, leftdown - rightdown, dim=-1),
                                               torch.cross(gt_rightup - gt_rightdown, gt_leftdown - gt_rightdown,
-                                                          dim=-1)).clamp(MIN_ANGLE, MAX_ANGLE), beta=BETA_RAD)
-        raw_leftxdown = _smooth(angle_diff_vec3(torch.cross(leftxdown, rightdown - rightup, dim=-1),
-                                                torch.cross(gt_leftup - gt_rightup, gt_rightdown - gt_rightup,
-                                                            dim=-1)).clamp(MIN_ANGLE, MAX_ANGLE), beta=BETA_RAD)
-        raw_downxright = _smooth(angle_diff_vec3(torch.cross(downxright, rightup - leftup, dim=-1),
-                                                 torch.cross(gt_leftdown - gt_leftup, gt_rightup - gt_leftup,
-                                                             dim=-1)).clamp(MIN_ANGLE, MAX_ANGLE), beta=BETA_RAD)
-        raw_rightxup = _smooth(angle_diff_vec3(torch.cross(rightxup, leftup - leftdown, dim=-1),
-                                               torch.cross(gt_rightdown - gt_leftdown, gt_leftup - gt_leftdown,
-                                                           dim=-1)).clamp(MIN_ANGLE, MAX_ANGLE), beta=BETA_RAD)
+                                                          dim=-1)).clamp(MIN_ANGLE, MAX_ANGLE)
+        # raw_upxleft = _smooth(upxleft_angle, beta=1e-2)
+        raw_upxleft = self.hughber_loss(upxleft_angle)
 
-        # 3. Apply Bayesian Tug-of-War per Triangle
-        loss_upxleft = (raw_upxleft / sigma_normal) + torch.log(sigma_normal)
-        loss_leftxdown = (raw_leftxdown / sigma_normal) + torch.log(sigma_normal)
-        loss_downxright = (raw_downxright / sigma_normal) + torch.log(sigma_normal)
-        loss_rightxup = (raw_rightxup / sigma_normal) + torch.log(sigma_normal)
+        leftxdown_angle = angle_diff_vec3(torch.cross(leftxdown, rightdown - rightup, dim=-1),
+                                torch.cross(gt_leftup - gt_rightup, gt_rightdown - gt_rightup, dim=-1)).clamp(MIN_ANGLE,
+                                                                                                              MAX_ANGLE)
+        # raw_leftxdown = _smooth(leftxdown_angle, beta=1e-2)
+        raw_leftxdown = self.hughber_loss(leftxdown_angle)
 
-        # 4. Mask and Combine
+        downxright_angle = angle_diff_vec3(torch.cross(downxright, rightup - leftup, dim=-1),
+                                torch.cross(gt_leftdown - gt_leftup, gt_rightup - gt_leftup, dim=-1)).clamp(MIN_ANGLE,
+                                                                                                            MAX_ANGLE)
+        # raw_downxright = _smooth(downxright_angle, beta=1e-2)
+        raw_downxright = self.hughber_loss(downxright_angle)
+
+        rightxup_angle = angle_diff_vec3(torch.cross(rightxup, leftup - leftdown, dim=-1),
+                                torch.cross(gt_rightdown - gt_leftdown, gt_leftup - gt_leftdown, dim=-1)).clamp(
+            MIN_ANGLE, MAX_ANGLE)
+        # raw_rightxup = _smooth(rightxup_angle, beta=1e-2)
+        raw_rightxup = self.hughber_loss(rightxup_angle)
+
+        loss_upxleft = raw_upxleft * torch.exp(-s_normal) + s_normal
+        loss_leftxdown = raw_leftxdown * torch.exp(-s_normal) + s_normal
+        loss_downxright = raw_downxright * torch.exp(-s_normal) + s_normal
+        loss_rightxup = raw_rightxup * torch.exp(-s_normal) + s_normal
+
         loss = mask_upxleft.to(torch.float32) * loss_upxleft \
                + mask_leftxdown.to(torch.float32) * loss_leftxdown \
                + mask_downxright.to(torch.float32) * loss_downxright \
@@ -221,13 +263,12 @@ class PP3DR_loss(nn.Module):
         total_valid_triangles = mask_upxleft.sum() + mask_leftxdown.sum() + mask_downxright.sum() + mask_rightxup.sum()
         return loss.sum(dtype=torch.float32) / (total_valid_triangles + 1e-6)
 
-    def gradient_matching_loss(self, pred_depth, gt_depth, valid_mask, sigma):
+    def gradient_matching_loss(self, pred_depth, gt_depth, valid_mask, s):
         B, L, H, W = pred_depth.shape
-        sigma_2d = sigma.view(B * L, 1, H, W)
+        s_2d = s.view(B * L, 1, H, W)
 
-        # 1. Extract Max Uncertainty for adjacent Y and X pixels
-        sigma_dy = F.max_pool2d(sigma_2d, kernel_size=(2, 1), stride=1).view(B, L, H - 1, W)
-        sigma_dx = F.max_pool2d(sigma_2d, kernel_size=(1, 2), stride=1).view(B, L, H, W - 1)
+        s_dy = F.max_pool2d(s_2d, kernel_size=(2, 1), stride=1).view(B, L, H - 1, W)
+        s_dx = F.max_pool2d(s_2d, kernel_size=(1, 2), stride=1).view(B, L, H, W - 1)
 
         pred_dy = pred_depth[..., 1:, :] - pred_depth[..., :-1, :]
         gt_dy = gt_depth[..., 1:, :] - gt_depth[..., :-1, :]
@@ -238,24 +279,24 @@ class PP3DR_loss(nn.Module):
         mask_dy = valid_mask[..., 1:, :] & valid_mask[..., :-1, :]
         mask_dx = valid_mask[..., :, 1:] & valid_mask[..., :, :-1]
 
-        # 2. Raw Errors
-        raw_dy = F.l1_loss(pred_dy, gt_dy, reduction='none')
-        raw_dx = F.l1_loss(pred_dx, gt_dx, reduction='none')
+        # raw_dy = F.smooth_l1_loss(pred_dy, gt_dy, reduction='none', beta=1e-2)
+        # raw_dx = F.smooth_l1_loss(pred_dx, gt_dx, reduction='none', beta=1e-2)
+        raw_dy = self.hughber_loss(pred_dy, gt_dy)
+        raw_dx = self.hughber_loss(pred_dx, gt_dx)
 
-        # 3. Bayesian Tug-of-War
-        loss_dy = (raw_dy / sigma_dy) + torch.log(sigma_dy)
-        loss_dx = (raw_dx / sigma_dx) + torch.log(sigma_dx)
+        loss_dy = raw_dy * torch.exp(-s_dy) + s_dy
+        loss_dx = raw_dx * torch.exp(-s_dx) + s_dx
 
-        # 4. Mask and Reduce
         loss_dy = loss_dy.masked_fill(~mask_dy, 0.0)
         loss_dx = loss_dx.masked_fill(~mask_dx, 0.0)
 
         return (loss_dy.sum(dtype=torch.float32) / (mask_dy.sum() + 1e-6)) + (loss_dx.sum(dtype=torch.float32) / (mask_dx.sum() + 1e-6))
 
-    def depth_loss(self, pred_depth, gt_depth, valid_mask, sigma):
-        raw_error = F.l1_loss(pred_depth, gt_depth, reduction='none')
+    def depth_loss(self, pred_depth, gt_depth, valid_mask, s):
+        # raw_error = F.smooth_l1_loss(pred_depth, gt_depth, reduction='none', beta=1e-2)
+        raw_error = self.hughber_loss(pred_depth, gt_depth)
 
-        loss = (raw_error / sigma) + torch.log(sigma)
+        loss = raw_error * torch.exp(-s) + s
         loss = loss.masked_fill(~valid_mask, 0.0)
 
         return loss.sum(dtype=torch.float32) / (valid_mask.sum() + 1e-6)
@@ -265,11 +306,18 @@ class PP3DR_loss(nn.Module):
         gt_valid_translation_mask = gt_relative_translations.isfinite().all(dim=-1, keepdim=True)
         gt_invalid_translation_mask = ~gt_valid_translation_mask
         gt_relative_translations = gt_relative_translations.masked_fill(gt_invalid_translation_mask, 0)
-        total_translation_loss = F.l1_loss(
+
+        # total_translation_loss = F.smooth_l1_loss(
+        #     scale.view(B, 1, 1) * pred['relative_camera_translations'],
+        #     self.median_depth * gt_relative_translations / median_depths.view(B, 1, 1),
+        #     reduction='none',
+        #     beta=1e-2
+        # )
+        total_translation_loss = self.hughber_loss(
             scale.view(B, 1, 1) * pred['relative_camera_translations'],
-            self.median_depth * gt_relative_translations / median_depths.view(B, 1, 1),
-            reduction='none'
+            self.median_depth * gt_relative_translations / median_depths.view(B, 1, 1)
         )
+
         total_translation_loss = total_translation_loss.masked_fill(gt_invalid_translation_mask, 0)
         return total_translation_loss.sum(dtype=torch.float32) / ((gt_valid_translation_mask).sum() * 3 + 1e-6)
 
@@ -290,9 +338,18 @@ class PP3DR_loss(nn.Module):
             gt_relative_rotations,
             identity_matrix
         )
+
+        # Calculate trace of (R_pred @ R_gt^T) using element-wise sum
         trace = (pred['relative_camera_rotations'] * gt_relative_rotations).sum(dim=(-2, -1))
-        raw_rotation_loss = torch.clamp((3 - trace) / 2, min=0)
-        return raw_rotation_loss.masked_fill(gt_rotation_invalid_mask, 0).sum(dtype=torch.float32) / (gt_rotation_valid_mask.sum() + 1e-6)
+
+        # trace = 1 + 2*cos(theta). Isolate cos(theta) and safely clamp to prevent NaN in arccos.
+        cos_theta = torch.clamp((trace - 1.0) / 2.0, min=-1.0 + 1e-6, max=1.0 - 1e-6)
+
+        # L1 absolute error of the rotation angle from 0 is just the angle itself
+        # angle_error = _smooth(torch.acos(cos_theta), beta=1e-2)
+        angle_error = self.hughber_loss(torch.acos(cos_theta))
+
+        return angle_error.masked_fill(gt_rotation_invalid_mask, 0).sum(dtype=torch.float32) / (gt_rotation_valid_mask.sum() + 1e-6)
 
     def forward(self, pred, gt):
         invalid_dict = {k: 0 if v is None else (~v.isfinite()).sum() for k, v in pred.items()}
@@ -303,16 +360,14 @@ class PP3DR_loss(nn.Module):
 
         pred_points, gt_points, scale, weights, median_depths, gt_valid_depth_mask = self.initialize(pred, gt)
 
-        # =========================================================================
-        # SIGMA CALCULATION: Enforce the [1.0, inf) boundary safely using expp1
-        # =========================================================================
-        sigma = torch.exp(pred['raw_uncertainty']) + 1.0
+        # Log-parameterized uncertainty (s) replaces the divided sigma
+        s = pred['raw_uncertainty']
 
-        point_loss = self.point_loss(pred_points, gt_points, scale, weights, gt_valid_depth_mask, sigma)
+        point_loss = self.point_loss(pred_points, gt_points, scale, weights, gt_valid_depth_mask, s)
         torch._assert(point_loss.isfinite(), f"Point loss invalid ({point_loss})")
 
         gt_log_depths = torch.log(gt['depths'])
-        depth_loss = self.depth_loss(pred['log_depths'], gt_log_depths, gt_valid_depth_mask, sigma)
+        depth_loss = self.depth_loss(pred['log_depths'], gt_log_depths, gt_valid_depth_mask, s)
         torch._assert(depth_loss.isfinite(), f"Depth loss invalid ({depth_loss})")
 
         normal_loss = self.normal_loss(
@@ -320,12 +375,11 @@ class PP3DR_loss(nn.Module):
             gt_points=gt_points,
             mask=gt_valid_depth_mask,
             gt_depths=gt['depths'],
-            sigma=sigma
+            s=s
         )
         torch._assert(normal_loss.isfinite(), f"Normal loss invalid ({normal_loss})")
 
-        gradient_matching_loss = self.gradient_matching_loss(pred['log_depths'], gt_log_depths, gt_valid_depth_mask,
-                                                             sigma)
+        gradient_matching_loss = self.gradient_matching_loss(pred['log_depths'], gt_log_depths, gt_valid_depth_mask, s)
         torch._assert(gradient_matching_loss.isfinite(), f"Gradient matching loss invalid ({gradient_matching_loss})")
 
         gt_relative_rotations, gt_relative_translations = self.obtain_gt_relative_poses(gt['extrinsics'])

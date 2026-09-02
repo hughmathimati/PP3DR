@@ -55,8 +55,8 @@ class ViTTT(nn.Module):
             num_registers = 5,
             start_checkpointing = 12,
             drop_rates = None,
-            output_blocks = [5, 23]
-
+            final_layer_norm = True,
+            output_blocks = None
     ):
         super().__init__()
         self.dim = dim
@@ -72,7 +72,7 @@ class ViTTT(nn.Module):
         ])
 
         self.class_and_registers = nn.Parameter(torch.randn(num_registers, dim) * 0.02)
-        self.final_layer_norm = nn.LayerNorm(dim)
+        self.final_layer_norm = nn.LayerNorm(dim) if final_layer_norm else nn.Identity()
         self.start_checkpointing = start_checkpointing
         self.output_blocks = output_blocks
 

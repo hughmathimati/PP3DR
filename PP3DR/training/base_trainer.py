@@ -81,8 +81,8 @@ class BaseTrainer:
                  model,
                  loss,
                  name="checkpoints",
-                 epochs=100,
-                 checkpoint_every=26,
+                 epochs=200,
+                 checkpoint_every=51,
                  pretrained_path=None,
                  strict=True,
                  ema = False,
@@ -242,9 +242,14 @@ class BaseTrainer:
             clean_state_dict = {}
             for k, v in loaded_state_dict.items():
                 if k.startswith("module."):
-                    clean_state_dict[k[7:]] = v
-                else:
-                    clean_state_dict[k] = v
+                    k = k[7:]
+
+                    # if "final_upscale" in k:
+                    #     print(f"Skipping poisoned weight: {k}")
+                    #     clean_state_dict[k] = torch.zeros_like(v)
+                    #     continue
+
+                clean_state_dict[k] = v
 
             # 3. Load the fine-tuned weights ON TOP of the initialization.
             missing, unexpected = train_model.load_state_dict(clean_state_dict, strict=strict)
@@ -267,7 +272,7 @@ class BaseTrainer:
                          model: nn.Module,
                          encoder_blocks: int,
                          decoder_blocks: int,
-                         adamw_lr: float = 1e-6, # 1e-4
+                         adamw_lr: float = 5e-5, # 1e-4
                          weight_decay: float = 0.04,
                          layer_decay: float = 0.95,
                          ):

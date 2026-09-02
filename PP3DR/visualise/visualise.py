@@ -189,7 +189,7 @@ if __name__ == "__main__":
     model = PP3DR()
     dataset = nrgbd_dataset()
     # I want to see which parameters are left over after loading this.
-    loaded_state_dict = torch.load("/vulcanscratch/hughma/PP3DR/5-23_11-23_dim-1024_100-more-epochs/PP3DR.pth", weights_only=True, map_location="cpu")
+    loaded_state_dict = torch.load("/vulcanscratch/hughma/PP3DR/16-36_changes_200-epochs/PP3DR.pth", weights_only=True, map_location="cpu")
 
     # 2. Fix the DDP "module." prefix trap!
     clean_state_dict = {}
@@ -200,7 +200,7 @@ if __name__ == "__main__":
             clean_state_dict[k] = v
 
     # 3. Load the fine-tuned weights ON TOP of the initialization.
-    model.load_state_dict(clean_state_dict)
+    model.load_state_dict(clean_state_dict, strict=False)
     print("post load")
     model = model.eval().to("cuda")
 
@@ -216,7 +216,7 @@ if __name__ == "__main__":
     print("post pred")
 
     # You can scale the translations and depths if the dataset (like RTMV) is physically tiny
-    scale = 1
+    scale = 10
     pred['relative_camera_translations'] *= scale
     pred['log_depths'] = pred['log_depths'] + np.log(scale)
     data['extrinsics'][:, :, :3, 3] *= scale
