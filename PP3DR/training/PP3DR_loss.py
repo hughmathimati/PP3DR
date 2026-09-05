@@ -9,15 +9,16 @@ from typing import Callable
 import math
 
 class HughberLoss(nn.Module):
-    def __init__(self, beta = 1e-2):
+    def __init__(self, beta = 1e-2, mse_weight=0.5):
         super().__init__()
         self.beta = beta
+        self.mse_weight = mse_weight
 
     def _forward2(self, x, gt):
         """
         NOTE: Performs reduction='none'.
         """
-        return F.smooth_l1_loss(x, gt, reduction="none", beta=self.beta) + F.mse_loss(x, gt, reduction="none")
+        return F.smooth_l1_loss(x, gt, reduction="none", beta=self.beta) + self.mse_weight * F.mse_loss(x, gt, reduction="none")
 
     def _forward1(self, error):
         """
@@ -31,7 +32,7 @@ class HughberLoss(nn.Module):
             error < self.beta,
             0.5 * square / self.beta,
             error - 0.5 * self.beta
-        ) + square
+        ) + self.mse_weight * square
 
         return loss
 
@@ -370,14 +371,14 @@ class PP3DR_loss(nn.Module):
         depth_loss = self.depth_loss(pred['log_depths'], gt_log_depths, gt_valid_depth_mask, s)
         torch._assert(depth_loss.isfinite(), f"Depth loss invalid ({depth_loss})")
 
-        normal_loss = self.normal_loss(
-            points=pred_points,
-            gt_points=gt_points,
-            mask=gt_valid_depth_mask,
-            gt_depths=gt['depths'],
-            s=s
-        )
-        torch._assert(normal_loss.isfinite(), f"Normal loss invalid ({normal_loss})")
+        # normal_loss = self.normal_loss(
+        #     points=pred_points,
+        #     gt_points=gt_points,
+        #     mask=gt_valid_depth_mask,
+        #     gt_depths=gt['depths'],
+        #     s=s
+        # )
+        # torch._assert(normal_loss.isfinite(), f"Normal loss invalid ({normal_loss})")
 
         gradient_matching_loss = self.gradient_matching_loss(pred['log_depths'], gt_log_depths, gt_valid_depth_mask, s)
         torch._assert(gradient_matching_loss.isfinite(), f"Gradient matching loss invalid ({gradient_matching_loss})")
@@ -390,12 +391,13 @@ class PP3DR_loss(nn.Module):
         rotation_loss = self.rotation_loss(pred, gt_relative_rotations)
         torch._assert(rotation_loss.isfinite(), f"Rotation loss invalid ({rotation_loss})")
 
-        total_loss = point_loss + depth_loss + gradient_matching_loss + normal_loss + translation_loss + rotation_loss
+        # total_loss = point_loss + depth_loss + gradient_matching_loss + normal_loss + translation_loss + rotation_loss
+        total_loss = point_loss + depth_loss + gradient_matching_loss + translation_loss + rotation_loss
         return total_loss, dict(
             total_loss=total_loss,
             point_loss=point_loss,
             depth_loss=depth_loss,
-            normal_loss=normal_loss,
+            # normal_loss=normal_loss,
             gradient_matching_loss=gradient_matching_loss,
             translation_loss=translation_loss,
             rotation_loss=rotation_loss

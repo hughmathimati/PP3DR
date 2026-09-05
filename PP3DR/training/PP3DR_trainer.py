@@ -6,8 +6,8 @@ if __name__ == "__main__":
     BaseTrainer(
         PP3DR,
         PP3DR_loss,
-        name="16-36_hughber",
-        pretrained_path="/vulcanscratch/hughma/PP3DR/16-36_coords-after-proj/PP3DR.pth",
+        name="16-36_no-normal",
+        pretrained_path="/vulcanscratch/hughma/PP3DR/16-36_hughber/PP3DR.pth",
         # checkpoint=""
         # strict=False
     )

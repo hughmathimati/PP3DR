@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=16-36_hughber
+#SBATCH --job-name=16-36_no-normal
 #SBATCH --output=%x-%j.out
 #SBATCH --partition=vulcan-ampere
 #SBATCH --ntasks 1
