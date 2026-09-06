@@ -178,6 +178,7 @@ class UpscaleBlock(nn.Module):
         self.residual = nn.ConvTranspose2d(
             in_channels=in_channels, out_channels=out_channels, kernel_size=upscale_dim, stride=upscale_dim
         )
+        self.residual_ls = LayerScale([out_channels, 1, 1])
         if proj_type == "swiglu":
             if ffn_ratio is None:
                 raise ValueError(f"ffn_ratio cannot be None when proj_type is 'swiglu'.")
@@ -198,7 +199,7 @@ class UpscaleBlock(nn.Module):
             mode='bilinear',
             align_corners=False
         )
-        return upscaled + self.residual(x)
+        return upscaled + self.residual_ls(self.residual(x))
 
 class DepthHead(nn.Module):
     def __init__(self, dim):
@@ -219,7 +220,22 @@ class DepthHead(nn.Module):
             ResidualConvUnit(256),  # Refines the 1/4th scale fusion
             ResidualConvUnit(128),  # Refines the 1/2th scale fusion
         ])
-        self.final_upscale = UpscaleBlock(128, 2, 2, proj_type="pure_linear") # original dimensions
+        self.final_upscale = nn.Sequential(
+            nn.Conv2d(128, 8, kernel_size=3, padding=1), # 2x2 = 4, times 2 output maps for 8 channels total
+            nn.PixelShuffle(upscale_factor=2)
+        )
+        self.icnr_init(self.final_upscale[0].weight, upscale_factor=2)
+        nn.init.zeros_(self.final_upscale[0].bias)
+
+    def icnr_init(self, tensor, upscale_factor=2):
+        """Initializes PixelShuffle convolution to mimic nearest-neighbor."""
+        out_channels, in_channels, k1, k2 = tensor.shape
+        base_channels = out_channels // (upscale_factor ** 2)
+        sub_kernel = torch.empty(base_channels, in_channels, k1, k2)
+        nn.init.kaiming_normal_(sub_kernel)
+        new_kernel = sub_kernel.repeat_interleave(upscale_factor ** 2, dim=0)
+        with torch.no_grad():
+            tensor.copy_(new_kernel)
 
     def forward(self, x, L, original_height, original_width):
         """
@@ -287,7 +303,7 @@ class PP3DR(nn.Module):
             ffn_ratio: int = 4,
             num_registers: int = 5,
             # How many blocks EACH not to checkpoint (total # is twice as many).
-            start_checkpointing=16,
+            start_checkpointing=15,
             point_head_class=PointHead,
             pose_head_class=PoseHead,
             # These are block_each indices.

@@ -81,7 +81,7 @@ class BaseTrainer:
                  model,
                  loss,
                  name="checkpoints",
-                 epochs=100,
+                 epochs=150,
                  checkpoint_every=51,
                  pretrained_path=None,
                  strict=True,
@@ -272,7 +272,7 @@ class BaseTrainer:
                          model: nn.Module,
                          encoder_blocks: int,
                          decoder_blocks: int,
-                         adamw_lr: float = 2e-5, # 1e-4
+                         adamw_lr: float = 1e-4, # 1e-4
                          weight_decay: float = 0.04,
                          layer_decay: float = 0.95,
                          ):

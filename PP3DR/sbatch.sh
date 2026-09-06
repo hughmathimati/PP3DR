@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=16-36_no-normal
+#SBATCH --job-name=16-36_pixel-shuffle-icnr
 #SBATCH --output=%x-%j.out
 #SBATCH --partition=vulcan-ampere
 #SBATCH --ntasks 1
