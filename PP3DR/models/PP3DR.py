@@ -19,9 +19,9 @@ from models.utils import apply_pos_embed
 
 
 class LayerScale(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, initial_value=1e-5):
         super().__init__()
-        self.scale = nn.Parameter(torch.ones(dim) * 1e-5)
+        self.scale = nn.Parameter(torch.ones(dim) * initial_value)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.scale * x
@@ -178,7 +178,6 @@ class UpscaleBlock(nn.Module):
         self.residual = nn.ConvTranspose2d(
             in_channels=in_channels, out_channels=out_channels, kernel_size=upscale_dim, stride=upscale_dim
         )
-        self.residual_ls = LayerScale([out_channels, 1, 1])
         if proj_type == "swiglu":
             if ffn_ratio is None:
                 raise ValueError(f"ffn_ratio cannot be None when proj_type is 'swiglu'.")
@@ -199,21 +198,29 @@ class UpscaleBlock(nn.Module):
             mode='bilinear',
             align_corners=False
         )
-        return upscaled + self.residual_ls(self.residual(x))
+        return upscaled + self.residual(x)
 
 class DepthHead(nn.Module):
     def __init__(self, dim):
         super().__init__()
+        # Initial feature map projections are going to be pure transpose convolutions, like VGGT-Omega's DenseHead.
         self.initial_proj = nn.ModuleList([
-            UpscaleBlock(dim, 128, 8, proj_type="linear_silu"), # 1/2
-            UpscaleBlock(dim, 256, 4, proj_type="linear_silu"), # 1/4
-            UpscaleBlock(dim, 256, 2, proj_type="linear_silu"), # 1/8
-            nn.Sequential( nn.Conv2d(dim, 256, kernel_size=1), nn.SiLU() )
+            UpscaleBlock(dim, 128, 8, "pure_linear"), # 1/2
+            UpscaleBlock(dim, 256, 4, "pure_linear"), # 1/4
+            UpscaleBlock(dim, 256, 2, "pure_linear"), # 1/8
+            # nn.Sequential(nn.Conv2d(dim, 256, kernel_size=1), nn.SiLU()) # original size
+            nn.Identity()
         ])
         self.fusion_proj = nn.ModuleList([
-            UpscaleBlock(256, 256, 2, proj_type="swiglu", ffn_ratio=2), # 1/8
+            # UpscaleBlock(256, 256, 2, proj_type="swiglu", ffn_ratio=2), # 1/8
+            UpscaleBlock(dim, 256, 2, proj_type="pure_linear"),  # 1/8
             UpscaleBlock(256, 256, 2, proj_type="swiglu", ffn_ratio=2), # 1/4
             UpscaleBlock(256, 128, 2, proj_type="swiglu", ffn_ratio=1), # 1/2
+        ])
+        self.fusion_layer_scale = nn.ModuleList([
+            LayerScale([256, 1, 1], 0.1),
+            LayerScale([256, 1, 1], 0.01),
+            LayerScale([128, 1, 1], 0.001),
         ])
         self.fusion_resconv = nn.ModuleList([
             ResidualConvUnit(256),  # Refines the 1/8th scale fusion
@@ -221,21 +228,10 @@ class DepthHead(nn.Module):
             ResidualConvUnit(128),  # Refines the 1/2th scale fusion
         ])
         self.final_upscale = nn.Sequential(
-            nn.Conv2d(128, 8, kernel_size=3, padding=1), # 2x2 = 4, times 2 output maps for 8 channels total
+            nn.Conv2d(128, 8, 1, 1), # 8 = 2 * 2^2
+            # PointwiseSwiGLU(128, 128, 8),
             nn.PixelShuffle(upscale_factor=2)
         )
-        self.icnr_init(self.final_upscale[0].weight, upscale_factor=2)
-        nn.init.zeros_(self.final_upscale[0].bias)
-
-    def icnr_init(self, tensor, upscale_factor=2):
-        """Initializes PixelShuffle convolution to mimic nearest-neighbor."""
-        out_channels, in_channels, k1, k2 = tensor.shape
-        base_channels = out_channels // (upscale_factor ** 2)
-        sub_kernel = torch.empty(base_channels, in_channels, k1, k2)
-        nn.init.kaiming_normal_(sub_kernel)
-        new_kernel = sub_kernel.repeat_interleave(upscale_factor ** 2, dim=0)
-        with torch.no_grad():
-            tensor.copy_(new_kernel)
 
     def forward(self, x, L, original_height, original_width):
         """
@@ -248,16 +244,12 @@ class DepthHead(nn.Module):
         log_depths (B, L, H, W)
         raw_uncertainty (B, L, H, W)
         """
-        # x = [apply_pos_embed(y, original_width, original_height, L) for y in x]
-        # a, b, c, d = [self.initial_proj[i](y) for i, y in enumerate(x)]
+        x = [apply_pos_embed(y, original_width, original_height, L) for y in x]
+        a, b, c, d = [self.initial_proj[i](y) for i, y in enumerate(x)]
 
-        # Trying out positional embedding post-dim-proj
-        projected = [self.initial_proj[i](y) for i, y in enumerate(x)]
-        a, b, c, d = [apply_pos_embed(y, original_width, original_height, L) for y in projected]
-
-        x = self.fusion_resconv[0](c + self.fusion_proj[0](d))
-        x = self.fusion_resconv[1](b + self.fusion_proj[1](x))
-        x = self.fusion_resconv[2](a + self.fusion_proj[2](x))
+        x = self.fusion_resconv[0](self.fusion_layer_scale(c) + self.fusion_proj[0](d))
+        x = self.fusion_resconv[1](self.fusion_layer_scale(b) + self.fusion_proj[1](x))
+        x = self.fusion_resconv[2](self.fusion_layer_scale(a) + self.fusion_proj[2](x))
         x = apply_pos_embed(x, original_width, original_height, L)
         # (B * L, 2, H, W)
         return rearrange(self.final_upscale(x), "(B L) two H W -> B L two H W", L=L).unbind(2)
@@ -303,7 +295,7 @@ class PP3DR(nn.Module):
             ffn_ratio: int = 4,
             num_registers: int = 5,
             # How many blocks EACH not to checkpoint (total # is twice as many).
-            start_checkpointing=15,
+            start_checkpointing=16,
             point_head_class=PointHead,
             pose_head_class=PoseHead,
             # These are block_each indices.

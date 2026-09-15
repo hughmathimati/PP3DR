@@ -298,8 +298,8 @@ class PP3DR_loss(nn.Module):
         Depth is the only loss which uses hughber_loss because I keep having random pixels inside tables predicted as
         being very far away.
         """
-        # raw_error = F.smooth_l1_loss(pred_depth, gt_depth, reduction='none', beta=1e-2)
-        raw_error = self.hughber_loss(pred_depth, gt_depth)
+        raw_error = F.smooth_l1_loss(pred_depth, gt_depth, reduction='none', beta=1e-2)
+        # raw_error = self.hughber_loss(pred_depth, gt_depth)
 
         loss = raw_error * torch.exp(-s) + s
         loss = loss.masked_fill(~valid_mask, 0.0)
@@ -395,7 +395,7 @@ class PP3DR_loss(nn.Module):
         rotation_loss = self.rotation_loss(pred, gt_relative_rotations)
         torch._assert(rotation_loss.isfinite(), f"Rotation loss invalid ({rotation_loss})")
 
-        total_loss = point_loss + depth_loss + gradient_matching_loss + normal_loss + translation_loss + rotation_loss
+        total_loss = point_loss + 3 * depth_loss + gradient_matching_loss + normal_loss + translation_loss + rotation_loss
         return total_loss, dict(
             total_loss=total_loss,
             point_loss=point_loss,

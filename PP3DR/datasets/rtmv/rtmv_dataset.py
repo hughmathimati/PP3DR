@@ -158,6 +158,10 @@ class rtmv_dataset(DatasetBase):
             depth_path = os.path.join(scene_path, f"{i:05d}.depth.exr")
             json_path = os.path.join(scene_path, f"{i:05d}.json")
 
+            # STRICT EXCLUSION: Ignore known corrupted frame
+            if rgb_path.endswith("abo/falling_amazon_berkeley_scenes/00065/00016.exr"):
+                continue
+
             if not (os.path.exists(rgb_path) and os.path.exists(depth_path) and os.path.exists(json_path)):
                 continue
 

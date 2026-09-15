@@ -6,8 +6,8 @@ if __name__ == "__main__":
     BaseTrainer(
         PP3DR,
         PP3DR_loss,
-        name="16-36_pixel-shuffle-icnr",
-        # pretrained_path="/vulcanscratch/hughma/PP3DR/16-36_hughber/PP3DR.pth",
-        # checkpoint=""
+        name="16-36_dpt-simpler-weighting",
+        pretrained_path="/vulcanscratch/hughma/PP3DR/16-36_residual-ls_silu_3x-depth/PP3DR.pth",
+        # checkpoint="/vulcanscratch/hughma/PP3DR/16-36_residual-ls/epoch 51"
         # strict=False
     )
