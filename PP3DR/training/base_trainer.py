@@ -272,7 +272,7 @@ class BaseTrainer:
                          model: nn.Module,
                          encoder_blocks: int,
                          decoder_blocks: int,
-                         adamw_lr: float = 1e-5, # 1e-4
+                         adamw_lr: float = 1e-5,
                          weight_decay: float = 0.04,
                          layer_decay: float = 0.95,
                          ):
@@ -387,8 +387,9 @@ class BaseTrainer:
             total_loss=0,
             point_loss=0,
             depth_loss=0,
-            normal_loss=0,
             gradient_matching_loss=0,
+            normal_loss=0,
+            structural_similarity_loss=0,
             translation_loss=0,
             rotation_loss=0,
         )

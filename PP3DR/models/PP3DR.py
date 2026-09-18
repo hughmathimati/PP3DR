@@ -208,19 +208,12 @@ class DepthHead(nn.Module):
             UpscaleBlock(dim, 128, 8, "pure_linear"), # 1/2
             UpscaleBlock(dim, 256, 4, "pure_linear"), # 1/4
             UpscaleBlock(dim, 256, 2, "pure_linear"), # 1/8
-            # nn.Sequential(nn.Conv2d(dim, 256, kernel_size=1), nn.SiLU()) # original size
             nn.Identity()
         ])
         self.fusion_proj = nn.ModuleList([
-            # UpscaleBlock(256, 256, 2, proj_type="swiglu", ffn_ratio=2), # 1/8
             UpscaleBlock(dim, 256, 2, proj_type="pure_linear"),  # 1/8
             UpscaleBlock(256, 256, 2, proj_type="swiglu", ffn_ratio=2), # 1/4
             UpscaleBlock(256, 128, 2, proj_type="swiglu", ffn_ratio=1), # 1/2
-        ])
-        self.fusion_layer_scale = nn.ModuleList([
-            LayerScale([256, 1, 1], 0.1),
-            LayerScale([256, 1, 1], 0.01),
-            LayerScale([128, 1, 1], 0.001),
         ])
         self.fusion_resconv = nn.ModuleList([
             ResidualConvUnit(256),  # Refines the 1/8th scale fusion
@@ -229,7 +222,6 @@ class DepthHead(nn.Module):
         ])
         self.final_upscale = nn.Sequential(
             nn.Conv2d(128, 8, 1, 1), # 8 = 2 * 2^2
-            # PointwiseSwiGLU(128, 128, 8),
             nn.PixelShuffle(upscale_factor=2)
         )
 
@@ -247,9 +239,10 @@ class DepthHead(nn.Module):
         x = [apply_pos_embed(y, original_width, original_height, L) for y in x]
         a, b, c, d = [self.initial_proj[i](y) for i, y in enumerate(x)]
 
-        x = self.fusion_resconv[0](self.fusion_layer_scale(c) + self.fusion_proj[0](d))
-        x = self.fusion_resconv[1](self.fusion_layer_scale(b) + self.fusion_proj[1](x))
-        x = self.fusion_resconv[2](self.fusion_layer_scale(a) + self.fusion_proj[2](x))
+        x = self.fusion_resconv[0](c + self.fusion_proj[0](d))
+        x = self.fusion_resconv[1](b + self.fusion_proj[1](x))
+        x = self.fusion_resconv[2](a + self.fusion_proj[2](x))
+
         x = apply_pos_embed(x, original_width, original_height, L)
         # (B * L, 2, H, W)
         return rearrange(self.final_upscale(x), "(B L) two H W -> B L two H W", L=L).unbind(2)
@@ -341,8 +334,8 @@ class PP3DR(nn.Module):
             drop_rates=ViTTT_drop_rates,
             start_checkpointing=0,
             final_layer_norm = False,
-            # For 16 blocks, this is [3, 15].
-            output_blocks = [encoder_blocks // 4 - 1, encoder_blocks - 1]
+            # For 16 blocks, this is [7, 15].
+            output_blocks = [encoder_blocks // 2 - 1, encoder_blocks - 1]
         )
         self.num_registers = num_registers
 

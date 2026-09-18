@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=16-36_dpt-simpler-weighting
+#SBATCH --job-name=16-36_7-15-8-17_new-losses
 #SBATCH --output=%x-%j.out
 #SBATCH --partition=vulcan-ampere
 #SBATCH --ntasks 1
@@ -8,7 +8,7 @@
 #SBATCH --gres=gpu:h200-sxm:4
 #SBATCH --account=vulcan-jbhuang
 #SBATCH --qos=vulcan-high-h200
-#SBATCH --time=24:00:00
+#SBATCH --time=12:00:00
 
 #set -x
 

@@ -61,8 +61,81 @@ class PointHead(nn.Module):
 
 @torch.compile()
 class PP3DR_DenseHead(PP3DR):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs, point_head_class=PointHead)
+    def __init__(
+            self,
+            dim: int = 1024,
+            num_heads: int = 16,
+            # VGGT-Omega uses 24 encoder blocks and 48 decoder blocks.
+            encoder_blocks: int = 16,
+            decoder_blocks: int = 36,
+            ffn_ratio: int = 4,
+            num_registers: int = 5,
+            # How many blocks EACH not to checkpoint (total # is twice as many).
+            start_checkpointing=16,
+            point_head_class=PointHead,
+            pose_head_class=PoseHead,
+            # These are block_each indices.
+            output_blocks=None
+    ):
+        # super().__init__(*args, **kwargs, point_head_class=PointHead)
+        nn.Module.__init__(self)
+        assert decoder_blocks % 2 == 0, \
+            f"Number of decoder blocks ({decoder_blocks}) must be even for alternating global and frame-wise attention."
+        assert dim % num_heads == 0, f"dim {dim} must be divisible by num_heads {num_heads}."
+
+        self.encoder_blocks = encoder_blocks
+        self.decoder_blocks = decoder_blocks
+        self.blocks_each = decoder_blocks // 2
+        self.start_checkpointing = start_checkpointing
+
+        # Drop rates
+        rates = torch.linspace(0, 0.1, encoder_blocks + decoder_blocks)
+        ViTTT_drop_rates = rates[:encoder_blocks]
+        PP3DR_drop_rates = rates[encoder_blocks:]
+
+        # General decoder
+        self.dim = dim
+        drop_rates = [x.item() for x in PP3DR_drop_rates]
+        self.global_blocks = nn.ModuleList([
+            GlobalBlock(dim, num_heads, ffn_ratio, drop_rates[2 * i])
+            for i in range(self.blocks_each)
+        ])
+        self.local_blocks = nn.ModuleList([
+            LocalBlock(dim, num_heads, ffn_ratio, drop_rates[2 * i + 1])
+            for i in range(self.blocks_each)
+        ])
+
+        # We don't store num_registers here. It gets stored in the decoder heads.
+        self.rope2d = Rope2D(embed_dim=dim, num_heads=num_heads, device="cuda")
+        self.rope3d = Rope3D(embed_dim=dim, num_heads=num_heads, device="cuda")
+
+        # Don't checkpoint the ViTTT blocks. Checkpointing the PP3DR blocks saves more time.
+        self.ViTTT = ViTTT(
+            dim,
+            num_heads,
+            encoder_blocks,
+            ffn_ratio,
+            drop_rates=ViTTT_drop_rates,
+            start_checkpointing=0,
+            final_layer_norm=False,
+            # For 16 blocks, this is [3, 15].
+            # output_blocks=[encoder_blocks // 4 - 1, encoder_blocks - 1]
+            output_blocks = [3, 4, 14, 15]
+        )
+        self.num_registers = num_registers
+
+        # Per-task decoders
+        self.point_head = point_head_class(dim=dim)
+        """
+        The camera decoder will predict the relative SE3 transformation to the next frame.
+        We are parameterizing our camera with three scalars for the translation and six scalars for the rotation.
+        Details of how the rotation prediction works are in the forward() method.
+        """
+        self.pose_head = pose_head_class(dim=dim)
+
+        # For 18 blocks each (36 blocks total), this is [8, 17].
+        self.output_blocks = [self.blocks_each // 2 - 1,
+                              self.blocks_each - 1] if output_blocks is None else output_blocks
 
     def forward(self, x: torch.Tensor, rope_x, rope_y, original_height, original_width) -> dict:
         """
@@ -90,7 +163,7 @@ class PP3DR_DenseHead(PP3DR):
 
         # Step 1: ViT
         # ViT is frame-wise. We need to collapse the batch dimension into the sequence dimension before passing it into Dino.
-        x, outputs = self.ViT(x.flatten(0, 1))
+        x, outputs = self.ViTTT(x.flatten(0, 1))
         # x.shape == (B * L, num_registers + HW // 256, dim)
         """
         NOTE:

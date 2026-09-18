@@ -9,7 +9,7 @@ from typing import Callable
 import math
 
 class HughberLoss(nn.Module):
-    def __init__(self, beta = 1e-2, mse_weight=0.5):
+    def __init__(self, beta = 1e-3, mse_weight=0.5):
         super().__init__()
         self.beta = beta
         self.mse_weight = mse_weight
@@ -76,7 +76,7 @@ def depth_edge(depth: torch.Tensor, rtol: float = 0.03) -> torch.Tensor:
 
 @torch.compile()
 class PP3DR_loss(nn.Module):
-    def __init__(self, scale=False, median_depth=10):
+    def __init__(self, scale=False, median_depth=1):
         super().__init__()
         self.scale = scale
         self.median_depth = median_depth
@@ -177,14 +177,19 @@ class PP3DR_loss(nn.Module):
 
         return pred_points, gt_points, scale, weights, median_depths, gt_valid_depth_mask
 
+    # --- Dense losses --- #
+
     def point_loss(self, pred_points, gt_points, scale, weights, gt_valid_depth_mask, s):
+        """
+        Depth and uncertainty-weighted 3D point coordinate loss in absolute coordinates.
+        """
         B, L, H, W = pred_points.shape[:4]
 
         raw_error = F.smooth_l1_loss(
             pred_points * scale.view(B, 1, 1, 1, 1),
             gt_points,
             reduction='none',
-            beta=1e-2
+            beta=1e-3
         ) * weights.view(B, L, H, W, 1)
         # raw_error = self.hughber_loss(
         #     pred_points * scale.view(B, 1, 1, 1, 1),
@@ -197,7 +202,23 @@ class PP3DR_loss(nn.Module):
         loss = loss.masked_fill(~gt_valid_depth_mask.unsqueeze(-1), 0.0)
         return loss.sum(dtype=torch.float32) / (gt_valid_depth_mask.sum() * 3 + 1e-6)
 
+    def depth_loss(self, pred_depth, gt_depth, valid_mask, s):
+        """
+        MSE (squared) loss on log depths.
+        """
+        # raw_error = F.smooth_l1_loss(pred_depth, gt_depth, reduction='none', beta=1e-3)
+        # raw_error = self.hughber_loss(pred_depth, gt_depth)
+        raw_error = F.mse_loss(pred_depth, gt_depth, reduction='none')
+
+        loss = raw_error * torch.exp(-s) + s
+        loss = loss.masked_fill(~valid_mask, 0.0)
+
+        return loss.sum(dtype=torch.float32) / (valid_mask.sum() + 1e-6)
+
     def normal_loss(self, points, gt_points, mask, gt_depths, s):
+        """
+        Uncertainty-weighted normal loss
+        """
         not_edge = ~depth_edge(gt_depths, rtol=0.03)
         mask = mask & not_edge
 
@@ -230,25 +251,25 @@ class PP3DR_loss(nn.Module):
         upxleft_angle = angle_diff_vec3(torch.cross(upxleft, leftdown - rightdown, dim=-1),
                                               torch.cross(gt_rightup - gt_rightdown, gt_leftdown - gt_rightdown,
                                                           dim=-1)).clamp(MIN_ANGLE, MAX_ANGLE)
-        raw_upxleft = _smooth(upxleft_angle, beta=1e-2)
+        raw_upxleft = _smooth(upxleft_angle, beta=1e-3)
         # raw_upxleft = self.hughber_loss(upxleft_angle)
 
         leftxdown_angle = angle_diff_vec3(torch.cross(leftxdown, rightdown - rightup, dim=-1),
                                 torch.cross(gt_leftup - gt_rightup, gt_rightdown - gt_rightup, dim=-1)).clamp(MIN_ANGLE,
                                                                                                               MAX_ANGLE)
-        raw_leftxdown = _smooth(leftxdown_angle, beta=1e-2)
+        raw_leftxdown = _smooth(leftxdown_angle, beta=1e-3)
         # raw_leftxdown = self.hughber_loss(leftxdown_angle)
 
         downxright_angle = angle_diff_vec3(torch.cross(downxright, rightup - leftup, dim=-1),
                                 torch.cross(gt_leftdown - gt_leftup, gt_rightup - gt_leftup, dim=-1)).clamp(MIN_ANGLE,
                                                                                                             MAX_ANGLE)
-        raw_downxright = _smooth(downxright_angle, beta=1e-2)
+        raw_downxright = _smooth(downxright_angle, beta=1e-3)
         # raw_downxright = self.hughber_loss(downxright_angle)
 
         rightxup_angle = angle_diff_vec3(torch.cross(rightxup, leftup - leftdown, dim=-1),
                                 torch.cross(gt_rightdown - gt_leftdown, gt_leftup - gt_leftdown, dim=-1)).clamp(
             MIN_ANGLE, MAX_ANGLE)
-        raw_rightxup = _smooth(rightxup_angle, beta=1e-2)
+        raw_rightxup = _smooth(rightxup_angle, beta=1e-3)
         # raw_rightxup = self.hughber_loss(rightxup_angle)
 
         loss_upxleft = raw_upxleft * torch.exp(-s_normal) + s_normal
@@ -264,47 +285,93 @@ class PP3DR_loss(nn.Module):
         total_valid_triangles = mask_upxleft.sum() + mask_leftxdown.sum() + mask_downxright.sum() + mask_rightxup.sum()
         return loss.sum(dtype=torch.float32) / (total_valid_triangles + 1e-6)
 
-    def gradient_matching_loss(self, pred_depth, gt_depth, valid_mask, s):
+    def gradient_matching_loss(self, pred_depth, gt_depth, valid_mask, s, scales=None):
+        """
+        Multi-scale uncertainty-weighted depth-difference loss
+        """
+        if scales is None:
+            scales = [1, 2, 4, 8, 16]
         B, L, H, W = pred_depth.shape
         s_2d = s.view(B * L, 1, H, W)
 
-        s_dy = F.max_pool2d(s_2d, kernel_size=(2, 1), stride=1).view(B, L, H - 1, W)
-        s_dx = F.max_pool2d(s_2d, kernel_size=(1, 2), stride=1).view(B, L, H, W - 1)
+        total_loss = 0.0
+        total_weight = 0.0
 
-        pred_dy = pred_depth[..., 1:, :] - pred_depth[..., :-1, :]
-        gt_dy = gt_depth[..., 1:, :] - gt_depth[..., :-1, :]
+        for step in scales:
+            # Max pool uncertainty across the exact spatial gap
+            s_dy = F.max_pool2d(s_2d, kernel_size=(step + 1, 1), stride=1).view(B, L, H - step, W)
+            s_dx = F.max_pool2d(s_2d, kernel_size=(1, step + 1), stride=1).view(B, L, H, W - step)
 
-        pred_dx = pred_depth[..., :, 1:] - pred_depth[..., :, :-1]
-        gt_dx = gt_depth[..., :, 1:] - gt_depth[..., :, :-1]
+            pred_dy = pred_depth[..., step:, :] - pred_depth[..., :-step, :]
+            gt_dy = gt_depth[..., step:, :] - gt_depth[..., :-step, :]
 
-        mask_dy = valid_mask[..., 1:, :] & valid_mask[..., :-1, :]
-        mask_dx = valid_mask[..., :, 1:] & valid_mask[..., :, :-1]
+            pred_dx = pred_depth[..., :, step:] - pred_depth[..., :, :-step]
+            gt_dx = gt_depth[..., :, step:] - gt_depth[..., :, :-step]
 
-        raw_dy = F.smooth_l1_loss(pred_dy, gt_dy, reduction='none', beta=1e-2)
-        raw_dx = F.smooth_l1_loss(pred_dx, gt_dx, reduction='none', beta=1e-2)
-        # raw_dy = self.hughber_loss(pred_dy, gt_dy)
-        # raw_dx = self.hughber_loss(pred_dx, gt_dx)
+            mask_dy = valid_mask[..., step:, :] & valid_mask[..., :-step, :]
+            mask_dx = valid_mask[..., :, step:] & valid_mask[..., :, :-step]
 
-        loss_dy = raw_dy * torch.exp(-s_dy) + s_dy
-        loss_dx = raw_dx * torch.exp(-s_dx) + s_dx
+            # Pure L1 strictly enforces relative macro-distances without a linear safety-valve
+            raw_dy = F.smooth_l1_loss(pred_dy, gt_dy, beta=1e-3)
+            raw_dx = torch.abs(pred_dx - gt_dx)
 
-        loss_dy = loss_dy.masked_fill(~mask_dy, 0.0)
-        loss_dx = loss_dx.masked_fill(~mask_dx, 0.0)
+            loss_dy = raw_dy * torch.exp(-s_dy) + s_dy
+            loss_dx = raw_dx * torch.exp(-s_dx) + s_dx
 
-        return (loss_dy.sum(dtype=torch.float32) / (mask_dy.sum() + 1e-6)) + (loss_dx.sum(dtype=torch.float32) / (mask_dx.sum() + 1e-6))
+            loss_dy = loss_dy.masked_fill(~mask_dy, 0.0)
+            loss_dx = loss_dx.masked_fill(~mask_dx, 0.0)
 
-    def depth_loss(self, pred_depth, gt_depth, valid_mask, s):
+            scale_weight = 1.0 / step
+
+            step_loss = (loss_dy.sum(dtype=torch.float32) / (mask_dy.sum() + 1e-6)) + \
+                        (loss_dx.sum(dtype=torch.float32) / (mask_dx.sum() + 1e-6))
+
+            total_loss = total_loss + (step_loss * scale_weight)
+            total_weight += scale_weight
+
+        return total_loss / total_weight
+
+    def structural_similarity_loss(self, pred_log, gt_log, mask, window_size=7):
         """
-        Depth is the only loss which uses hughber_loss because I keep having random pixels inside tables predicted as
-        being very far away.
+        Computes SSIM on LOG depths to prevent extreme absolute background values
+        from dominating the structural gradients.
         """
-        raw_error = F.smooth_l1_loss(pred_depth, gt_depth, reduction='none', beta=1e-2)
-        # raw_error = self.hughber_loss(pred_depth, gt_depth)
+        B, L, H, W = pred_log.shape
+        pred_log = pred_log.view(B * L, 1, H, W)
+        gt_log = gt_log.view(B * L, 1, H, W)
+        mask_f = mask.view(B * L, 1, H, W).to(pred_log.dtype)
 
-        loss = raw_error * torch.exp(-s) + s
-        loss = loss.masked_fill(~valid_mask, 0.0)
+        # Stability constants adapted for the dynamic range of log space.
+        # For GT depths normalised to 1, the range of absolute depths frequently falls around 0.5 - 5.
+        # Since it's better to underestimate than to overestimate this range (for this loss), I'm going to set it to 2.
+        val_range = 2.0
+        C1 = (0.01 * val_range) ** 2
+        C2 = (0.03 * val_range) ** 2
 
-        return loss.sum(dtype=torch.float32) / (valid_mask.sum() + 1e-6)
+        weight = torch.ones(1, 1, window_size, window_size, device=pred_log.device) / (window_size ** 2)
+        pad = window_size // 2
+
+        norm = F.conv2d(mask_f, weight, padding=pad).clamp(min=1e-4)
+
+        mu_pred = F.conv2d(pred_log * mask_f, weight, padding=pad) / norm
+        mu_gt = F.conv2d(gt_log * mask_f, weight, padding=pad) / norm
+
+        var_pred = F.conv2d((pred_log ** 2) * mask_f, weight, padding=pad) / norm - mu_pred ** 2
+        var_gt = F.conv2d((gt_log ** 2) * mask_f, weight, padding=pad) / norm - mu_gt ** 2
+        cov = F.conv2d(pred_log * gt_log * mask_f, weight, padding=pad) / norm - mu_pred * mu_gt
+
+        ssim_num = (2 * mu_pred * mu_gt + C1) * (2 * cov + C2)
+        ssim_den = (mu_pred ** 2 + mu_gt ** 2 + C1) * (var_pred + var_gt + C2)
+        ssim = ssim_num / ssim_den
+
+        valid_ssim_mask = (norm > 0.5) & mask_f.bool()
+
+        ssim_loss = (1.0 - ssim) / 2.0
+        ssim_loss = ssim_loss.masked_fill(~valid_ssim_mask, 0.0)
+
+        return ssim_loss.sum(dtype=torch.float32) / (valid_ssim_mask.sum() + 1e-6)
+
+    # --- Pose losses --- #
 
     def translation_loss(self, pred, gt_relative_translations, scale, median_depths):
         B = scale.shape[0]
@@ -316,7 +383,7 @@ class PP3DR_loss(nn.Module):
             scale.view(B, 1, 1) * pred['relative_camera_translations'],
             self.median_depth * gt_relative_translations / median_depths.view(B, 1, 1),
             reduction='none',
-            beta=1e-2
+            beta=1e-3
         )
         # total_translation_loss = self.hughber_loss(
         #     scale.view(B, 1, 1) * pred['relative_camera_translations'],
@@ -351,10 +418,12 @@ class PP3DR_loss(nn.Module):
         cos_theta = torch.clamp((trace - 1.0) / 2.0, min=-1.0 + 1e-6, max=1.0 - 1e-6)
 
         # L1 absolute error of the rotation angle from 0 is just the angle itself
-        angle_error = _smooth(torch.acos(cos_theta), beta=1e-2)
+        angle_error = _smooth(torch.acos(cos_theta), beta=1e-3)
         # angle_error = self.hughber_loss(torch.acos(cos_theta))
 
         return angle_error.masked_fill(gt_rotation_invalid_mask, 0).sum(dtype=torch.float32) / (gt_rotation_valid_mask.sum() + 1e-6)
+
+    # --- Forward function --- #
 
     def forward(self, pred, gt):
         invalid_dict = {k: 0 if v is None else (~v.isfinite()).sum() for k, v in pred.items()}
@@ -387,6 +456,9 @@ class PP3DR_loss(nn.Module):
         gradient_matching_loss = self.gradient_matching_loss(pred['log_depths'], gt_log_depths, gt_valid_depth_mask, s)
         torch._assert(gradient_matching_loss.isfinite(), f"Gradient matching loss invalid ({gradient_matching_loss})")
 
+        structural_similarity_loss = self.structural_similarity_loss(pred['log_depths'], gt_log_depths, gt_valid_depth_mask)
+        torch._assert(structural_similarity_loss.isfinite(), f"Structural similarity loss invalid ({structural_similarity_loss})")
+
         gt_relative_rotations, gt_relative_translations = self.obtain_gt_relative_poses(gt['extrinsics'])
 
         translation_loss = self.translation_loss(pred, gt_relative_translations, scale, median_depths)
@@ -395,13 +467,14 @@ class PP3DR_loss(nn.Module):
         rotation_loss = self.rotation_loss(pred, gt_relative_rotations)
         torch._assert(rotation_loss.isfinite(), f"Rotation loss invalid ({rotation_loss})")
 
-        total_loss = point_loss + 3 * depth_loss + gradient_matching_loss + normal_loss + translation_loss + rotation_loss
+        total_loss = point_loss + depth_loss + gradient_matching_loss + 0.25 * normal_loss + 0.5 * structural_similarity_loss + translation_loss + rotation_loss
         return total_loss, dict(
             total_loss=total_loss,
             point_loss=point_loss,
             depth_loss=depth_loss,
-            normal_loss=normal_loss,
             gradient_matching_loss=gradient_matching_loss,
+            normal_loss=normal_loss,
+            structural_similarity_loss=structural_similarity_loss,
             translation_loss=translation_loss,
             rotation_loss=rotation_loss
         )
