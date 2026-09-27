@@ -1,22 +1,4 @@
 # Project structure:
-## ViT:
-- ### Old trainers:
-  - Training scripts for previous (failed) ViTTT distillation attempts
-- ### datasets:
-  - Image-only dataset classes for ViTTT distillation
-- ### images:
-  - Visualisations of features produced by DINOv3 and ViTTT, for two test images (cat + Sintel)
-- ### models:
-  - `BidirectionalLaCT.py`: Variant 1 Bidirectional LaCT (update last layer only) from https://github.com/JunchenLiu77/ViTTT/tree/main
-  - `Dinov3.py`: Utilities for working with DINOv3 from HuggingFace
-  - `ViTTT.py`: TTT feature extractor
-  - `pos_embed.py`: 2D RoPE embedding class (taken from DINOv3)
-- `Remaining three scripts are:`
-- The train script used for the 24-block variant (`ViTTT_distill_more_datasets.py`)
-- The train script used for the 12-block variant (which actually outperformed the 24-block variant in both train *and* val loss) (`ViTTT_distill_12_blocks.py`)
-- The train script used fo finetuning the 12-block variant (`ViTTT_distill_12_blocks_finetune.py`)
-- The script used for extracting partial losses and model weights from a training checkpoint (`loss_extractor.py`)
-
 ## PP3DR (name subject to change):
 - ### datasets
   - #### dynamic_replica
@@ -47,3 +29,21 @@
   - `visualise_gt.py`: Script for Viser visualisation of GT dataset scenes
   - `notebook.ipynb`: Jupyter notebook for visualising GT depth, predicted depth, and predicted aleatoric uncertainty
   - `jupyter.sh`: Script you can run with `sbatch` to launch a Jupyter server on a GPU node.
+
+## ViT:
+- ### Old trainers:
+  - Training scripts for previous (failed) ViTTT distillation attempts
+- ### datasets:
+  - Image-only dataset classes for ViTTT distillation
+- ### images:
+  - Visualisations of features produced by DINOv3 and ViTTT, for two test images (cat + Sintel)
+- ### models:
+  - `BidirectionalLaCT.py`: Variant 1 Bidirectional LaCT (update last layer only) from https://github.com/JunchenLiu77/ViTTT/tree/main
+  - `Dinov3.py`: Utilities for working with DINOv3 from HuggingFace
+  - `ViTTT.py`: TTT feature extractor
+  - `pos_embed.py`: 2D RoPE embedding class (taken from DINOv3)
+- `Remaining three scripts are:`
+- The train script used for the 24-block variant (`ViTTT_distill_more_datasets.py`)
+- The train script used for the 12-block variant (which actually outperformed the 24-block variant in both train *and* val loss) (`ViTTT_distill_12_blocks.py`)
+- The train script used fo finetuning the 12-block variant (`ViTTT_distill_12_blocks_finetune.py`)
+- The script used for extracting partial losses and model weights from a training checkpoint (`loss_extractor.py`)
