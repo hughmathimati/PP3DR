@@ -1,5 +1,5 @@
 # Project structure:
-## PP3DR (name subject to change):
+## PP3DR (Per-pixel 3D Reconstruction):
 - ### datasets
   - #### dynamic_replica
     - Contains the train, validation, and test datasets.
