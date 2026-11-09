@@ -216,9 +216,13 @@ class DatasetBase(torch.utils.data.Dataset):
         rem_bottom = self.input_dim - current_H
         rem_right = self.input_dim - current_W
 
-        # Apply Zero Padding to reach exactly 512x512
+        # Apply REPLICATE Padding to reach exactly 512x512
+        """
+        NOTE: This was previously zero-padding. I'm changing it to replicate because it's probably better for the model.
+        Depths must remain zero-padded (they don't go into the model anyway).
+        """
         zero_pad_format = (0, rem_right, 0, rem_bottom)
-        final_images = F.pad(padded_images, pad=zero_pad_format, mode="constant", value=0)
+        final_images = F.pad(padded_images, pad=zero_pad_format, mode="replicate")
 
         # Apply Zero Padding directly to Depths
         # (Combines the edge padding + remaining padding into one step, leaving boundaries as 0)

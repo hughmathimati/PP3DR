@@ -223,18 +223,6 @@ class BaseTrainer:
         # Drop rates get handled inside the model itself.
         train_model = model()
 
-        # 1. Initialize ONLY the new LaCT blocks and Decoder Heads!
-        for name, module in train_model.named_modules():
-            if isinstance(module, nn.Linear):
-                # Truncated normal tightly bounds the initial weights
-                nn.init.trunc_normal_(module.weight, std=0.02)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.LayerNorm):
-                nn.init.ones_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-
         if pretrained_path is not None:
             loaded_state_dict = torch.load(pretrained_path, weights_only=True, map_location="cpu")
 
@@ -243,11 +231,6 @@ class BaseTrainer:
             for k, v in loaded_state_dict.items():
                 if k.startswith("module."):
                     k = k[7:]
-
-                    # if "final_upscale" in k:
-                    #     print(f"Skipping poisoned weight: {k}")
-                    #     clean_state_dict[k] = torch.zeros_like(v)
-                    #     continue
 
                 clean_state_dict[k] = v
 
@@ -272,7 +255,7 @@ class BaseTrainer:
                          model: nn.Module,
                          encoder_blocks: int,
                          decoder_blocks: int,
-                         adamw_lr: float = 1e-5,
+                         adamw_lr: float = 1e-4,
                          weight_decay: float = 0.04,
                          layer_decay: float = 0.95,
                          ):
@@ -292,8 +275,8 @@ class BaseTrainer:
             # ==========================================
             # Excludes 1D tensors, biases, norms, and embeddings from weight decay
             is_1d = param.dim() < 2
-            is_special = any(k in name for k in ["bias", "norm", "gamma", "token", "pos_embed", "patch_embed"])
-
+            # gamma is the name of the LayerScale parameter.
+            is_special = any(k in name for k in ("pos_embed", "token", "step_size", "log_lr"))
             if is_1d or is_special:
                 wd = 0.0
             else:
@@ -313,7 +296,7 @@ class BaseTrainer:
                 layer_id = int(name.split("blocks.")[1].split(".")[0])
                 if "global_blocks." in name:
                     lr_mult = layer_decay ** (num_layers - (2 * layer_id + encoder_blocks))
-                elif "local_blocks." in name:
+                elif "local_blocks." in name or "frame_blocks." in name: # "frame_blocks" is used in ZipMap and VGGT-Omega
                     lr_mult = layer_decay ** (num_layers - (2 * layer_id + 1 + encoder_blocks))
                 else:
                     lr_mult = layer_decay ** (num_layers - layer_id)

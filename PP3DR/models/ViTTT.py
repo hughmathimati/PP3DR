@@ -22,26 +22,57 @@ from timm.layers import DropPath
 class LayerScale(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.scale = nn.Parameter(torch.ones(dim) * 1e-5)
+        self.gamma = nn.Parameter(torch.ones(dim) * 1e-5)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.scale * x
+        return self.gamma * x
+
+class SpatialDepthwiseConv(nn.Module):
+    """
+    Applies a residual 3x3 depthwise convolution strictly to the 2D patch tokens,
+    leaving register tokens untouched. Zero-initialized to start as an identity.
+    """
+    def __init__(self, dim: int, num_registers: int = 5):
+        super().__init__()
+        self.num_registers = num_registers
+        # Recall that our patch size is 16, meaning a 3x3 kernel actually takes into account nine 16x16 patches.
+        self.depthwise_convolution = nn.Conv2d(dim, dim, 3, 1, 1, groups=dim, bias=True)
+        nn.init.zeros_(self.depthwise_convolution.weight)
+        nn.init.zeros_(self.depthwise_convolution.bias)
+
+    def forward(self, x: torch.Tensor, H_p: int, W_p: int) -> torch.Tensor:
+        # x: (B * L, num_registers + H_p * W_p, dim)
+        regs = x[:, :self.num_registers, :]
+        patches = x[:, self.num_registers:, :]
+
+        patches_2d = rearrange(patches, "BL (Hp Wp) D -> BL D Hp Wp", Hp=H_p, Wp=W_p)
+        patches_2d = patches_2d + self.depthwise_convolution(patches_2d)
+        patches = rearrange(patches_2d, "BL D Hp Wp -> BL (Hp Wp) D")
+
+        return torch.cat([regs, patches], dim=1)
 
 @torch.compile()
 class Block(nn.Module):
     def __init__(self, dim, num_heads, ffn_ratio, drop_path = 0):
         super().__init__()
+        self.conv1 = SpatialDepthwiseConv(dim)
         self.layer_norm_1 = nn.LayerNorm(dim)
         self.TTT = BidirectionalLaCT(dim, num_heads)
         self.layer_scale_1 = LayerScale(dim)
+        self.conv2 = SpatialDepthwiseConv(dim)
         self.layer_norm_2 = nn.LayerNorm(dim)
         self.ffn = SwiGLU(in_features = dim, hidden_features = dim * ffn_ratio)
         self.layer_scale_2 = LayerScale(dim)
         self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
 
-    def forward(self, x: torch.Tensor, rope) -> torch.Tensor:
-        x = x + self.drop_path(self.layer_scale_1(self.TTT(self.layer_norm_1(x), rope)))
-        x = x + self.drop_path(self.layer_scale_2(self.ffn(self.layer_norm_2(x))))
+    def forward(self, x: torch.Tensor, rope, H_p: int, W_p: int) -> torch.Tensor:
+        x = x + self.drop_path(self.layer_scale_1(self.TTT(
+                self.conv1(self.layer_norm_1(x), H_p, W_p),
+                rope
+        )))
+        x = x + self.drop_path(self.layer_scale_2(self.ffn(
+            self.conv2(self.layer_norm_2(x), H_p, W_p)
+        )))
         return x
 
 @torch.compile()
@@ -93,16 +124,17 @@ class ViTTT(nn.Module):
         # We'll handle shapes not divisible by 16 during data processing, as DINO also doesn't handle this.
         # assert len(x.shape) == 4, f"x.shape should have length 4, but is instead {x.shape}"
         B, C, H, W = x.shape
+        H_p, W_p = H // 16, W // 16
         x = self.patch_embed(x)
-        rope = self.rope(H // 16, W // 16)
+        rope = self.rope(H_p, W_p)
         repeated_class_and_registers = self.class_and_registers.unsqueeze(0).repeat(B, 1, 1)
         x = torch.cat((repeated_class_and_registers, x), dim = 1)
         outputs = []
         for i, block in enumerate(self.blocks):
             if self.training and i >= self.start_checkpointing:
-                x = checkpoint(block, x, rope, use_reentrant = False)
+                x = checkpoint(block, x, rope, H_p, W_p, use_reentrant = False)
             else:
-                x = block(x, rope)
+                x = block(x, rope, H_p, W_p)
             if i in self.output_blocks:
                 outputs.append(x)
 

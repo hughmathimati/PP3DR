@@ -206,9 +206,9 @@ class PP3DR_loss(nn.Module):
         """
         MSE (squared) loss on log depths.
         """
-        # raw_error = F.smooth_l1_loss(pred_depth, gt_depth, reduction='none', beta=1e-3)
+        raw_error = F.smooth_l1_loss(pred_depth, gt_depth, reduction='none', beta=1e-3)
         # raw_error = self.hughber_loss(pred_depth, gt_depth)
-        raw_error = F.mse_loss(pred_depth, gt_depth, reduction='none')
+        # raw_error = F.mse_loss(pred_depth, gt_depth, reduction='none')
 
         loss = raw_error * torch.exp(-s) + s
         loss = loss.masked_fill(~valid_mask, 0.0)
@@ -225,8 +225,16 @@ class PP3DR_loss(nn.Module):
         B, L, H, W = s.shape
         s_2d = s.view(B * L, 1, H, W)
 
-        # Max pooling works perfectly on log(sigma). Max s = Max uncertainty.
-        s_norm_2d = F.max_pool2d(s_2d, kernel_size=2, stride=1)
+        """
+        We have two options with regard to taking the mean of the predicted aleatoric uncertainties.
+        Because the logits are actually the log of the aleatoric variances, the mathematically correct approach is to 
+        take the mean in linear space and then return into log space.
+        The upside is that this doesn't underestimate the variance. The downside is the extra computation.
+        For simplicity, I'm going to just take the average of the logits. However, it's worth bearing this in mind.
+        """
+        s_norm_2d = F.avg_pool2d(s_2d, kernel_size=2, stride=1)
+        # Below is what to use if you want to take the mean in linear space.
+        # s_norm_2d = torch.log(F.avg_pool2d(torch.exp(s_2d), kernel_size=2, stride=1) + 1e-8)
         s_normal = s_norm_2d.view(B, L, H - 1, W - 1)
 
         leftup, rightup, leftdown, rightdown = points[..., :-1, :-1, :], points[..., :-1, 1:, :], points[
@@ -298,9 +306,9 @@ class PP3DR_loss(nn.Module):
         total_weight = 0.0
 
         for step in scales:
-            # Max pool uncertainty across the exact spatial gap
-            s_dy = F.max_pool2d(s_2d, kernel_size=(step + 1, 1), stride=1).view(B, L, H - step, W)
-            s_dx = F.max_pool2d(s_2d, kernel_size=(1, step + 1), stride=1).view(B, L, H, W - step)
+            # Average (or LogMeanExp) the uncertainty of the exact two endpoints being differenced:
+            s_dy = 0.5 * (s[..., step:, :] + s[..., :-step, :])
+            s_dx = 0.5 * (s[..., :, step:] + s[..., :, :-step])
 
             pred_dy = pred_depth[..., step:, :] - pred_depth[..., :-step, :]
             gt_dy = gt_depth[..., step:, :] - gt_depth[..., :-step, :]
@@ -312,8 +320,8 @@ class PP3DR_loss(nn.Module):
             mask_dx = valid_mask[..., :, step:] & valid_mask[..., :, :-step]
 
             # Pure L1 strictly enforces relative macro-distances without a linear safety-valve
-            raw_dy = F.smooth_l1_loss(pred_dy, gt_dy, beta=1e-3)
-            raw_dx = torch.abs(pred_dx - gt_dx)
+            raw_dy = F.smooth_l1_loss(pred_dy, gt_dy, beta=1e-3, reduction='none')
+            raw_dx = F.smooth_l1_loss(pred_dx, gt_dx, beta=1e-3, reduction='none')
 
             loss_dy = raw_dy * torch.exp(-s_dy) + s_dy
             loss_dx = raw_dx * torch.exp(-s_dx) + s_dx
@@ -467,7 +475,7 @@ class PP3DR_loss(nn.Module):
         rotation_loss = self.rotation_loss(pred, gt_relative_rotations)
         torch._assert(rotation_loss.isfinite(), f"Rotation loss invalid ({rotation_loss})")
 
-        total_loss = point_loss + depth_loss + gradient_matching_loss + 0.25 * normal_loss + 0.5 * structural_similarity_loss + translation_loss + rotation_loss
+        total_loss = point_loss + 3 * depth_loss + gradient_matching_loss + 0.25 * normal_loss + 0.5 * structural_similarity_loss + translation_loss + rotation_loss
         return total_loss, dict(
             total_loss=total_loss,
             point_loss=point_loss,
